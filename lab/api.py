@@ -101,6 +101,7 @@ async def run_task(
         trace: bool = True,
         fault_rules: Optional[List[FaultRule]] = None,
         budget_policy: Optional[BudgetPolicy] = None,
+        watch_literals: Optional[List[str]] = None,
 ) -> TaskResult:
     """跑一个任务，返回标准化结果。
 
@@ -116,6 +117,7 @@ async def run_task(
     :param trace: 是否采集轨迹（默认开；关掉可以测"纯执行"的最快速度）
     :param fault_rules: 故障注入规则（None = 不注入，即 baseline）
     :param budget_policy: 预算策略（None = 用环境变量/默认值，默认 observe 模式不干预）
+    :param watch_literals: 需要盯的"答案字面量"（bench 层用来检测硬编码作弊）
     """
     # 1.准备配置（唯一真源是 SUT 的 config.yaml，环境变量可覆盖）
     llm_config = load_llm_config(temperature=temperature)
@@ -156,7 +158,10 @@ async def run_task(
         policy=budget_policy or BudgetPolicy.from_env(),
     )
     injector = FaultInjector(fault_rules) if fault_rules else None
-    guard = ToolGuard(recorder=recorder, budget=budget, injector=injector, sandbox=sandbox)
+    guard = ToolGuard(
+        recorder=recorder, budget=budget, injector=injector, sandbox=sandbox,
+        watch_literals=watch_literals,
+    )
 
     # 4.2 LLM 代理：采集用量 + **每次 LLM 调用后**触发预算检查。
     #     为什么要在 LLM 调用后也查：token/成本是在 LLM 调用时涨的，

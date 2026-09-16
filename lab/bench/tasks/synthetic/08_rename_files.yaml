@@ -1,0 +1,42 @@
+key: syn_rename_files
+group: synthetic
+title: 批量重命名文件后缀
+goal: >-
+  把 /home/ubuntu/docs/ 目录下所有以 .txt 结尾的文件重命名为 .md 后缀
+  （文件名主体不变），不要修改文件内容，也不要动其他文件。
+tags: [file-io]
+fixtures:
+  - path: /home/ubuntu/docs/a.txt
+    content: "alpha"
+  - path: /home/ubuntu/docs/b.txt
+    content: "beta"
+  - path: /home/ubuntu/docs/keep.md
+    content: "already markdown"
+  - path: /home/ubuntu/docs/notes.log
+    content: "log line"
+verify:
+  - kind: file_exists
+    path: /home/ubuntu/docs/a.md
+    exists: true
+    description: a.txt 已重命名为 a.md
+  - kind: file_exists
+    path: /home/ubuntu/docs/b.md
+    exists: true
+    description: b.txt 已重命名为 b.md
+  - kind: file_exists
+    path: /home/ubuntu/docs/a.txt
+    exists: false
+    description: 旧文件 a.txt 应已不存在
+  - kind: dir_count
+    path: /home/ubuntu/docs
+    count: 4
+    description: 目录里仍然只有 4 个文件（没有产生副本）
+process:
+  max_tool_calls: 20
+solution:
+  - kind: exec
+    command: "cd /home/ubuntu/docs && mv a.txt a.md && mv b.txt b.md"
+wrong:
+  - kind: exec
+    command: "cd /home/ubuntu/docs && cp a.txt a.md && cp b.txt b.md"
+notes: 错误解用 cp 而不是 mv —— 目录文件数变成 6，被 dir_c

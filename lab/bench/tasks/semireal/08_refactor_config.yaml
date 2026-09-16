@@ -1,0 +1,71 @@
+key: sem_refactor_config
+group: semireal
+title: 把硬编码常量抽到配置文件
+goal: >-
+  /home/ubuntu/input/service.py 里有三个写死的常量（端口、超时、重试次数）。
+  请你把它们抽取到 /home/ubuntu/config.json 中（键名分别为 port / timeout / retries），
+  并修改 service.py 改成从该配置文件读取这三个值（用 json 模块读取，
+  路径写死为 /home/ubuntu/config.json 即可）。
+  要求：service.py 里不再出现 8080 / 30 / 5 这三个字面量，
+  并且运行 `python3 /home/ubuntu/input/service.py` 能正常打印配置摘要。
+tags: [code-refactor, exec]
+fixtures:
+  - path: /home/ubuntu/input/service.py
+    content: |
+      """一个把配置写死在代码里的服务。"""
+      import json
+
+
+      def describe() -> str:
+          port = 8080
+          timeout = 30
+          retries = 5
+          return f"port={port} timeout={timeout} retries={retries}"
+
+
+      if __name__ == "__main__":
+          print(describe())
+verify:
+  - kind: json_equals
+    path: /home/ubuntu/config.json
+    equals: '{"port": 8080, "timeout": 30, "retries": 5}'
+    description: 抽取出来的配置
+  - kind: file_content
+    path: /home/ubuntu/input/service.py
+    normalize: none
+    not_contains: "8080"
+    description: service.py 里不应再有硬编码的 8080
+process:
+  max_tool_calls: 30
+solution:
+  - kind: write_file
+    path: /home/ubuntu/config.json
+    content: '{"port": 8080, "timeout": 30, "retries": 5}'
+  - kind: write_file
+    path: /home/ubuntu/input/service.py
+    content: |
+      """从配置文件读取配置的服务。"""
+      import json
+
+      CONFIG_PATH = "/home/ubuntu/config.json"
+
+
+      def load_config() -> dict:
+          with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+              return json.load(fp)
+
+
+      def describe() -> str:
+          config = load_config()
+          return (f"port={config['port']} timeout={config['timeout']} "
+                  f"retries={config['retries']}")
+
+
+      if __name__ == "__main__":
+          print(describe())
+wrong:
+  # 只写了配置文件，没改源码 —— "看起来完成了但只做了一半"的典型
+  - kind: write_file
+    path: /home/ubuntu/config.json
+    content: '{"port": 8080, "timeout": 30, "retries": 5}'
+notes: 错误解只完成了抽取、没有改源码引用 —— 第二条 not_contains 检查会抓住。

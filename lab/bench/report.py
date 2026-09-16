@@ -1,0 +1,261 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""报告生成：把 SuiteResult 渲染成 Markdown。
+
+== 两条写作原则 ==
+1. **每个数字都必须带它的不确定性**。只给"成功率 78%"是不合格的报告 ——
+   读者无法判断这 78% 和上次的 75% 有没有区别。所以成功率一律带 Wilson 区间，
+   连续量一律带 t 区间，并且标注 n。
+2. **把"这个数字不可信"的地方也写出来**。并发运行时耗时不可比、
+   缺少错误解的任务判定强度弱、某个指标的价格表没命中导致成本为 0 ——
+   这些都要在报告的"已知限制"里明说。
+   一份不写自己弱点的报告，读者只能选择"全信"或"全不信"，两者都是坏的。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from lab.bench.runner import SuiteResult
+from lab.bench.stats import Interval
+
+
+def _interval_row(name: str, interval: Interval, unit: str = "", digits: int = 1,
+                  clamp_min: Optional[float] = None) -> str:
+    """渲染一行"均值 + 区间"。
+
+    clamp_min：对 token/成本/耗时这类**不可能为负**的指标把下界截到 0。
+    为什么需要：n 很小时 t 区间会宽到出现负值（例如 tokens 的区间 [-1.1e6, 1.4e6]），
+    数学上没错，但印在报告里像 bug，会让读者对整份报告失去信任。
+    截断**不会**掩盖"区间很宽"这个事实 —— 我们用 ⚠️ 单独标出来（见下）。
+    """
+    if interval.low is None:
+        value = f"{interval.point:,.{digits}f}{unit}"
+        return f"| {name} | {value} | — | {interval.n} |"
+
+    low, high = interval.low, interval.high
+    if clamp_min is not None:
+        low = max(clamp_min, low)
+        if high is not None:
+            high = max(clamp_min, high)
+
+    value = f"{interval.point:,.{digits}f}{unit}"
+    spread = f"[{low:,.{digits}f}, {high:,.{digits}f}]{unit}"
+    # 区间比点估计本身还宽 → 这个数字基本没有信息量，必须显式提醒
+    if interval.half_width is not None and interval.point and interval.half_width > abs(interval.point):
+        spread += " ⚠️"
+    return f"| {name} | {value} | {spread} | {interval.n} |"
+
+
+def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> str:
+    """渲染完整报告。"""
+    lines: List[str] = []
+
+    # ==================== 头部 ====================
+    lines.append("# Agent 可靠性基线报告")
+    lines.append("")
+    lines.append(f"- **suite**: `{suite.suite_id}`（{suite.label}）")
+    lines.append(f"- **开始时间**: {suite.started_at}   **总耗时**: {suite.elapsed_s}s")
+    lines.append(f"- **模型**: `{suite.model_name}`   **温度**: {suite.temperature}（评测固定，保证可复现）")
+    lines.append(f"- **SUT**: `{suite.outcomes[0].sut_name if suite.outcomes else 'n/a'}`")
+    lines.append(f"- **规模**: {task_count or len(suite.task_summaries)} 个任务 × {suite.runs_per_task} 次 = "
+                 f"**{suite.total_runs}** 次运行")
+    lines.append(f"- **预算模式**: `{suite.budget_mode}`（只记录不干预）")
+    if suite.concurrency > 1:
+        lines.append(f"- ⚠️ **并发度**: {suite.concurrency}（耗时指标不可横向比较）")
+    lines.append("")
+
+    # ==================== 总体指标 ====================
+    lines.append("## 一、总体指标")
+    lines.append("")
+    rate = suite.success_rate
+    lines.append(f"**成功率 {rate.point:.1%}**，95% Wilson 区间 "
+                 f"[{rate.low:.1%}, {rate.high:.1%}]，n={recipe_n(rate)}")
+    lines.append("")
+    lines.append("| 指标 | 均值 | 95% 区间 | n |")
+    lines.append("|---|---|---|---|")
+    lines.append(_interval_row("tokens/任务", suite.tokens, digits=0, clamp_min=0))
+    lines.append(_interval_row("成本/任务", suite.cost, unit=" 美元", digits=4, clamp_min=0))
+    lines.append(_interval_row("耗时/任务", suite.elapsed, unit=" ms", digits=0, clamp_min=0))
+    lines.append(_interval_row("工具调用/任务", suite.tool_calls, digits=2, clamp_min=0))
+    lines.append("")
+    lines.append("> 区间含义：**同样条件下重复这个评测，均值有 95% 的概率落在区间内**。")
+    lines.append("> 两个方案的区间重叠时，不要宣称其中一个更好（n 不够，见第四节）。")
+    lines.append("> 带 ⚠️ 的区间比点估计本身还宽 —— 说明 **n 太小，这个数字现在没有信息量**。")
+    lines.append("")
+
+    # ---- 交叉校验：SUT 自述 vs 独立判定 ----
+    lines.append("### SUT 自述 vs 独立判定")
+    lines.append("")
+    if not suite.self_report_available:
+        lines.append("本次评测未记录 SUT 自述字段（旧数据，字段是后来加的）→ 无法做交叉校验。")
+        lines.append("")
+    else:
+        gap = suite.self_report_gap
+        lines.append("| 口径 | 成功数 | 成功率 |")
+        lines.append("|---|---|---|")
+        lines.append(f"| SUT 自述 `result.ok` | {suite.self_reported_successes}/{suite.total_runs} "
+                     f"| {suite.self_reported_successes / max(1, suite.total_runs):.1%} |")
+        lines.append(f"| **独立判定（权威）** | **{suite.successes}/{suite.total_runs}** "
+                     f"| **{rate.point:.1%}** |")
+        lines.append("")
+        if gap:
+            lines.append(f"⚠️ **{gap} 次运行是「自报成功但实际失败」**"
+                         f"（占 {gap / max(1, suite.total_runs):.0%}）。"
+                         f"这类虚报是最危险的：如果只看 SUT 自述，成功率会被直接抬高。")
+            lines.append("")
+            lines.append("> 实测案例：某任务 SUT 规划出 **0 个步骤、一个工具都没调**，"
+                         "仍然返回 `ok=True`（`error=None`）。"
+                         "独立判定则发现产物根本不存在。")
+        else:
+            lines.append("本次没有出现虚报（自述与判定一致），说明 SUT 的自我评估是可靠的。")
+        lines.append("")
+
+    # ==================== 分组 ====================
+    lines.append("## 二、分组对比")
+    lines.append("")
+    lines.append("| 分组 | 运行数 | 成功率 | 95% 区间 | tokens/任务 | 耗时/任务 |")
+    lines.append("|---|---|---|---|---|---|")
+    for group, data in sorted(suite.by_group().items()):
+        interval = data["success_rate"]
+        lines.append(
+            f"| {group} | {data['runs']} | {interval.point:.1%} "
+            f"| [{interval.low:.1%}, {interval.high:.1%}] "
+            f"| {data['tokens'].point:,.0f} | {data['elapsed'].point:,.0f} ms |"
+        )
+    lines.append("")
+    lines.append("> `synthetic` 是纯合成任务（完全可控），`semireal` 是半真实小场景"
+                 "（CSV 清洗 / 日志分析 / 改代码等）。两者成功率差多少，"
+                 "可以直接回答\"这套系统在玩具任务上刷分、在真实任务上崩掉\"这类质疑。")
+    lines.append("")
+
+    # ==================== 逐任务 ====================
+    lines.append("## 三、逐任务明细")
+    lines.append("")
+    lines.append("| 任务 | 分组 | 成功 | 成功率 | tokens | 耗时 | 工具 | 过程 flag |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for summary in sorted(suite.task_summaries, key=lambda s: (s.group, s.task_uid)):
+        mark = "✅" if summary.successes == summary.runs else ("⚠️" if summary.successes else "❌")
+        flags = ",".join(f"{k}×{v}" for k, v in summary.flag_counts.items()) or ""
+        lines.append(
+            f"| `{summary.task_key}` | {summary.group} | {mark} {summary.successes}/{summary.runs} "
+            f"| {summary.success_rate.point:.0%} | {summary.tokens.point:,.0f} "
+            f"| {summary.elapsed_ms.point:,.0f} ms | {summary.tool_calls.point:.1f} | {flags} |"
+        )
+    lines.append("")
+
+    # ==================== 不稳定任务 ====================
+    unstable = [s for s in suite.task_summaries if s.unstable]
+    lines.append("## 四、不稳定任务（同一任务多次运行结果不一致）")
+    lines.append("")
+    if unstable:
+        lines.append("这些任务最能说明系统的方差 —— **它们才是加固工作的靶子**：")
+        lines.append("")
+        for summary in unstable:
+            lines.append(f"- `{summary.task_uid}`：{summary.successes}/{summary.runs} 成功 "
+                         f"（{summary.title}）")
+    else:
+        lines.append("本次没有出现\"同一任务部分成功部分失败\"的情况。")
+        lines.append("")
+        lines.append("> 但这**不等于系统稳定**：如果 n 很小，不稳定任务很可能只是没被抽到。")
+    lines.append("")
+
+    # ==================== 失败归因 ====================
+    lines.append("## 五、失败归因")
+    lines.append("")
+    attribution = suite.error_attribution()
+    if attribution:
+        lines.append("| 原因 | 次数 |")
+        lines.append("|---|---|")
+        for key, count in attribution.items():
+            lines.append(f"| `{key}` | {count} |")
+        lines.append("")
+        lines.append("> `verification_failed` 表示 Agent 自己认为成功、但判定器判定失败 ——"
+                     "这类是**最值得看的失败**（要区分是能力问题还是验证器问题）。")
+        lines.append("> `tool:*` 前缀是工具层出错次数（可能不影响最终成败）。")
+    else:
+        lines.append("本次没有失败。")
+    lines.append("")
+
+    # ==================== 过程问题 ====================
+    lines.append("## 六、过程问题（答案对但路径可疑）")
+    lines.append("")
+    flags = suite.process_flag_counts()
+    if flags:
+        lines.append("| 问题 | 出现次数 |")
+        lines.append("|---|---|")
+        for key, count in flags.items():
+            lines.append(f"| `{key}` | {count} |")
+        lines.append("")
+        lines.append("> 过程问题**不影响成功率**（那是结果分），但会影响可维护性与安全性：")
+        lines.append("> 工具调用超标 = 效率差；动作多样性低 = 在原地打转；")
+        lines.append("> `hardcoded_answer` = 抄答案；`path_escape_attempted` = 越权尝试。")
+    else:
+        lines.append("本次没有检测到过程问题。")
+    lines.append("")
+
+    # ==================== 预算观察 ====================
+    lines.append("## 七、预算观察（observe 模式的产出）")
+    lines.append("")
+    stats = suite.budget_stats()
+    lines.append(f"- 越界运行数：**{stats['violated_runs']}/{stats['runs']}**"
+                 f"（{stats['violated_rate']:.1%}）")
+    lines.append(f"- enforce 模式下\"本会中止\"的运行数：**{stats['would_stop_runs']}**")
+    if stats["by_metric"]:
+        lines.append(f"- 按维度：{stats['by_metric']}")
+    lines.append("")
+    lines.append("> 这一节是**切换模式前的决策依据**：")
+    lines.append("> 若\"本会中止\"的比例很小 → 硬上限设得合适，可以放心切 enforce；")
+    lines.append("> 若很大 → 硬上限太紧，切过去会砍掉大量本来能成功的任务。")
+    lines.append("")
+
+    # ==================== 已知限制 ====================
+    lines.append("## 八、已知限制（请连同上面的数字一起读）")
+    lines.append("")
+    for note in suite.notes:
+        lines.append(f"- {note}")
+    if suite.fixture_failures:
+        lines.append(f"- ⚠️ 有 {len(suite.fixture_failures)} 次运行在执行前就失败了，"
+                     f"**未计入成功率**（否则会把环境问题算成 Agent 能力问题）")
+    lines.append("- 耗时指标包含模型服务端排队时间，跨时段对比需要谨慎。")
+    lines.append("- 判定器只看最终产物，**不评价过程质量**（过程分在第六节单独给）。")
+    lines.append("- 任务集从 20 个任务中抽取，覆盖面有限；结论外推到其它任务类型需要谨慎。")
+    lines.append("")
+
+    # ==================== 复现 ====================
+    lines.append("## 九、复现方式")
+    lines.append("")
+    lines.append("```bash")
+    lines.append("# 1. 先验证任务集本身可信（不需要 API Key，不花钱）")
+    lines.append("python -m lab bench validate")
+    lines.append("")
+    lines.append("# 2. 复现本次评测（阈值/故障注入都来自命令行，不藏在代码里）")
+    lines.append(f"python -m lab bench run --runs {suite.runs_per_task} --label \"{suite.label}\"")
+    lines.append("")
+    lines.append("# 3. 重新出报告（不重跑）")
+    lines.append(f"python -m lab bench report {suite.suite_id}")
+    lines.append("```")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def recipe_n(interval: Interval) -> int:
+    """小工具：把 interval 的 n 取出来（用于比率那一行的文案）。"""
+    return interval.n
+
+
+def render_suite_list(suites: List[Dict[str, Any]]) -> str:
+    """列出历史评测。"""
+    if not suites:
+        return "(还没有任何评测记录)"
+    lines = ["| suite_id | label | 模型 | n/任务 | 运行数 | 成功率 | 开始时间 |",
+             "|---|---|---|---|---|---|---|"]
+    for row in suites:
+        total = row["total_runs"] or 0
+        successes = row["successes"] or 0
+        rate = (successes / total) if total else 0.0
+        lines.append(
+            f"| `{row['suite_id'][:8]}` | {row['label']} | {row['model_name']} "
+            f"| {row['runs_per_task']} | {total} | {rate:.1%} | {row['started_at']} |"
+        )
+    return "\n".join(lines)

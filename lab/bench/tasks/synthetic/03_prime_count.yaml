@@ -1,0 +1,23 @@
+key: syn_prime_count
+group: synthetic
+title: 统计质数个数
+goal: >-
+  统计 1 到 1000 之间（含 1 和 1000）一共有多少个质数，
+  把个数写入 /home/ubuntu/prime_count.txt，文件中只能有这一个数字。
+tags: [numeric]
+verify:
+  - kind: numeric
+    path: /home/ubuntu/prime_count.txt
+    value: 168
+    description: 1..1000 内质数个数
+process:
+  max_tool_calls: 15
+  answer_literals: ["168"]
+solution:
+  - kind: write_file
+    path: /home/ubuntu/prime_count.txt
+    content: "168"
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/prime_count.txt
+    content: "169"

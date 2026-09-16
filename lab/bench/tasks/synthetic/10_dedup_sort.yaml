@@ -1,0 +1,57 @@
+key: syn_dedup_sort
+group: synthetic
+title: 去重并排序
+goal: >-
+  读取 /home/ubuntu/input/tags.txt，去掉重复行与空行，
+  把剩下的行按字典序排序后写入 /home/ubuntu/tags_clean.txt（每行一个）。
+tags: [text]
+fixtures:
+  - path: /home/ubuntu/input/tags.txt
+    content: |
+      python
+      linux
+
+      docker
+      python
+      CI
+      linux
+      docker
+
+      git
+verify:
+  - kind: file_content
+    path: /home/ubuntu/tags_clean.txt
+    normalize: sorted_lines
+    equals: |
+      CI
+      docker
+      git
+      linux
+      python
+    description: 去重排序后的标签
+  - kind: line_count
+    path: /home/ubuntu/tags_clean.txt
+    count: 5
+    description: 5 个唯一标签
+process:
+  max_tool_calls: 12
+solution:
+  - kind: write_file
+    path: /home/ubuntu/tags_clean.txt
+    content: |
+      CI
+      docker
+      git
+      linux
+      python
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/tags_clean.txt
+    content: |
+      CI
+      docker
+      docker
+      git
+      linux
+      python
+notes: 错误解漏了去重 —— 所以除内容比对外还要用 line_count 二次校验行数。

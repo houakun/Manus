@@ -1,0 +1,54 @@
+key: sem_csv_clean
+group: semireal
+title: 清洗脏 CSV（去空行/去重/统一大小写）
+goal: >-
+  清洗 /home/ubuntu/input/contacts.csv，规则如下：
+  1) 删除所有完全空白的行；
+  2) 删除重复行（重复指向完全相同的行，保留第一次出现的那条）；
+  3) 把 email 列统一转成小写；
+  4) 保留表头 name,email。
+  把清洗后的结果写入 /home/ubuntu/contacts_clean.csv。
+tags: [csv, data-cleaning]
+fixtures:
+  - path: /home/ubuntu/input/contacts.csv
+    content: |
+      name,email
+      Alice,ALICE@Example.com
+
+      bob,bob@example.com
+      Alice,ALICE@Example.com
+      Carol,carol@EXAMPLE.com
+
+      dave,DAVE@example.com
+verify:
+  - kind: csv_rows
+    path: /home/ubuntu/contacts_clean.csv
+    rows:
+      - ["name", "email"]
+      - ["Alice", "alice@example.com"]
+      - ["bob", "bob@example.com"]
+      - ["Carol", "carol@example.com"]
+      - ["dave", "dave@example.com"]
+    description: 清洗后的联系人表
+process:
+  max_tool_calls: 20
+solution:
+  - kind: write_file
+    path: /home/ubuntu/contacts_clean.csv
+    content: |
+      name,email
+      Alice,alice@example.com
+      bob,bob@example.com
+      Carol,carol@example.com
+      dave,dave@example.com
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/contacts_clean.csv
+    content: |
+      name,email
+      Alice,alice@example.com
+      bob,bob@example.com
+      Alice,alice@example.com
+      Carol,carol@example.com
+      dave,dave@example.com
+notes: 错误解漏了去重。注意"去重"要在"转小写"之后判断，否则 ALICE@ 与 alice@ 会被当成两行。

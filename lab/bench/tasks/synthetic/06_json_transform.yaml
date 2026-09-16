@@ -1,0 +1,33 @@
+key: syn_json_transform
+group: synthetic
+title: JSON 字段提取与重组
+goal: >-
+  读取 /home/ubuntu/input/users.json（一个对象数组，字段为 id / name / age / active），
+  从中筛选出 active 为 true 的用户，只保留 name 与 age 两个字段，
+  并且按 age 升序排列，结果写入 /home/ubuntu/active.json。
+tags: [json]
+fixtures:
+  - path: /home/ubuntu/input/users.json
+    content: |
+      [
+        {"id": 1, "name": "alice", "age": 31, "active": true},
+        {"id": 2, "name": "bob", "age": 25, "active": false},
+        {"id": 3, "name": "carol", "age": 28, "active": true},
+        {"id": 4, "name": "dave", "age": 44, "active": true}
+      ]
+verify:
+  - kind: json_equals
+    path: /home/ubuntu/active.json
+    equals: '[{"name": "carol", "age": 28}, {"name": "alice", "age": 31}, {"name": "dave", "age": 44}]'
+    description: 筛选并排序后的结果
+process:
+  max_tool_calls: 15
+solution:
+  - kind: write_file
+    path: /home/ubuntu/active.json
+    content: '[{"name": "carol", "age": 28}, {"name": "alice", "age": 31}, {"name": "dave", "age": 44}]'
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/active.json
+    content: '[{"name": "alice", "age": 31}, {"name": "carol", "age": 28}, {"name": "dave", "age": 44}]'
+notes: 错误解没按 age 排序 —— 判定器要求 JSON 结构完全一致，顺序也算。

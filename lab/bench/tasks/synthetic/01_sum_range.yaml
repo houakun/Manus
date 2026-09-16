@@ -1,0 +1,24 @@
+key: syn_sum_range
+group: synthetic
+title: 区间求和写入文件
+goal: >-
+  计算 1 到 1000 之间所有整数的和，把结果写入 /home/ubuntu/sum.txt。
+  文件中只能有这一个数字，不要写单位、说明文字或标题。
+tags: [numeric, file-io]
+verify:
+  - kind: numeric
+    path: /home/ubuntu/sum.txt
+    value: 500500
+    description: 求和结果
+process:
+  max_tool_calls: 12
+  answer_literals: ["500500"]
+solution:
+  - kind: write_file
+    path: /home/ubuntu/sum.txt
+    content: "500500"
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/sum.txt
+    content: "500499"
+notes: 最基础的任务，用来确认链路通畅；硬编码字面量检测也在这里验证。

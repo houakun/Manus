@@ -1,0 +1,33 @@
+key: sem_log_analyze
+group: semireal
+title: nginx 日志状态码统计
+goal: >-
+  分析 /home/ubuntu/input/access.log（标准 nginx combined 格式），
+  统计每个 HTTP 状态码出现的次数，按次数从高到低输出到 /home/ubuntu/status.json，
+  格式为 {"status": {"200": 3, "404": 2}}（次数相同的按状态码升序）。
+tags: [log, json, analysis]
+fixtures:
+  - path: /home/ubuntu/input/access.log
+    content: |
+      10.0.0.1 - - [01/Jan/2026:10:00:00 +0800] "GET /index.html HTTP/1.1" 200 1043
+      10.0.0.2 - - [01/Jan/2026:10:00:01 +0800] "GET /missing HTTP/1.1" 404 153
+      10.0.0.3 - - [01/Jan/2026:10:00:02 +0800] "POST /api/login HTTP/1.1" 200 87
+      10.0.0.4 - - [01/Jan/2026:10:00:03 +0800] "GET /missing HTTP/1.1" 404 153
+      10.0.0.5 - - [01/Jan/2026:10:00:04 +0800] "GET /index.html HTTP/1.1" 200 1043
+      10.0.0.6 - - [01/Jan/2026:10:00:05 +0800] "GET /boom HTTP/1.1" 500 12
+verify:
+  - kind: json_equals
+    path: /home/ubuntu/status.json
+    equals: '{"status": {"200": 3, "404": 2, "500": 1}}'
+    description: 状态码计数
+process:
+  max_tool_calls: 20
+solution:
+  - kind: write_file
+    path: /home/ubuntu/status.json
+    content: '{"status": {"200": 3, "404": 2, "500": 1}}'
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/status.json
+    content: '{"status": {"200": 3, "404": 2}}'
+notes: 错误解漏了只出现一次的 500 —— 用来抓"只看高频、漏掉长尾"的实现。

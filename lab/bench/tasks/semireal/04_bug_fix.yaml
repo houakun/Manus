@@ -1,0 +1,51 @@
+key: sem_bug_fix
+group: semireal
+title: 修复脚本中的 off-by-one 并运行出结果
+goal: >-
+  修复 /home/ubuntu/input/stats.py 中的 bug：它本应统计从 1 到 n（含 n）的
+  整数平方和，但结果总是少最后一项。修好之后运行该脚本，
+  并把脚本输出的数字写入 /home/ubuntu/result.txt。
+tags: [code-fix, exec]
+fixtures:
+  - path: /home/ubuntu/input/stats.py
+    content: |
+      """统计 1 到 n（含 n）的整数平方和。"""
+
+      def sum_of_squares(n: int) -> int:
+          total = 0
+          # BUG: range 的终点少算了最后一项
+          for i in range(1, n):
+              total += i * i
+          return total
+
+
+      if __name__ == "__main__":
+          print(sum_of_squares(10))
+verify:
+  - kind: numeric
+    path: /home/ubuntu/result.txt
+    value: 385
+    description: 1..10 的平方和
+  - kind: file_content
+    path: /home/ubuntu/input/stats.py
+    normalize: none
+    contains: "range(1, n + 1)"
+    description: 脚本里的 off-by-one 已修正
+process:
+  max_tool_calls: 25
+  answer_literals: ["385"]
+solution:
+  # 参考解用 exec：这个任务的要点本来就是"能改代码并运行"，直接写产物验证不到这一层。
+  # 注意：命令必须写成**平台中立**的形式（python 一行式，只用单引号），
+  # 因为 fast mode 通过宿主 shell 执行（Windows 下是 cmd.exe，不支持 $( ) 与单引号）。
+  - kind: exec
+    command: >-
+      python -c "import pathlib,subprocess,sys; p=pathlib.Path('input/stats.py');
+      p.write_text(p.read_text().replace('range(1, n)', 'range(1, n + 1)'));
+      out=subprocess.run([sys.executable, 'input/stats.py'], capture_output=True, text=True).stdout.strip();
+      pathlib.Path('result.txt').write_text(out)"
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/result.txt
+    content: "285"
+notes: 正确值 385（1²+...+10²）；少最后一项会得到 285。第二个检查确认脚本本身被改了，而不只是产出了数字。

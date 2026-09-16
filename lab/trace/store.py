@@ -77,7 +77,78 @@ CREATE TABLE IF NOT EXISTS spans (
 CREATE INDEX IF NOT EXISTS idx_spans_task ON spans(task_id);
 CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_ok ON tasks(sut_name, ok);
+
+-- ==================== 评测 harness（Step 4）====================
+-- 这两张表与 tasks/spans 的分工：
+--   tasks/spans  记录"SUT 干了什么"
+--   bench_*      记录"判定器认为它做对了吗"
+-- 分开存的原因：同一条 trace 可能被多套任务/多种判定规则复用，
+-- 把判定结果写进 tasks 会让"一次运行"和"一次评测"的概念混在一起。
+CREATE TABLE IF NOT EXISTS bench_suites (
+    suite_id       TEXT PRIMARY KEY,
+    label          TEXT,
+    model_name     TEXT,
+    temperature    REAL,
+    runs_per_task  INTEGER,
+    concurrency    INTEGER,
+    budget_mode    TEXT,
+    started_at     TEXT,
+    elapsed_s      REAL,
+    total_runs     INTEGER,
+    successes      INTEGER,
+    task_count     INTEGER,
+    notes          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bench_runs (
+    run_id                 TEXT PRIMARY KEY,
+    suite_id               TEXT NOT NULL,
+    task_uid               TEXT,
+    task_key               TEXT,
+    group_name             TEXT,
+    run_index              INTEGER,
+    ok                     INTEGER,
+    self_reported_ok       INTEGER,
+    failed_checks          TEXT,
+    process_flags          TEXT,
+    task_id                TEXT,
+    sut_name               TEXT,
+    tokens                 INTEGER,
+    cost_usd               REAL,
+    elapsed_ms             INTEGER,
+    llm_calls              INTEGER,
+    tool_calls             REAL,
+    steps_done             INTEGER,
+    error_type             TEXT,
+    error                  TEXT,
+    budget_violated        TEXT,
+    budget_would_stop      INTEGER,
+    action_diversity       REAL,
+    postcondition_warnings INTEGER,
+    faults_injected        INTEGER,
+    created_at             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_bench_runs_suite ON bench_runs(suite_id);
+CREATE INDEX IF NOT EXISTS idx_bench_runs_task ON bench_runs(task_uid);
 """
+
+# 后加的列：老库需要 ALTER TABLE 才能补齐。
+# 为什么要这个：Step 3 之后 tasks 表多了加固层字段，而 CREATE TABLE IF NOT EXISTS
+# 对已存在的表**不会**新增列 —— 不写迁移的话，老库会静默地缺字段，
+# 写入时抛 OperationalError（或更糟：字段永远为空）。
+_TASKS_GUARD_COLUMNS = {
+    "budget_violated_metrics": "TEXT",
+    "budget_would_stop": "INTEGER",
+    "action_diversity": "REAL",
+    "postcondition_warnings": "INTEGER",
+    "faults_injected": "INTEGER",
+}
+
+# bench_runs 的后加列（同样的迁移理由）
+_BENCH_RUN_COLUMNS = {
+    "self_reported_ok": "INTEGER",
+}
 
 
 class SpanStore:
@@ -98,43 +169,70 @@ class SpanStore:
     def init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """给已存在的表补新列（幂等）。"""
+        for table, columns in (
+                ("tasks", _TASKS_GUARD_COLUMNS),
+                ("bench_runs", _BENCH_RUN_COLUMNS),
+        ):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # ==================== 写入 ====================
 
     def save_run(self, result: "TaskResult", spans: List[Span], *, goal: str = "") -> None:
         """写入一次完整运行（任务行 + 全部 span）。同 task_id 重复写入会覆盖，保证幂等。"""
-        task_row = (
-            result.task_id,
-            result.sut_name,
-            goal or result.plan_goal,
-            1 if result.ok else 0,
-            result.error,
-            result.error_type,
-            result.answer,
-            result.plan_title,
-            result.steps.total,
-            result.steps.done,
-            result.steps.succeeded,
-            result.steps.failed,
-            result.llm_usage.llm_calls,
-            result.llm_usage.llm_errors,
-            result.llm_usage.prompt_tokens,
-            result.llm_usage.completion_tokens,
-            result.llm_usage.total_tokens,
-            result.llm_usage.tool_calls,
-            result.cost_usd,
-            result.elapsed_ms,
-            datetime.now().isoformat(timespec="seconds"),
-            result.workspace,
-            json.dumps(result.tool_sequence, ensure_ascii=False),
-        )
+        guard = result.guard or {}
+        budget = guard.get("budget") or {}
+        loop = guard.get("loop") or {}
+
+        # 用显式列名而不是 VALUES(?,?,...) 位置参数：
+        # 以后再加字段时，不会因为占位符数量对不上而把钱已经花掉的评测结果写坏。
+        columns = {
+            "task_id": result.task_id,
+            "sut_name": result.sut_name,
+            "goal": goal or result.plan_goal,
+            "ok": 1 if result.ok else 0,
+            "error": result.error,
+            "error_type": result.error_type,
+            "answer": result.answer,
+            "plan_title": result.plan_title,
+            "steps_total": result.steps.total,
+            "steps_done": result.steps.done,
+            "steps_succeeded": result.steps.succeeded,
+            "steps_failed": result.steps.failed,
+            "llm_calls": result.llm_usage.llm_calls,
+            "llm_errors": result.llm_usage.llm_errors,
+            "prompt_tokens": result.llm_usage.prompt_tokens,
+            "completion_tokens": result.llm_usage.completion_tokens,
+            "total_tokens": result.llm_usage.total_tokens,
+            "tool_calls": int(loop.get("tool_calls") or result.llm_usage.tool_calls),
+            "cost_usd": result.cost_usd,
+            "elapsed_ms": result.elapsed_ms,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "workspace": result.workspace,
+            "tool_sequence": json.dumps(result.tool_sequence, ensure_ascii=False),
+            # ---- Step 3 加固层字段 ----
+            "budget_violated_metrics": json.dumps(budget.get("violated_metrics") or [], ensure_ascii=False),
+            "budget_would_stop": 1 if budget.get("would_stop") else 0,
+            "action_diversity": loop.get("action_diversity"),
+            "postcondition_warnings": len((guard.get("postconditions") or {}).get("warnings") or []),
+            "faults_injected": int((guard.get("faults") or {}).get("injections") or 0),
+        }
+        placeholders = ",".join("?" for _ in columns)
+        column_names = ",".join(columns)
 
         with self._connect() as conn:
             conn.execute("DELETE FROM spans WHERE task_id = ?", (result.task_id,))
             conn.execute("DELETE FROM tasks WHERE task_id = ?", (result.task_id,))
             conn.execute(
-                """INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                task_row,
+                f"INSERT INTO tasks ({column_names}) VALUES ({placeholders})",
+                tuple(columns.values()),
             )
             conn.executemany(
                 """INSERT INTO spans
@@ -222,6 +320,136 @@ class SpanStore:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ==================== 评测 harness（Step 4）====================
+
+    def save_suite(self, suite: Any) -> None:
+        """写入一次评测（suite 元信息 + 全部 run）。同 suite_id 重复写入会覆盖。"""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM bench_runs WHERE suite_id = ?", (suite.suite_id,))
+            conn.execute("DELETE FROM bench_suites WHERE suite_id = ?", (suite.suite_id,))
+            conn.execute(
+                """INSERT INTO bench_suites
+                   (suite_id, label, model_name, temperature, runs_per_task, concurrency,
+                    budget_mode, started_at, elapsed_s, total_runs, successes, task_count, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    suite.suite_id, suite.label, suite.model_name, suite.temperature,
+                    suite.runs_per_task, suite.concurrency, suite.budget_mode, suite.started_at,
+                    suite.elapsed_s, suite.total_runs, suite.successes, len(suite.task_summaries),
+                    json.dumps(suite.notes, ensure_ascii=False),
+                ),
+            )
+            conn.executemany(
+                """INSERT INTO bench_runs
+                   (run_id, suite_id, task_uid, task_key, group_name, run_index, ok, self_reported_ok,
+                    failed_checks, process_flags, task_id, sut_name, tokens, cost_usd, elapsed_ms,
+                    llm_calls, tool_calls, steps_done, error_type, error, budget_violated,
+                    budget_would_stop, action_diversity, postcondition_warnings, faults_injected,
+                    created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        o.run_id, o.suite_id, o.task_uid, o.task_key, o.group, o.run_index,
+                        1 if o.ok else 0,
+                        1 if o.self_reported_ok else 0,
+                        json.dumps(o.failed_checks, ensure_ascii=False),
+                        json.dumps(o.process_flags, ensure_ascii=False),
+                        o.task_id, o.sut_name, o.tokens, o.cost_usd, o.elapsed_ms,
+                        o.llm_calls, o.tool_calls, o.steps_done, o.error_type, o.error,
+                        json.dumps(o.budget_violated, ensure_ascii=False),
+                        1 if o.budget_would_stop else 0, o.action_diversity,
+                        o.postcondition_warnings, o.faults_injected,
+                        datetime.now().isoformat(timespec="seconds"),
+                    )
+                    for o in suite.outcomes
+                ],
+            )
+
+    def list_suites(self, limit: int = 10) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT suite_id, label, model_name, runs_per_task, started_at,
+                          total_runs, successes, task_count, elapsed_s, budget_mode
+                   FROM bench_suites ORDER BY started_at DESC, rowid DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def load_suite(self, suite_id: str) -> Optional[Any]:
+        """重建一次评测的汇总结果（用于"不重跑也能重新出报告"）。
+
+        注意：这里只重建汇总所需的信息（failed_checks / process_flags），
+        不重建逐条 CheckResult —— 报告只需要知道"哪几条没过"，
+        完整判定明细已经在跑的时候打印过了。
+        """
+        # 延迟导入：bench.runner 会间接 import lab.api，而 lab.api 又依赖本模块，
+        # 模块级导入会形成循环。函数内导入可以避免这个问题。
+        from lab.bench.runner import RunOutcome, SuiteResult, summarize_task
+        from lab.bench.task import load_all_tasks
+
+        with self._connect() as conn:
+            suite_row = conn.execute(
+                "SELECT * FROM bench_suites WHERE suite_id = ?", (suite_id,)
+            ).fetchone()
+            if not suite_row:
+                return None
+            run_rows = conn.execute(
+                "SELECT * FROM bench_runs WHERE suite_id = ? ORDER BY task_uid, run_index",
+                (suite_id,),
+            ).fetchall()
+
+        outcomes = [
+            RunOutcome(
+                run_id=row["run_id"],
+                suite_id=row["suite_id"],
+                task_uid=row["task_uid"],
+                task_key=row["task_key"] or "",
+                group=row["group_name"] or "",
+                run_index=row["run_index"] or 0,
+                ok=bool(row["ok"]),
+                self_reported_ok=bool(row["self_reported_ok"]),
+                failed_checks=json.loads(row["failed_checks"] or "[]"),
+                process_flags=json.loads(row["process_flags"] or "[]"),
+                task_id=row["task_id"] or "",
+                sut_name=row["sut_name"] or "",
+                tokens=row["tokens"] or 0,
+                cost_usd=row["cost_usd"] or 0.0,
+                elapsed_ms=row["elapsed_ms"] or 0,
+                llm_calls=row["llm_calls"] or 0,
+                tool_calls=row["tool_calls"] or 0.0,
+                steps_done=row["steps_done"] or 0,
+                error_type=row["error_type"],
+                error=row["error"],
+                budget_violated=json.loads(row["budget_violated"] or "[]"),
+                budget_would_stop=bool(row["budget_would_stop"]),
+                action_diversity=row["action_diversity"],
+                postcondition_warnings=row["postcondition_warnings"] or 0,
+                faults_injected=row["faults_injected"] or 0,
+            )
+            for row in run_rows
+        ]
+
+        suites = {task.uid: task for task in load_all_tasks()}
+        return SuiteResult(
+            suite_id=suite_id,
+            label=suite_row["label"] or "",
+            model_name=suite_row["model_name"] or "",
+            temperature=suite_row["temperature"] or 0.0,
+            runs_per_task=suite_row["runs_per_task"] or 1,
+            concurrency=suite_row["concurrency"] or 1,
+            budget_mode=suite_row["budget_mode"] or "observe",
+            started_at=suite_row["started_at"] or "",
+            elapsed_s=suite_row["elapsed_s"] or 0.0,
+            notes=json.loads(suite_row["notes"] or "[]"),
+            self_report_available=all(row["self_reported_ok"] is not None for row in run_rows),
+            outcomes=outcomes,
+            task_summaries=[
+                summarize_task(suites[uid], [o for o in outcomes if o.task_uid == uid])
+                for uid in sorted({o.task_uid for o in outcomes})
+                if uid in suites
+            ],
+        )
 
     def stats(self, sut_name: Optional[str] = None) -> Dict[str, Any]:
         """跨运行聚合：成功率、tokens/任务、成本/任务、P95 耗时。

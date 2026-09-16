@@ -1,0 +1,66 @@
+key: syn_sort_numbers
+group: synthetic
+title: 数字排序落盘
+goal: >-
+  读取 /home/ubuntu/input/numbers.txt（每行一个整数），按从小到大排序，
+  把排序后的结果每行一个写入 /home/ubuntu/sorted.txt。
+tags: [text, file-io]
+fixtures:
+  - path: /home/ubuntu/input/numbers.txt
+    content: |
+      42
+      7
+      -13
+      256
+      0
+      99
+      -1
+      1024
+      13
+      7
+verify:
+  - kind: file_content
+    path: /home/ubuntu/sorted.txt
+    normalize: sorted_lines
+    equals: |
+      -13
+      -1
+      0
+      7
+      7
+      13
+      42
+      99
+      256
+      1024
+    description: 排序结果（含重复项）
+process:
+  max_tool_calls: 12
+solution:
+  - kind: write_file
+    path: /home/ubuntu/sorted.txt
+    content: |
+      -13
+      -1
+      0
+      7
+      7
+      13
+      42
+      99
+      256
+      1024
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/sorted.txt
+    content: |
+      -13
+      -1
+      0
+      7
+      13
+      42
+      99
+      256
+      1024
+notes: 输入含重复值，去掉一个重复项就会失败 —— 这是"看起来对但实际漏数据"的检测点。

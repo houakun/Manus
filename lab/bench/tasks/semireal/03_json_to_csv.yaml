@@ -1,0 +1,45 @@
+key: sem_json_to_csv
+group: semireal
+title: JSON 数组转 CSV（固定列顺序）
+goal: >-
+  读取 /home/ubuntu/input/products.json（对象数组），
+  把它转成 CSV 写入 /home/ubuntu/products.csv。
+  表头必须是 name,price,stock 这个顺序；缺少的字段留空；
+  价格保留原始数值文本，不要加货币符号。
+tags: [json, csv, transform]
+fixtures:
+  - path: /home/ubuntu/input/products.json
+    content: |
+      [
+        {"name": "keyboard", "price": 89, "stock": 12},
+        {"name": "monitor", "price": 320, "stock": 4},
+        {"name": "mouse", "price": 25}
+      ]
+verify:
+  - kind: csv_rows
+    path: /home/ubuntu/products.csv
+    rows:
+      - ["name", "price", "stock"]
+      - ["keyboard", "89", "12"]
+      - ["monitor", "320", "4"]
+      - ["mouse", "25", ""]
+    description: 转换后的 CSV
+process:
+  max_tool_calls: 18
+solution:
+  - kind: write_file
+    path: /home/ubuntu/products.csv
+    content: |
+      name,price,stock
+      keyboard,89,12
+      monitor,320,4
+      mouse,25,
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/products.csv
+    content: |
+      name,price,stock
+      keyboard,89,12
+      monitor,320,4
+      mouse,25,0
+notes: 错误解把缺失字段填成 0 —— 判定器要求必须是空字符串，"缺失"和"零"不能混。

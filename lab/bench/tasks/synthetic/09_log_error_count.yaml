@@ -1,0 +1,34 @@
+key: syn_log_error_count
+group: synthetic
+title: 日志错误行计数
+goal: >-
+  统计 /home/ubuntu/input/app.log 中包含 "ERROR" 的行数（大小写敏感），
+  把数字写入 /home/ubuntu/error_count.txt。
+tags: [text, log]
+fixtures:
+  - path: /home/ubuntu/input/app.log
+    content: |
+      2026-01-01 10:00:00 INFO starting
+      2026-01-01 10:00:01 ERROR db connection failed
+      2026-01-01 10:00:02 INFO retrying
+      2026-01-01 10:00:03 WARN slow query
+      2026-01-01 10:00:04 ERROR retry exhausted
+      2026-01-01 10:00:05 INFO gave up
+      error lowercase should not count
+verify:
+  - kind: numeric
+    path: /home/ubuntu/error_count.txt
+    value: 2
+    description: ERROR 行数
+process:
+  max_tool_calls: 12
+  answer_literals: ["2"]
+solution:
+  - kind: write_file
+    path: /home/ubuntu/error_count.txt
+    content: "2"
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/error_count.txt
+    content: "3"
+notes: 输入里有一行小写 error，用来区分"大小写敏感"和"忽略大小写"两种实现。

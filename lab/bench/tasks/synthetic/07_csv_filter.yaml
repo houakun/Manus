@@ -1,0 +1,43 @@
+key: syn_csv_filter
+group: synthetic
+title: CSV 条件筛选
+goal: >-
+  读取 /home/ubuntu/input/orders.csv（表头 id,item,amount），
+  筛选出 amount 大于 100 的行（保留表头），写入 /home/ubuntu/filtered.csv。
+tags: [csv]
+fixtures:
+  - path: /home/ubuntu/input/orders.csv
+    content: |
+      id,item,amount
+      1,keyboard,89
+      2,monitor,320
+      3,mouse,25
+      4,ssd,180
+      5,desk,101
+verify:
+  - kind: csv_rows
+    path: /home/ubuntu/filtered.csv
+    rows:
+      - ["id", "item", "amount"]
+      - ["2", "monitor", "320"]
+      - ["4", "ssd", "180"]
+      - ["5", "desk", "101"]
+    description: amount>100 的行（含表头）
+process:
+  max_tool_calls: 15
+solution:
+  - kind: write_file
+    path: /home/ubuntu/filtered.csv
+    content: |
+      id,item,amount
+      2,monitor,320
+      4,ssd,180
+      5,desk,101
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/filtered.csv
+    content: |
+      id,item,amount
+      2,monitor,320
+      4,ssd,180
+notes: 边界值 101（略大于 100）必须留下；用 >= 或 > 的实现差别会在这里暴露。

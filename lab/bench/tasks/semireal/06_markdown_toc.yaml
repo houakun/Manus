@@ -1,0 +1,50 @@
+key: sem_markdown_toc
+group: semireal
+title: 为 Markdown 生成目录
+goal: >-
+  读取 /home/ubuntu/input/README.md，把其中所有以 "#" 开头的标题
+  （包括二三级标题）按出现顺序提取出来，生成一个 Markdown 目录写入
+  /home/ubuntu/TOC.md。格式要求：每个标题一行，行首用 "- "，
+  保留原有层级缩进（二级标题缩进 2 个空格，三级标题缩进 4 个空格），
+  并把标题文字原样保留。
+tags: [markdown, text]
+fixtures:
+  - path: /home/ubuntu/input/README.md
+    content: |
+      # 项目说明
+      这是一段正文。
+      ## 安装
+      安装步骤。
+      ### 依赖
+      依赖列表。
+      ## 使用
+      使用方法。
+verify:
+  - kind: file_content
+    path: /home/ubuntu/TOC.md
+    normalize: strip
+    equals: |
+      - 项目说明
+        - 安装
+          - 依赖
+        - 使用
+    description: 生成的目录
+process:
+  max_tool_calls: 15
+solution:
+  - kind: write_file
+    path: /home/ubuntu/TOC.md
+    content: |
+      - 项目说明
+        - 安装
+          - 依赖
+        - 使用
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/TOC.md
+    content: |
+      - 项目说明
+      - 安装
+      - 依赖
+      - 使用
+notes: 错误解丢掉了层级缩进 —— 判定器要求缩进完全一致，这是"格式即语义"的任务。

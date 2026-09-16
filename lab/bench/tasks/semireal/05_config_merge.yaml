@@ -1,0 +1,31 @@
+key: sem_config_merge
+group: semireal
+title: 合并两份配置（后者覆盖前者）
+goal: >-
+  把 /home/ubuntu/input/base.json 与 /home/ubuntu/input/override.json 合并成一份配置，
+  规则：同名字段以 override 为准（浅合并即可），
+  结果写入 /home/ubuntu/merged.json。JSON 对象的键顺序不重要，但内容必须完全一致。
+tags: [json, config]
+fixtures:
+  - path: /home/ubuntu/input/base.json
+    content: |
+      {"host": "localhost", "port": 8000, "debug": false, "timeout": 30}
+  - path: /home/ubuntu/input/override.json
+    content: |
+      {"port": 9000, "debug": true}
+verify:
+  - kind: json_equals
+    path: /home/ubuntu/merged.json
+    equals: '{"host": "localhost", "port": 9000, "debug": true, "timeout": 30}'
+    description: 合并后的配置
+process:
+  max_tool_calls: 15
+solution:
+  - kind: write_file
+    path: /home/ubuntu/merged.json
+    content: '{"host": "localhost", "port": 9000, "debug": true, "timeout": 30}'
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/merged.json
+    content: '{"host": "localhost", "port": 8000, "debug": true, "timeout": 30}'
+notes: 错误解保留了 base 的 port —— 覆盖方向搞反就会是这个结果。

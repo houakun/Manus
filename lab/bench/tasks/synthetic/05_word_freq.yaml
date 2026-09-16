@@ -1,0 +1,31 @@
+key: syn_word_freq
+group: synthetic
+title: 词频统计（输出 JSON）
+goal: >-
+  读取 /home/ubuntu/input/text.txt，统计其中每个英文单词出现的次数（忽略大小写，
+  只按空格与换行分隔）。把所有单词按出现次数从高到低排序，
+  取前 3 个写入 /home/ubuntu/top.json，格式为
+  {"words": [{"word": "xxx", "count": 3}, ...]}，次数相同的按字典序排列。
+tags: [text, json]
+fixtures:
+  - path: /home/ubuntu/input/text.txt
+    content: |
+      the quick brown fox jumps over the lazy dog
+      The DOG barks and the fox runs
+      a quick brown dog
+verify:
+  - kind: json_equals
+    path: /home/ubuntu/top.json
+    equals: '{"words": [{"word": "the", "count": 3}, {"word": "brown", "count": 2}, {"word": "dog", "count": 2}]}'
+    description: 词频 Top3
+process:
+  max_tool_calls: 15
+solution:
+  - kind: write_file
+    path: /home/ubuntu/top.json
+    content: '{"words": [{"word": "the", "count": 3}, {"word": "brown", "count": 2}, {"word": "dog", "count": 2}]}'
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/top.json
+    content: '{"words": [{"word": "the", "count": 3}, {"word": "dog", "count": 2}, {"word": "brown", "count": 2}]}'
+notes: 错误解只把并列项的顺序换了 —— 判定器必须能抓住"排序规则没遵守"。

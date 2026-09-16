@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from lab.api import LabConfigError, default_trace_store, fault_rules_from_spec, run_task_sync
+from lab.bootstrap import ensure_runs_dir
 from lab.sut.base import TaskResult
 from lab.trace.view import render_trace
 
@@ -205,6 +206,161 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bench_validate(args: argparse.Namespace) -> int:
+    """`lab bench validate`：任务集三步自检（不花钱）。"""
+    import asyncio
+
+    from lab.bench.task import load_all_tasks
+    from lab.bench.validate import render_validations, validate_all
+
+    tasks = load_all_tasks(group=args.group)
+    if not tasks:
+        print("[lab] 没有找到任务", file=sys.stderr)
+        return 2
+
+    results = asyncio.run(validate_all(tasks))
+    print(render_validations(results))
+    failed = [item for item in results if not item.ok]
+    print(f"\n结论: {len(results) - len(failed)}/{len(results)} 任务通过自检")
+    if failed:
+        print("\n未通过的任务（先修任务集，再跑评测 —— 否则基线数字不可信）：")
+        for item in failed:
+            print(f"  - {item.uid}: {'; '.join(item.problems) or '自检步骤未按预期'}")
+    return 1 if failed else 0
+
+
+def _cmd_bench_tasks(args: argparse.Namespace) -> int:
+    """`lab bench tasks`：列出任务集。"""
+    from lab.bench.task import load_all_tasks, summarize_tasks
+
+    tasks = load_all_tasks(group=args.group)
+    print(f"共 {len(tasks)} 个任务")
+    for task in tasks:
+        print(f"  [{task.group}] {task.key:24} {task.title}")
+        print(f"      目标: {task.goal.strip().splitlines()[0][:66]}...")
+    summary = summarize_tasks(tasks)
+    print(f"\n分组: {summary['by_group']}")
+    print(f"标签: {summary['by_tag']}")
+    return 0
+
+
+def _cmd_bench_run(args: argparse.Namespace) -> int:
+    """`lab bench run`：跑评测并出报告。"""
+    import asyncio
+
+    from lab.api import default_trace_store, fault_rules_from_spec
+    from lab.bench.report import render_report
+    from lab.bench.runner import run_suite
+    from lab.bench.task import load_all_tasks
+    from lab.guard.budget import BudgetMode, BudgetPolicy
+
+    tasks = load_all_tasks(group=args.group)
+    if args.task:
+        wanted = set(args.task)
+        tasks = [t for t in tasks if t.key in wanted or t.uid in wanted]
+    if args.limit:
+        tasks = tasks[: args.limit]
+    if not tasks:
+        print("[lab] 没有找到任务", file=sys.stderr)
+        return 2
+
+    # 花钱的事要先说清楚。估算基于"n=5 基线里最贵的任务"，属于上限估计。
+    runs = args.runs * len(tasks)
+    estimate = runs * 0.045
+    print(f"即将运行 {len(tasks)} 个任务 × {args.runs} 次 = **{runs} 次真模型调用**")
+    print(f"预估成本上限 ≈ ${estimate:.2f}（基于历史上最贵的单次任务估算）")
+    if estimate > 1.0 and not args.yes:
+        print("\n[lab] 预估成本超过 $1.00，请确认后加 --yes 重跑。", file=sys.stderr)
+        print("      先用小规模验证链路：--limit 2 --runs 1", file=sys.stderr)
+        return 2
+
+    budget_policy = BudgetPolicy.from_env()
+    if args.budget_mode:
+        budget_policy = budget_policy.model_copy(update={"mode": BudgetMode(args.budget_mode)})
+
+    suite = asyncio.run(run_suite(
+        runs_per_task=args.runs,
+        group=args.group,
+        limit=args.limit,
+        keys=args.task,
+        label=args.label,
+        bench_root=ensure_runs_dir() / "bench",
+        concurrency=args.concurrency,
+        temperature=args.temperature,
+        budget_policy=budget_policy,
+        fault_rules=fault_rules_from_spec(
+            args.fault, tool=args.fault_tool, rate=args.fault_rate
+        ),
+    ))
+
+    store = default_trace_store()
+    store.save_suite(suite)
+    print("")
+    print(f"评测完成: {suite.successes}/{suite.total_runs} 成功"
+          f"（{suite.success_rate.point:.1%}，95% 区间 [{suite.success_rate.low:.1%}, "
+          f"{suite.success_rate.high:.1%}]），耗时 {suite.elapsed_s}s")
+
+    if args.report:
+        report = render_report(suite)
+        out_path = _write_report(suite.suite_id[:8], report)
+        print(f"报告已写入: {out_path}")
+    print(f"重新出报告: python -m lab bench report {suite.suite_id[:8]}")
+    return 0
+
+
+def _write_report(suite_id: str, report: str) -> Path:
+    reports_dir = ensure_runs_dir() / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    path = reports_dir / f"{suite_id}.md"
+    path.write_text(report, encoding="utf-8")
+    return path
+
+
+def _cmd_bench_report(args: argparse.Namespace) -> int:
+    """`lab bench report`：从历史评测重新生成报告（不重跑）。"""
+    from lab.api import default_trace_store
+    from lab.bench.report import render_report
+
+    store = default_trace_store()
+    suite_id = args.suite_id
+    if not suite_id:
+        suites = store.list_suites(limit=1)
+        if not suites:
+            print("[lab] 还没有任何评测记录", file=sys.stderr)
+            return 2
+        suite_id = suites[0]["suite_id"]
+    elif len(suite_id) < 36:
+        # 支持短 id：取唯一匹配
+        matched = [row for row in store.list_suites(limit=200) if row["suite_id"].startswith(suite_id)]
+        if len(matched) != 1:
+            print(f"[lab] 无法唯一确定 suite: {suite_id}（匹配 {len(matched)} 个）", file=sys.stderr)
+            return 2
+        suite_id = matched[0]["suite_id"]
+
+    suite = store.load_suite(suite_id)
+    if suite is None:
+        print(f"[lab] 未找到评测: {suite_id}", file=sys.stderr)
+        return 2
+
+    report = render_report(suite)
+    if args.out:
+        path = Path(args.out)
+        path.write_text(report, encoding="utf-8")
+        print(f"报告已写入: {path}")
+    else:
+        print(report)
+    return 0
+
+
+def _cmd_bench_list(args: argparse.Namespace) -> int:
+    """`lab bench list`：列出历史评测。"""
+    from lab.api import default_trace_store
+    from lab.bench.report import render_suite_list
+
+    print(render_suite_list(default_trace_store().list_suites(limit=args.limit)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lab",
@@ -240,6 +396,46 @@ def build_parser() -> argparse.ArgumentParser:
     stats_parser = sub.add_parser("stats", help="跨运行聚合指标")
     stats_parser.add_argument("--sut", default=None, help="按 SUT 名字过滤（如 manus-planner-react[fast]）")
     stats_parser.set_defaults(func=_cmd_stats)
+
+    # ==================== 评测 harness ====================
+    bench_parser = sub.add_parser("bench", help="评测 harness（任务集 / 执行器 / 判定器 / 报告）")
+    bench_sub = bench_parser.add_subparsers(dest="bench_command", required=True)
+
+    bench_tasks = bench_sub.add_parser("tasks", help="列出任务集")
+    bench_tasks.add_argument("--group", default=None, help="只列某个分组")
+    bench_tasks.set_defaults(func=_cmd_bench_tasks)
+
+    bench_validate = bench_sub.add_parser(
+        "validate", help="任务集三步自检（不花钱；跑评测前必做）"
+    )
+    bench_validate.add_argument("--group", default=None)
+    bench_validate.set_defaults(func=_cmd_bench_validate)
+
+    bench_run = bench_sub.add_parser("run", help="跑评测（会花真钱）")
+    bench_run.add_argument("--runs", type=int, default=1, help="每个任务重复次数（n）")
+    bench_run.add_argument("--group", default=None)
+    bench_run.add_argument("--limit", type=int, default=None, help="只跑前 N 个任务（先验证链路）")
+    bench_run.add_argument("--task", action="append", default=None,
+                           help="只跑指定的任务 key（可多次；用于补跑失败任务或单任务对照）")
+    bench_run.add_argument("--label", default="", help="给本次评测起个名字")
+    bench_run.add_argument("--concurrency", type=int, default=1, help="并发度（>1 会让耗时不可比）")
+    bench_run.add_argument("--temperature", type=float, default=None)
+    bench_run.add_argument("--budget-mode", default=None, choices=["observe", "degrade", "enforce"])
+    bench_run.add_argument("--fault", action="append", default=None, help="注入故障（可多次/逗号分隔）")
+    bench_run.add_argument("--fault-tool", default="*")
+    bench_run.add_argument("--fault-rate", type=float, default=1.0)
+    bench_run.add_argument("--report", action="store_true", help="跑完直接生成 Markdown 报告")
+    bench_run.add_argument("--yes", action="store_true", help="确认可能较高的成本")
+    bench_run.set_defaults(func=_cmd_bench_run)
+
+    bench_report = bench_sub.add_parser("report", help="从历史评测重新生成报告（不重跑）")
+    bench_report.add_argument("suite_id", nargs="?", default=None, help="支持短 id")
+    bench_report.add_argument("--out", default=None, help="写入文件而不是打印")
+    bench_report.set_defaults(func=_cmd_bench_report)
+
+    bench_list = bench_sub.add_parser("list", help="列出历史评测")
+    bench_list.add_argument("--limit", type=int, default=10)
+    bench_list.set_defaults(func=_cmd_bench_list)
 
     return parser
 

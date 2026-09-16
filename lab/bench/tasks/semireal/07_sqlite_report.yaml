@@ -1,0 +1,36 @@
+key: sem_sqlite_report
+group: semireal
+title: 用 SQLite 建表并输出汇总
+goal: >-
+  创建数据库 /home/ubuntu/sales.db，建表 sales(id INTEGER, region TEXT, amount INTEGER)，
+  插入以下数据：(1,'north',100) (2,'south',250) (3,'north',300) (4,'south',200)，
+  然后查询每个 region 的 amount 合计，按合计从大到小输出到 /home/ubuntu/report.txt，
+  每行格式为 "region=合计"（例如 south=450）。
+tags: [sqlite, exec, data]
+verify:
+  - kind: file_content
+    path: /home/ubuntu/report.txt
+    normalize: strip
+    equals: |
+      south=450
+      north=400
+    description: 分区域销售汇总（必须按合计降序）
+  - kind: file_exists
+    path: /home/ubuntu/sales.db
+    exists: true
+    description: 数据库文件确实被创建
+process:
+  max_tool_calls: 25
+solution:
+  # 注意：宿主环境没有 sqlite3 命令行，必须用 python 的 sqlite3 模块；
+  # 命令写成一整行（宿主 shell 对多行命令支持不一致）。
+  # 数据故意设计成 south > north：这样"漏写 ORDER BY"会得到相反的行序，
+  # 判定器才能把它和正确解区分开（这一步是任务自检帮我发现的）。
+  - kind: exec
+    command: >-
+      python -c "import sqlite3; c=sqlite3.connect('sales.db'); c.execute('CREATE TABLE IF NOT EXISTS sales(id INTEGER, region TEXT, amount INTEGER)'); c.execute('DELETE FROM sales'); c.executemany('INSERT INTO sales VALUES(?,?,?)', [(1,'north',100),(2,'south',250),(3,'north',300),(4,'south',200)]); c.commit(); rows=c.execute('SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) DESC').fetchall(); open('report.txt','w').write('\n'.join(f'{r}={a}' for r,a in rows)); c.close()"
+wrong:
+  - kind: exec
+    command: >-
+      python -c "import sqlite3; c=sqlite3.connect('sales.db'); c.execute('CREATE TABLE IF NOT EXISTS sales(id INTEGER, region TEXT, amount INTEGER)'); c.execute('DELETE FROM sales'); c.executemany('INSERT INTO sales VALUES(?,?,?)', [(1,'north',100),(2,'south',250),(3,'north',300),(4,'south',200)]); c.commit(); rows=c.execute('SELECT region, SUM(amount) FROM sales GROUP BY region').fetchall(); open('report.txt','w').write('\n'.join(f'{r}={a}' for r,a in rows)); c.close()"
+notes: 错误解没写 ORDER BY。数据刻意让 south>north，否则自然行序恰好等于降序，判定器就区分不出来（自检发现的问题）。

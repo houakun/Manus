@@ -1,0 +1,24 @@
+key: syn_date_diff
+group: synthetic
+title: 计算两个日期相差天数
+goal: >-
+  计算 2026-03-01 与 2025-12-15 之间相差多少天（用后一个日期减去前一个日期），
+  把天数写入 /home/ubuntu/days.txt。
+tags: [numeric, date]
+verify:
+  - kind: numeric
+    path: /home/ubuntu/days.txt
+    value: 76
+    description: 两个日期相差天数
+process:
+  max_tool_calls: 12
+  answer_literals: ["76"]
+solution:
+  - kind: write_file
+    path: /home/ubuntu/days.txt
+    content: "76"
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/days.txt
+    content: "75"
+notes: 跨年且跨越 2 月，用来暴露"手工算天数"容易出的错。

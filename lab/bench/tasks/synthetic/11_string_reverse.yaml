@@ -1,0 +1,27 @@
+key: syn_string_reverse
+group: synthetic
+title: 字符串处理（反转 + 大写）
+goal: >-
+  读取 /home/ubuntu/input/word.txt，把其中的文本先反转、再全部转成大写，
+  结果写入 /home/ubuntu/reversed.txt。
+tags: [text]
+fixtures:
+  - path: /home/ubuntu/input/word.txt
+    content: "Manus Agent"
+verify:
+  - kind: file_content
+    path: /home/ubuntu/reversed.txt
+    normalize: strip
+    equals: "TNEGA SUNUM"
+    description: 反转并大写（顺序与大小写都要对）
+process:
+  max_tool_calls: 10
+solution:
+  - kind: write_file
+    path: /home/ubuntu/reversed.txt
+    content: "TNEGA SUNUM"
+wrong:
+  - kind: write_file
+    path: /home/ubuntu/reversed.txt
+    content: "MANUS AGENT"
+notes: 错误解只做了大写没做反转，用来确认判定器不会被"部分正确"骗过。

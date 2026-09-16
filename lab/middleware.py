@@ -85,6 +85,7 @@ class ToolGuard:
             max_attempts: int = 3,
             verify_postconditions: bool = True,
             seed: int = 42,
+            watch_literals: Optional[List[str]] = None,
     ) -> None:
         self._recorder = recorder
         self.budget = budget
@@ -94,11 +95,49 @@ class ToolGuard:
         self._max_attempts = max(1, max_attempts)
         self._verify = verify_postconditions
         self._rng = random.Random(seed)
+        # 硬编码检测：这些字面量如果直接出现在写入内容/命令里，说明是"抄答案"而不是算出来的。
+        # 由 bench 层传入（它才知道答案是什么），guard 只负责盯。
+        self._watch_literals = [item for item in (watch_literals or []) if item]
 
         # 观察结果（进 TaskResult）
         self.postcondition_warnings: List[str] = []
         self.retry_stats: Dict[str, int] = {}
         self.fault_counts: Dict[str, int] = {}
+        # 失败类型计数：bench 的"越权访问"等过程规则靠它
+        self.error_types: Dict[str, int] = {}
+        # 硬编码可疑记录：{文件或命令: [命中的字面量]}
+        self.hardcode_suspects: Dict[str, List[str]] = {}
+
+    def _note_error_type(self, error_type: Optional[str]) -> None:
+        """累计失败类型（供过程规则与归因统计使用）。"""
+        if not error_type:
+            return
+        self.error_types[error_type] = self.error_types.get(error_type, 0) + 1
+
+    def _check_hardcode(self, function_name: str, args: Dict[str, Any]) -> None:
+        """盯住"直接写入答案"这个作弊模式。
+
+        两种作弊路径都要盖住：
+          - `write_file` 直接把答案写进文件（content 命中字面量）
+          - `shell_execute` 用 echo/printf 把答案重定向进文件（command 命中字面量）
+        这是个**启发式**：可能误报（例如任务本身就是要求写入某个固定字符串），
+        所以它只进 process_flags，不影响结果分 `ok`。
+        """
+        if not self._watch_literals:
+            return
+        if function_name == "write_file":
+            haystack = args.get("content") or ""
+            where = args.get("filepath") or "write_file"
+        elif function_name == "shell_execute":
+            haystack = args.get("command") or ""
+            where = args.get("command", "shell_execute")[:80]
+        else:
+            return
+        if not isinstance(haystack, str):
+            return
+        hits = [literal for literal in self._watch_literals if literal in haystack]
+        if hits:
+            self.hardcode_suspects.setdefault(where, []).extend(hits)
 
     # ==================== 工具包装 ====================
 
@@ -141,6 +180,7 @@ class ToolGuard:
         if self.budget is not None:
             self.budget.note_tool_call()
         hit = self.loop_guard.observe(function_name, args)
+        self._check_hardcode(function_name, args)
         self.check_budget()
 
         attempt = 0
@@ -193,6 +233,7 @@ class ToolGuard:
         # 3.任何失败都转成结构化结果返回（永不抛异常，理由见模块注释）
         if result is None:
             error_type, retryable = _classify_exception(error)
+            self._note_error_type(error_type)
             result = ToolResult(
                 success=False,
                 message=f"{type(error).__name__}: {error}" if error else "工具调用失败",
@@ -202,6 +243,8 @@ class ToolGuard:
             )
         else:
             result.attempts = attempt
+            if not result.success:
+                self._note_error_type(result.error_type)
 
         # 4.后置校验：独立确认"声称成功"是否真的成立
         warning: Optional[str] = None
@@ -244,7 +287,10 @@ class ToolGuard:
             "postconditions": {"warnings": self.postcondition_warnings},
             "retries": {"total": sum(self.retry_stats.values()), "by_reason": dict(self.retry_stats)},
             "loop": self.loop_guard.report(),
+            "error_types": dict(self.error_types),
         }
+        if self.hardcode_suspects:
+            data["hardcode_suspects"] = {key: sorted(set(value)) for key, value in self.hardcode_suspects.items()}
         if self.budget is not None:
             data["budget"] = self.budget.report().model_dump(mode="json")
         if self.injector is not None:
