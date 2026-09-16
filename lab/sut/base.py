@@ -68,6 +68,10 @@ class TaskResult(BaseModel):
     # --- 产物与轨迹 ---
     workspace: str = ""  # 本次任务的本地工作目录（可直接进去看 Agent 写了什么）
     trace_path: Optional[str] = None  # 轨迹文件路径（Step 2 填充）
+    # 加固层观察结果（Step 3）：预算越界 / 循环检测 / 故障注入 / 重试 / 后置校验。
+    # 用 dict 而不是一堆具名字段：这一步的观察项还会变（Step 4 会加置信区间相关项），
+    # 每次都改 TaskResult 的字段会让所有构造点都要跟着改。
+    guard: Dict[str, Any] = Field(default_factory=dict)
 
     def summary_line(self) -> str:
         """一行摘要，用于 CLI 输出与 CI 日志。"""

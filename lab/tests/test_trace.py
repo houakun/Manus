@@ -334,7 +334,8 @@ def test_render_tree_shows_hierarchy_and_attrs():
     recorder = TraceRecorder("t1", sut_name="fake-sut")
     step = recorder.open_step("写文件")
     tool = recorder.open_tool("write_file", "file", {"filepath": "/a.txt"})
-    tool.end(success=True, attempts=2)
+    tool.end(success=True, attempts=2, faults_injected="partial_write",
+              postcondition_warning="写入内容与预期不一致")
     step.end(success=True)
     recorder.finish_task(ok=True)
 
@@ -345,6 +346,9 @@ def test_render_tree_shows_hierarchy_and_attrs():
     assert "[tool]" in text
     assert "write_file" in text
     assert "attempts=2" in text  # D2 类问题靠这个字段被发现
+    # 加固层信号必须直接可见：否则"全绿但全错"在默认视图里看不出来
+    assert "fault=partial_write" in text
+    assert "post=" in text
 
 
 def test_render_tree_handles_empty_and_broken_input():

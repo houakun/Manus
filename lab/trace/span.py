@@ -246,6 +246,25 @@ class TraceRecorder:
                 if top is span:
                     break
 
+    def current_span(self) -> Optional[Span]:
+        """当前栈顶 span（中间件用它来定位"该给哪个 span 补属性"）。"""
+        return self._stack[-1] if self._stack else None
+
+    def annotate(self, **attrs: Any) -> None:
+        """把附加属性写到**当前栈顶** span 上。
+
+        为什么中间件不自己建 span：工具 span 已经由适配器根据 `ToolEvent` 建好了
+        （事件才是权威来源）。中间件只需要"在已有 span 上补注"；
+        如果它也建一个，一次工具调用就会出现两个 span，所有工具类指标都会翻倍。
+        """
+        span = self.current_span()
+        if span is None:
+            return
+        for key, value in attrs.items():
+            if value is None:
+                continue
+            span.attrs[key] = value if _is_jsonable(value) else str(value)
+
     def close_open_spans(self, *, error: Optional[str] = None, status: str = "error") -> None:
         """收尾：把所有未关闭的 span 关掉。
 

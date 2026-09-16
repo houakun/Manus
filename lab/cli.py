@@ -25,7 +25,7 @@ import json
 import sys
 from pathlib import Path
 
-from lab.api import LabConfigError, default_trace_store, run_task_sync
+from lab.api import LabConfigError, default_trace_store, fault_rules_from_spec, run_task_sync
 from lab.sut.base import TaskResult
 from lab.trace.view import render_trace
 
@@ -51,6 +51,9 @@ def _print_human(result: TaskResult) -> None:
     print(f"成本     : ${result.cost_usd:.6f}")
     print(f"耗时     : {result.elapsed_ms} ms")
 
+    # 加固层观察结果（Step 3）：observe 模式下这些全是"本会怎样"，不改变实际行为
+    _print_guard(result)
+
     if result.attachments:
         print(f"交付文件 : {', '.join(result.attachments)}")
     if result.error:
@@ -70,6 +73,44 @@ def _print_human(result: TaskResult) -> None:
     print("")
 
 
+def _print_guard(result: TaskResult) -> None:
+    """打印加固层观察结果。
+
+    observe 模式下最有价值的两个量是 `would_stop` / `would_degrade`：
+    它们让我们在**不改变 SUT 行为**的前提下，预演切换到 enforce/degrade 的后果。
+    """
+    guard = result.guard or {}
+    budget = guard.get("budget")
+    if budget:
+        violated = budget.get("violated_metrics") or []
+        flag = "⚠️" if violated else "✓"
+        print(f"预算[{budget.get('mode')}]  : {flag} 越界维度 {violated or '无'} "
+              f"(检查 {budget.get('checks')} 次；本会中止={budget.get('would_stop')})")
+        if budget.get("final"):
+            final = budget["final"]
+            print(f"          最终值 tokens={final.get('tokens')} cost=${final.get('cost_usd')} "
+                  f"elapsed={final.get('elapsed_s')}s steps={final.get('steps')} tools={final.get('tool_calls')}")
+
+    loop = guard.get("loop") or {}
+    if loop:
+        print(f"循环检测 : 最长连续重复 {loop.get('max_consecutive_repeat')} 次，"
+              f"熔断候选 {loop.get('repeat_trips')} 次，动作多样性 {loop.get('action_diversity')}")
+
+    retries = guard.get("retries") or {}
+    if retries.get("total"):
+        print(f"重试     : 共 {retries['total']} 次，原因 {retries.get('by_reason')}")
+
+    faults = guard.get("faults_observed") or {}
+    if faults:
+        print(f"故障注入 : {faults}")
+
+    warnings = (guard.get("postconditions") or {}).get("warnings") or []
+    if warnings:
+        print(f"后置校验 : ⚠️ {len(warnings)} 条告警")
+        for warning in warnings[:3]:
+            print(f"           - {warning[:100]}")
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """执行 `lab run`。"""
     try:
@@ -81,6 +122,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
             temperature=args.temperature,
             exec_timeout=args.exec_timeout,
             trace=not args.no_trace,
+            fault_rules=fault_rules_from_spec(
+                args.fault, tool=args.fault_tool, rate=args.fault_rate, latency_s=args.fault_latency
+            ),
         )
     except LabConfigError as e:
         # 使用错误（例如没配 key）：打印可操作的提示，不要抛栈
@@ -177,6 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--temperature", type=float, default=None, help="覆盖温度（默认 0.0 可复现）")
     run_parser.add_argument("--json", action="store_true", help="输出完整 JSON")
     run_parser.add_argument("--no-trace", action="store_true", help="不采集轨迹（测纯执行速度时用）")
+    run_parser.add_argument(
+        "--fault", action="append", default=None,
+        help="注入故障（可多次/逗号分隔）：timeout, transient_error, permanent_error, malformed_result, "
+             "empty_result, truncated_result, silent_wrong_result, partial_write, latency_spike, flaky",
+    )
+    run_parser.add_argument("--fault-tool", default="*", help="故障只作用于匹配的工具名（支持 glob，如 'shell_*'）")
+    run_parser.add_argument("--fault-rate", type=float, default=1.0, help="故障命中概率 0~1")
+    run_parser.add_argument("--fault-latency", type=float, default=2.0, help="latency_spike 注入的额外延迟（秒）")
     run_parser.set_defaults(func=_cmd_run)
 
     trace_parser = sub.add_parser("trace", help="查看一次运行的轨迹树")

@@ -68,6 +68,12 @@ def _key_attrs(span: Span, kind_attrs: bool = True) -> str:
             parts.append(f"attempts={attrs['attempts']}")
         if attrs.get("result_chars"):
             parts.append(f"out={attrs['result_chars']}c")
+        # 加固层最要紧的两个信号必须出现在树里：
+        # 否则"6 次 write_file 全绿但全文错"这种事在默认视图里完全看不出来。
+        if attrs.get("faults_injected"):
+            parts.append(f"⚡fault={attrs['faults_injected']}")
+        if attrs.get("postcondition_warning"):
+            parts.append(f"⚠post={str(attrs['postcondition_warning'])[:50]}")
     elif span.kind == SpanKind.STEP:
         if attrs.get("success") is not None:
             parts.append(f"success={attrs['success']}")

@@ -54,6 +54,7 @@ from app.domain.services.tools.shell import ShellTool  # noqa: E402
 from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser  # noqa: E402
 
 from lab.infra.memory_uow import create_uow_factory  # noqa: E402
+from lab.middleware import ToolGuard  # noqa: E402
 from lab.sut.base import SUT, StepStats, TaskResult  # noqa: E402
 from lab.trace.span import TraceRecorder  # noqa: E402
 from lab.usage import Usage  # noqa: E402
@@ -75,6 +76,7 @@ class ManusSUT(SUT):
             usage: Optional[Usage] = None,
             max_seconds: float = 300.0,
             trace: Optional[TraceRecorder] = None,
+            guard: Optional[ToolGuard] = None,
     ) -> None:
         """构造函数：所有依赖都由外部注入，adapter 自己不 new 任何具体实现。"""
         self._llm = llm
@@ -98,6 +100,10 @@ class ManusSUT(SUT):
         self._tool_handles: dict = {}
         self._plan_revisions = 0
 
+        # 工具层中间件（Step 3）：不传就现建一个 observe 模式的，
+        # 保证"预算/循环"至少是被观测的（不传就啥都看不见，很容易漏掉问题）。
+        self._guard = guard or ToolGuard(recorder=self._trace, sandbox=self._sandbox)
+
     # ==================== 工具集构造 ====================
 
     def _build_tools(self) -> Optional[List[BaseTool]]:
@@ -114,11 +120,15 @@ class ManusSUT(SUT):
         """
         if not self._fast_mode:
             return None
-        return [
+        tools = [
             FileTool(sandbox=self._sandbox),
             ShellTool(sandbox=self._sandbox),
             MessageTool(),
         ]
+        # Step 3：整列表包一层 GuardedTool 代理。
+        # SUT 对工具只用 .name / .get_tools() / .has_tool() / .invoke() 四个成员，
+        # 所以代理这四个就够了 —— 这就是"零 SUT 改动接入中间件"的全部代价。
+        return self._guard.wrap_tools(tools)
 
     # ==================== 主流程 ====================
 
@@ -243,6 +253,8 @@ class ManusSUT(SUT):
             # 记录错误链长度：级联很深（一次失败爆出好几条错误）本身就是个信号，
             # 说明 SUT 的失败处理把同一个根因反复包装了
             error_chain_len=len(error_chain),
+            # 加固层观察汇总（预算/循环/重试/后置校验）
+            guard_summary=len(self._guard.postcondition_warnings),
         )
 
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
@@ -262,6 +274,7 @@ class ManusSUT(SUT):
             llm_usage=self._usage,
             elapsed_ms=elapsed_ms,
             workspace=str(self._workspace),
+            guard=self._guard.report(),
         )
 
     # ==================== 事件 → span 的映射 ====================
@@ -276,6 +289,8 @@ class ManusSUT(SUT):
         step = event.step
         if event.status == StepEventStatus.STARTED:
             self._step_handles[step.id] = self._trace.open_step(step.description, step.id)
+            # 通知中间件"进入新步骤"：预算里的步数 +1，循环检测重置连续计数
+            self._guard.note_step()
             return
 
         handle = self._step_handles.pop(step.id, None)

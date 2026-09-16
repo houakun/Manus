@@ -34,12 +34,18 @@ from lab.trace.view import render_tree  # noqa: E402
 from lab.usage import Usage  # noqa: E402
 
 
-def _build_sut(tmp_path, script, recorder):
+def _build_sut(tmp_path, script, recorder, *, injector=None, budget_policy=None):
     """组装一个 fast mode 的 SUT（全部依赖都是 lab 侧替身）。"""
+    from lab.faults.injector import FaultInjector
+    from lab.guard.budget import Budget, BudgetPolicy
+    from lab.middleware import ToolGuard
+
     usage = Usage()
-    llm = CountingLLM(ScriptedLLM(script), usage, sink=recorder)
     workspace = tmp_path / "workspace"
     sandbox = LocalSandbox(workspace)
+    budget = Budget(usage, model_name="deepseek-chat", policy=budget_policy or BudgetPolicy())
+    guard = ToolGuard(recorder=recorder, budget=budget, injector=injector, sandbox=sandbox)
+    llm = CountingLLM(ScriptedLLM(script), usage, sink=recorder, after_call=guard.check_budget)
     sut = ManusSUT(
         llm=llm,
         # 直接构造配置，避免测试依赖 api/config.yaml 的内容
@@ -52,6 +58,7 @@ def _build_sut(tmp_path, script, recorder):
         usage=usage,
         max_seconds=30,
         trace=recorder,
+        guard=guard,
     )
     return sut, usage
 
@@ -231,7 +238,6 @@ async def test_failed_tool_records_error_type_in_span(tmp_path):
 
 
 # ==================== 组合根（api.run_task）的接线测试 ====================
-
 def test_run_task_wires_trace_and_persists(tmp_path, monkeypatch):
     """验证 api.run_task 这个"组合根"把 recorder 正确串到了 LLM 代理、SUT 和存储上。
 

@@ -25,7 +25,7 @@ SUT 改造后，OpenAILLM 的返回值里多了 `_usage` / `_latency_ms` / `_mod
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from lab.bootstrap import ensure_sut_on_path
 
@@ -42,11 +42,16 @@ _PRIVATE_KEYS = ("_usage", "_latency_ms", "_model")
 class CountingLLM:
     """LLM 协议代理：转发调用 + 采集用量 + 上报 llm span。"""
 
-    def __init__(self, inner: LLM, usage: Usage, sink: Optional[SpanSink] = None) -> None:
+    def __init__(self, inner: LLM, usage: Usage, sink: Optional[SpanSink] = None,
+                 after_call: Optional[Callable[[], None]] = None) -> None:
         self._inner = inner
         self._usage = usage
         # sink 可选：不传也能工作（离线实验 / 单元测试场景）
         self._sink = sink
+        # after_call 可选：每次调用后回调。Step 3 用它做"每次 LLM 调用后检查预算"——
+        # token 与成本是在 LLM 调用时涨的，只在工具调用前检查会漏检
+        # （一个不停思考、不调工具的 Agent 会完全绕过预算）。
+        self._after_call = after_call
 
     def _measure_context(self, messages: List[Dict[str, Any]]) -> int:
         """估算本次请求的上下文字符数。
@@ -135,6 +140,11 @@ class CountingLLM:
                 total_tokens=(raw_usage or {}).get("total_tokens"),
                 has_tool_calls=bool(result.get("tool_calls")),
             )
+
+        # 4.调用后回调（预算检查）。放在最后：此时 span 已经收口，
+        #   预算越界会被标注到当前栈顶（即所在 step），而不是这条 llm span 上。
+        if self._after_call is not None:
+            self._after_call()
 
         return result
 

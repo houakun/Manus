@@ -525,7 +525,10 @@ class LocalSandbox:
                 success=False,
                 message=f"命令执行超时({self._exec_timeout}s)，已强制终止: {command}",
                 error_type="timeout",
-                retryable=False,
+                # retryable 只表示"失败类型是暂态"，**不表示"应该重试"**。
+                # 是否真的重试由中间件结合「工具幂等性」判定：shell_execute 非幂等，
+                # 所以它不会被自动重试（否则命令可能已经产生一半副作用）。
+                retryable=True,
                 data={
                     "session_id": session_id,
                     "command": command,

@@ -183,7 +183,10 @@ async def test_command_timeout_is_enforced(sandbox: LocalSandbox):
 
     assert result.success is False
     assert result.error_type == "timeout"
-    assert result.retryable is False
+    # retryable=True 表达的是"超时属于暂态失败"，**不代表应该重试**。
+    # 是否真的重试由中间件结合幂等性判定：shell_execute 非幂等 → 不会被自动重试。
+    # （这正是 D2 "重试非幂等工具导致重复副作用"的正解，详见 lab/guard/retry.py）
+    assert result.retryable is True
     # 2 秒超时 + 杀树开销，给足余量也不能接近 60 秒
     assert elapsed < 20, f"超时未真正生效，耗时 {elapsed:.1f}s（进程树可能没杀干净）"
 

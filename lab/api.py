@@ -29,9 +29,13 @@ ensure_sut_on_path()
 from app.infrastructure.external.llm.openai_llm import OpenAILLM  # noqa: E402
 
 from lab.config import load_agent_config, load_llm_config  # noqa: E402
+from lab.faults.injector import FaultInjector  # noqa: E402
+from lab.faults.kinds import FaultKind, FaultRule  # noqa: E402
+from lab.guard.budget import Budget, BudgetPolicy  # noqa: E402
 from lab.infra.counting_llm import CountingLLM  # noqa: E402
 from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
 from lab.infra.nulls import NullBrowser, NullSearchEngine  # noqa: E402
+from lab.middleware import ToolGuard  # noqa: E402
 from lab.sut.base import TaskResult  # noqa: E402
 from lab.sut.manus_adapter import ManusSUT  # noqa: E402
 from lab.trace.span import TraceRecorder  # noqa: E402
@@ -50,6 +54,36 @@ def default_trace_store() -> SpanStore:
     return SpanStore(ensure_runs_dir() / TRACE_DB_NAME)
 
 
+def fault_rules_from_spec(
+        kinds: Optional[List[str]] = None,
+        *,
+        tool: str = "*",
+        rate: float = 1.0,
+        latency_s: float = 2.0,
+) -> List[FaultRule]:
+    """把命令行传的故障名转成注入规则（CLI / 临时实验用）。
+
+    只做"每种故障各一条规则"这个最小形态。复杂的组合场景（按工具×按次数×�継发）
+    直接在测试里构造 `FaultRule` 列表，不要把这个函数堆成配置语言。
+    """
+    rules: List[FaultRule] = []
+    for raw in kinds or []:
+        for name in str(raw).split(","):
+            name = name.strip()
+            if not name:
+                continue
+            rules.append(FaultRule(
+                kind=FaultKind(name),
+                tool=tool,
+                rate=rate,
+                latency_s=latency_s,
+                # 这两种故障的语义是"前 N 次失败/前 N 次慢"，默认只影响第一次，
+                # 让重试路径可以被确定性地验证
+                fail_times=1 if FaultKind(name) == FaultKind.TRANSIENT_ERROR else None,
+            ))
+    return rules
+
+
 class LabConfigError(RuntimeError):
     """lab 配置有问题（例如没配 API Key），属于"使用错误"，不是 SUT 缺陷。"""
 
@@ -65,6 +99,8 @@ async def run_task(
         exec_timeout: int = 60,
         attachments: Optional[List[str]] = None,
         trace: bool = True,
+        fault_rules: Optional[List[FaultRule]] = None,
+        budget_policy: Optional[BudgetPolicy] = None,
 ) -> TaskResult:
     """跑一个任务，返回标准化结果。
 
@@ -78,6 +114,8 @@ async def run_task(
     :param exec_timeout: 单条 shell 命令的超时
     :param attachments: 随任务一起传入的附件（沙箱逻辑路径）
     :param trace: 是否采集轨迹（默认开；关掉可以测"纯执行"的最快速度）
+    :param fault_rules: 故障注入规则（None = 不注入，即 baseline）
+    :param budget_policy: 预算策略（None = 用环境变量/默认值，默认 observe 模式不干预）
     """
     # 1.准备配置（唯一真源是 SUT 的 config.yaml，环境变量可覆盖）
     llm_config = load_llm_config(temperature=temperature)
@@ -105,14 +143,25 @@ async def run_task(
             "（接缝已经留好：把 DockerSandbox 实例传给 ManusSUT 即可）"
         )
 
-    # 4.组装依赖：LLM 用代理包一层以采集 token/成本；沙箱用本地实现
-    #   组成根（composition root）在这里：所有依赖的顺序关系一眼可读 ——
-    #   recorder 必须先建（LLM 代理和 SUT 都要用它）。
+    # 4.组装依赖（组成根）：这里的顺序**就是**依赖关系，一眼可读
     usage = Usage()
     recorder = TraceRecorder(task_id, goal=goal) if trace else None
     store = default_trace_store()
-    llm = CountingLLM(OpenAILLM(llm_config), usage, sink=recorder)
     sandbox = LocalSandbox(workspace, exec_timeout=exec_timeout)
+
+    # 4.1 预算（Step 3 默认 observe：只记录不干预）+ 故障注入 + 工具中间件
+    budget = Budget(
+        usage,
+        model_name=llm_config.model_name,
+        policy=budget_policy or BudgetPolicy.from_env(),
+    )
+    injector = FaultInjector(fault_rules) if fault_rules else None
+    guard = ToolGuard(recorder=recorder, budget=budget, injector=injector, sandbox=sandbox)
+
+    # 4.2 LLM 代理：采集用量 + **每次 LLM 调用后**触发预算检查。
+    #     为什么要在 LLM 调用后也查：token/成本是在 LLM 调用时涨的，
+    #     只在工具调用前查会漏掉"不停思考、不调工具"的失控路径。
+    llm = CountingLLM(OpenAILLM(llm_config), usage, sink=recorder, after_call=guard.check_budget)
 
     sut = ManusSUT(
         llm=llm,
@@ -125,6 +174,7 @@ async def run_task(
         usage=usage,
         max_seconds=max_seconds,
         trace=recorder,
+        guard=guard,
     )
 
     # 5.执行并补齐计量字段
