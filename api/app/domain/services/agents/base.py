@@ -24,6 +24,19 @@ from app.domain.services.tools.base import BaseTool
 logger = logging.getLogger(__name__)
 
 
+class LLMInvocationError(RuntimeError):
+    """语言模型调用在重试耗尽后抛出的专用异常。
+
+    为什么继承 RuntimeError：改造前抛的就是裸的 RuntimeError，
+    继承它可以保证任何已有的 `except RuntimeError` 逻辑行为不变（向后兼容），
+    同时让上层能用 `except LLMInvocationError` 精确识别"可预期的 LLM 失败"。
+    """
+
+    def __init__(self, message: str, error_type: str = "llm_retry_exhausted") -> None:
+        super().__init__(message)
+        self.error_type = error_type
+
+
 class BaseAgent(ABC):
     """基础Agent智能体"""
     name: str = ""  # 智能体名字
@@ -127,24 +140,56 @@ class BaseAgent(ABC):
                 await asyncio.sleep(self._retry_interval)
                 continue
 
-        # 11.所有重试均已耗尽仍未获得有效响应，抛出异常避免返回None
-        raise RuntimeError(f"调用语言模型失败, 已达到最大重试次数({self._agent_config.max_retries}): {error}")
+        # 11.所有重试均已耗尽仍未获得有效响应
+        # [lab/S5] 抛出专用异常而不是裸 RuntimeError：让 invoke() 能捕获并转成 ErrorEvent，
+        #          避免异常穿透 flow 导致 SSE 中途断流、前端看不到任何错误（见问题 D4）。
+        raise LLMInvocationError(
+            f"调用语言模型失败, 已达到最大重试次数({self._agent_config.max_retries}): {error}"
+        )
 
     async def _invoke_tool(self, tool: BaseTool, tool_name: str, arguments: Dict[str, Any]) -> ToolResult:
         """传递工具包+工具名字+对应参数调用指定工具"""
         # 1.执行循环调用工具获取结果
+        # [lab/S6] 改造点：把失败区分为可枚举的 error_type，并记录实际尝试次数。
+        #   注意：这里【没有】改变重试策略本身（何时该重试、非幂等工具怎么办是 Step 3 的工作），
+        #   只把"发生了什么"记录下来，保证零行为变更。
         err = ""
-        for _ in range(self._agent_config.max_retries):
+        error_type = "tool_error"
+        attempts = 0
+        for attempt in range(1, self._agent_config.max_retries + 1):
+            attempts = attempt
             try:
                 return await tool.invoke(tool_name, **arguments)
+            except ValueError as e:
+                # [lab/D1] 工具不存在属于"确定性错误"：重试再多次也不可能出现该工具，直接失败
+                #           并把原因如实上报给 LLM，让它自己换个工具，而不是浪费重试次数。
+                err = str(e)
+                error_type = "tool_not_found"
+                logger.error(f"调用工具[{tool_name}]失败(工具不存在), 错误: {str(e)}")
+                break
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                err = str(e)
+                error_type = "timeout"
+                logger.exception(f"调用工具[{tool_name}]超时, 错误: {str(e)}")
+                await asyncio.sleep(self._retry_interval)
+                continue
             except Exception as e:
                 err = str(e)
+                error_type = "tool_error"
                 logger.exception(f"调用工具[{tool_name}]出错, 错误: {str(e)}")
                 await asyncio.sleep(self._retry_interval)
                 continue
 
         # 2.循环最大重试次数后没有结果则将错误作为工具的执行结果，让LLM自行处理
-        return ToolResult(success=False, message=err)
+        return ToolResult(
+            success=False,
+            message=err,
+            error_type=error_type,
+            # [lab/D2] 只有超时类失败标记为可重试；其余情况（含所有工具调用）
+            #           Step 3 会引入"工具幂等性声明"后再决定是否允许重试。
+            retryable=error_type == "timeout",
+            attempts=attempts,
+        )
 
     async def _add_to_memory(self, messages: List[Dict[str, Any]]) -> None:
         """将对应的信息添加到记忆中"""
@@ -212,10 +257,17 @@ class BaseAgent(ABC):
         format = format if format else self._format
 
         # 2.调用语言模型获取响应内容
-        message = await self._invoke_llm(
-            [{"role": "user", "content": query}],
-            format,
-        )
+        # [lab/S5] 把"可预期的 LLM 失败"转成事件而不是异常：
+        #           headless 评测需要拿到 TaskResult，异常会直接炸掉调用方；
+        #           线上 SSE 场景同理，异常会导致连接中断且前端收不到 error 事件。
+        try:
+            message = await self._invoke_llm(
+                [{"role": "user", "content": query}],
+                format,
+            )
+        except LLMInvocationError as e:
+            yield ErrorEvent(error=f"[{self.name}] 调用语言模型失败: {e}")
+            return
 
         # 3.循环遍历直到最大迭代次数
         for _ in range(self._agent_config.max_iterations):
@@ -268,7 +320,12 @@ class BaseAgent(ABC):
                 })
 
             # 12.所有工具都执行完成后，调用LLM获取汇总消息二次提供
-            message = await self._invoke_llm(tool_messages)
+            # [lab/S5] 同上：二次调用失败也要变成 ErrorEvent，而不是抛异常穿透 flow。
+            try:
+                message = await self._invoke_llm(tool_messages)
+            except LLMInvocationError as e:
+                yield ErrorEvent(error=f"[{self.name}] 汇总工具结果时调用语言模型失败: {e}")
+                return
         else:
             # 13.超过最大迭代次数后，则抛出错误
             yield ErrorEvent(error=f"Agent迭代超过最大迭代次数: {self._agent_config.max_iterations}, 任务处理失败")

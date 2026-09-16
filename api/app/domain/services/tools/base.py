@@ -113,4 +113,8 @@ class BaseTool:
                 return await method(**filtered_kwargs)
 
         # 5.如果循环结束还没有找到工具并调用则抛出错误
-        return ValueError(f"工具[{tool_name}]未找到")
+        # [lab/D1-bugfix] 这里原本写的是 `return ValueError(...)`：
+        #   异常对象被当成"返回值"往下传，调用方再执行 result.model_dump_json() 时会抛出
+        #   AttributeError: 'ValueError' object has no attribute 'model_dump_json'，
+        #   真正的失败原因（工具名写错/幻觉出工具名）被彻底掩盖。必须改成 raise。
+        raise ValueError(f"工具[{tool_name}]未找到")

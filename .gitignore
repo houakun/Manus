@@ -1,0 +1,14 @@
+.env
+agent-engineering-handoff.md
+docs
+
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- lab 运行产物 ----
+# 任务工作区 / 轨迹 / 验收输出都是"证据"，会随时间膨胀，不进版本管理
+# （lab/runs/.gitignore 里还有一份自保护规则，双保险）
+lab/runs/

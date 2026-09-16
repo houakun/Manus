@@ -6,7 +6,7 @@
 @File    : planner_react.py
 """
 import logging
-from typing import AsyncGenerator, Optional, Callable
+from typing import AsyncGenerator, Optional, Callable, List
 
 from app.domain.external.browser import Browser
 from app.domain.external.json_parser import JSONParser
@@ -14,7 +14,7 @@ from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.models.app_config import AgentConfig
-from app.domain.models.event import BaseEvent, PlanEvent, PlanEventStatus, TitleEvent, MessageEvent
+from app.domain.models.event import BaseEvent, ErrorEvent, PlanEvent, PlanEventStatus, TitleEvent, MessageEvent
 from app.domain.models.event import DoneEvent
 from app.domain.models.message import Message
 from app.domain.models.plan import Plan, ExecutionStatus
@@ -22,6 +22,7 @@ from app.domain.models.session import SessionStatus
 from app.domain.services.agents.planner import PlannerAgent
 from app.domain.services.agents.react import ReActAgent
 from app.domain.services.tools.a2a import A2ATool
+from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.browser import BrowserTool
 from app.domain.services.tools.file import FileTool
 from app.domain.services.tools.mcp import MCPTool
@@ -49,6 +50,7 @@ class PlannerReActFlow(BaseFlow):
             search_engine: SearchEngine,  # 搜索引擎
             mcp_tool: MCPTool,  # mcp工具
             a2a_tool: A2ATool,  # a2a远程agent
+            tools: Optional[List[BaseTool]] = None,  # [lab] 可选：注入自定义工具集
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
         # 1.流初始化数据配置
@@ -59,15 +61,22 @@ class PlannerReActFlow(BaseFlow):
         self.plan: Optional[Plan] = None
 
         # 2.初始化Agent预设工具列表
-        tools = [
-            FileTool(sandbox=sandbox),
-            ShellTool(sandbox=sandbox),
-            BrowserTool(browser=browser),
-            SearchTool(search_engine=search_engine),
-            MessageTool(),
-            mcp_tool,
-            a2a_tool,
-        ]
+        #   [lab/S-tools] 新增 tools 注入参数（可选，默认 None）：
+        #     - 传 None 时行为与改造前【完全一致】→ 向后兼容，不影响现有 UI/线上链路；
+        #     - lab 的 fast mode 会传入"仅 file + shell + message"的精简工具集，
+        #       把 browser/search/mcp/a2a 从 LLM 的工具清单里去掉。
+        #   为什么必须能"去掉"而不只是"让它们失败"：工具 schema 是要进 prompt 的，
+        #   留着用不了的工具会诱导模型反复尝试 → 浪费迭代次数、污染评测结果。
+        if tools is None:
+            tools = [
+                FileTool(sandbox=sandbox),
+                ShellTool(sandbox=sandbox),
+                BrowserTool(browser=browser),
+                SearchTool(search_engine=search_engine),
+                MessageTool(),
+                mcp_tool,
+                a2a_tool,
+            ]
 
         # 3.创建规划Agent
         self.planner = PlannerAgent(
@@ -205,9 +214,18 @@ class PlannerReActFlow(BaseFlow):
                 self.status = FlowStatus.COMPLETED
             elif self.status == FlowStatus.COMPLETED:
                 # 27.计划状态已完成则更新plan状态，并发送计划事件通知API已完成
-                self.plan.status = ExecutionStatus.COMPLETED
+                # [lab/D5-bugfix] self.plan 可能为 None：当 PlannerAgent 没能产出有效 Plan 时
+                #   （上面第16步）会直接把状态置为 COMPLETED 并走到这里。
+                #   原代码无条件执行 self.plan.status 会抛 AttributeError，把"规划失败"
+                #   变成"整个进程崩溃"；PlanEvent(plan=None) 也会触发 pydantic 校验错误。
+                #   评测场景下弱模型/网络抖动很容易触发这条路径，必须转成结构化错误事件。
+                if self.plan is None:
+                    logger.warning(f"Planner&ReAct流结束但计划为空，返回错误事件")
+                    yield ErrorEvent(error="Agent未能生成有效的任务计划(Plan 为空)，任务终止")
+                else:
+                    self.plan.status = ExecutionStatus.COMPLETED
+                    yield PlanEvent(status=PlanEventStatus.COMPLETED, plan=self.plan)
                 self.status = FlowStatus.IDLE
-                yield PlanEvent(status=PlanEventStatus.COMPLETED, plan=self.plan)
                 break
         # 28.任务已经结束则返回结束事件
         yield DoneEvent()
