@@ -146,8 +146,23 @@ class SuiteResult(BaseModel):
 
     @property
     def self_report_gap(self) -> int:
-        """自报成功但被判定失败的次数（即"虚报"数量）。"""
+        """自报成功但被判定失败的次数（即"虚报成功"）。"""
         return sum(1 for o in self.outcomes if o.self_reported_ok and not o.ok)
+
+    @property
+    def false_negative_runs(self) -> int:
+        """SUT 自报失败但产物其实是合格的次数（即"误报失败"）。
+
+        为什么这个方向也必须统计：它和虚报成功一样会让指标失真，但方向相反 ——
+        只看自述会**低估**成功率，并把"做完了但最后一步报错/超时/多问了一句"
+        这类情况全部当成能力不足。实测中这类占 3/38（8%），比虚报还多。
+        典型的三个原因（都来自实测）：
+          - 活干完了，但汇总阶段的 LLM 调用失败；
+          - 活干完了，但 Agent 又去问用户问题（WaitEvent，headless 下无法继续）；
+          - 活干完了，但整任务超时被砍。
+        三者共同说明：**"任务完成"应该看交付物，而不是看 Agent 有没有好好收尾**。
+        """
+        return sum(1 for o in self.outcomes if not o.self_reported_ok and o.ok)
 
     @property
     def honest_failures(self) -> int:
@@ -234,6 +249,20 @@ class SuiteResult(BaseModel):
             "would_stop_runs": sum(1 for o in self.outcomes if o.budget_would_stop),
             "by_metric": dict(sorted(metrics.items(), key=lambda kv: -kv[1])),
         }
+
+
+def _budget_source_note(default_policy: Any, by_task: Optional[Dict[str, Any]]) -> str:
+    """描述本次用的阈值是怎么来的（报告里必须有，否则数字无法归因）。"""
+    if by_task:
+        sources = {policy.source for policy in by_task.values()}
+        return (
+            f"**按任务的历史分位数推导**（{len(by_task)} 个任务有历史），"
+            f"来源类型={sorted(sources)}；无历史的任务用默认值。"
+            "注意：历史数据来自**旧版本 SUT**，换版本后应重跑基线再重新推导。"
+        )
+    if default_policy is not None:
+        return f"统一使用 {default_policy.source} 策略"
+    return "默认值"
 
 
 def summarize_task(task: BenchTask, outcomes: List[RunOutcome]) -> TaskSummary:
@@ -351,11 +380,24 @@ async def run_suite(
         concurrency: int = 1,
         temperature: Optional[float] = None,
         budget_policy: Any = None,
+        budget_policy_by_task: Optional[Dict[str, Any]] = None,
         fault_rules: Any = None,
         max_seconds: Optional[float] = None,
         progress: bool = True,
+        on_start: Optional[Any] = None,
+        on_outcome: Optional[Any] = None,
+        on_finish: Optional[Any] = None,
 ) -> SuiteResult:
-    """跑一个完整 suite（任务集 × n 次重复）。"""
+    """跑一个完整 suite（任务集 × n 次重复）。
+
+    三个回调是"断点续跑"的接口：
+        on_start(suite)    先落 suite 元信息（在跑之前）
+        on_outcome(outcome) 每完成一次运行就落库
+        on_finish(suite)   结束时回写汇总
+    为什么不用 gather：gather 只在全部完成后一次性返回，中途被中断就全丢。
+    长评测（40 次运行 ≈ 半小时、花掉几美元）被中断的途径很多：Ctrl-C、
+    机器休眠、终端关闭、远程会话断开。增量落库让这些情况最多丢一次运行。
+    """
     from datetime import datetime
 
     from lab.config import load_llm_config
@@ -392,22 +434,35 @@ async def run_suite(
         async with semaphore:
             if progress:
                 print(f"  → {task.uid} run{index + 1}/{runs_per_task}", flush=True)
+            # 预算策略按任务选：优先用该任务自己的历史分位数推导出来的策略，
+            # 没有历史就回退到传入的全局策略。
+            # （任务之间的成本差异远大于任务内方差，一个全局数字必然对部分任务是错的）
+            task_policy = (budget_policy_by_task or {}).get(task.key, budget_policy)
             return await run_once(
                 task, suite_id=suite_id, run_index=index, bench_root=bench_root,
                 model_name=llm_config.model_name, temperature=temperature,
-                budget_policy=budget_policy, fault_rules=fault_rules, max_seconds=max_seconds,
+                budget_policy=task_policy, fault_rules=fault_rules, max_seconds=max_seconds,
             )
 
-    jobs = [_one(task, index) for task in tasks for index in range(runs_per_task)]
-    outcomes = await asyncio.gather(*jobs, return_exceptions=True)
+    # 先落元信息：这样即使进程马上被杀，也能在库里看到"有一次评测开过、跑到哪了"
+    if on_start is not None:
+        on_start(suite)
 
-    # 单个 run 出错不能带走整个 suite（否则一次评测白跑）
+    # 用 as_completed 而不是 gather，才能在**每次运行完成时**立即回调（增量落库）
+    pending = [asyncio.create_task(_one(task, index))
+               for task in tasks for index in range(runs_per_task)]
+
     collected: List[RunOutcome] = []
-    for job, outcome in zip(jobs, outcomes):
-        if isinstance(outcome, BaseException):
-            suite.fixture_failures.append(f"{type(outcome).__name__}: {outcome}")
+    for future in asyncio.as_completed(pending):
+        try:
+            outcome = await future
+        except Exception as exc:  # noqa: BLE001
+            # 单次运行出错不能带走整个 suite（否则一次网络抖动就毁掉整份评测）
+            suite.fixture_failures.append(f"{type(exc).__name__}: {exc}")
             continue
         collected.append(outcome)
+        if on_outcome is not None:
+            on_outcome(outcome)
 
     suite.outcomes = collected
     suite.task_summaries = [
@@ -415,9 +470,19 @@ async def run_suite(
         for task in tasks
     ]
     suite.elapsed_s = round(time.monotonic() - started, 1)
+    suite.notes.append(
+        f"预算阈值来源：{_budget_source_note(budget_policy, budget_policy_by_task)}"
+    )
     if concurrency > 1:
         suite.notes.append(
             f"本次以并发 {concurrency} 运行：**耗时指标不可横向比较**"
             "（并行会互相竞争模型配额与本机资源）。"
         )
+    if suite.fixture_failures:
+        suite.notes.append(
+            f"有 {len(suite.fixture_failures)} 次运行在执行前就失败（环境/网络问题），"
+            "**未计入成功率** —— 否则会把环境问题当成 Agent 能力问题。"
+        )
+    if on_finish is not None:
+        on_finish(suite)
     return suite

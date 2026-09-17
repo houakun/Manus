@@ -325,8 +325,20 @@ class SpanStore:
 
     def save_suite(self, suite: Any) -> None:
         """写入一次评测（suite 元信息 + 全部 run）。同 suite_id 重复写入会覆盖。"""
+        self.save_suite_header(suite)
+        for outcome in suite.outcomes:
+            self.save_outcome(outcome)
+        self.finalize_suite(suite)
+
+    def save_suite_header(self, suite: Any) -> None:
+        """先写 suite 元信息（**在跑之前**）。
+
+        为什么要拆出来：长时间评测（40 次运行 = 半小时）中途被中断是常态。
+        先把元信息写进去 + 每完成一次运行就落库，崩溃最多丢一次运行，
+        而不是丢掉整份数据（否则半小时的 API 花费直接归零）。
+        这就是 handoff 体检第 7 项"断点续跑"在评测层的落地。
+        """
         with self._connect() as conn:
-            conn.execute("DELETE FROM bench_runs WHERE suite_id = ?", (suite.suite_id,))
             conn.execute("DELETE FROM bench_suites WHERE suite_id = ?", (suite.suite_id,))
             conn.execute(
                 """INSERT INTO bench_suites
@@ -340,7 +352,24 @@ class SpanStore:
                     json.dumps(suite.notes, ensure_ascii=False),
                 ),
             )
-            conn.executemany(
+
+    def finalize_suite(self, suite: Any) -> None:
+        """运行结束后回写汇总字段（总数/成功数/耗时）。"""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE bench_suites
+                   SET elapsed_s = ?, total_runs = ?, successes = ?, task_count = ?, notes = ?
+                   WHERE suite_id = ?""",
+                (suite.elapsed_s, suite.total_runs, suite.successes,
+                 len(suite.task_summaries), json.dumps(suite.notes, ensure_ascii=False),
+                 suite.suite_id),
+            )
+
+    def save_outcome(self, outcome: Any) -> None:
+        """写入/覆盖**一次运行**的结果（幂等）。"""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM bench_runs WHERE run_id = ?", (outcome.run_id,))
+            conn.execute(
                 """INSERT INTO bench_runs
                    (run_id, suite_id, task_uid, task_key, group_name, run_index, ok, self_reported_ok,
                     failed_checks, process_flags, task_id, sut_name, tokens, cost_usd, elapsed_ms,
@@ -348,23 +377,40 @@ class SpanStore:
                     budget_would_stop, action_diversity, postcondition_warnings, faults_injected,
                     created_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                [
-                    (
-                        o.run_id, o.suite_id, o.task_uid, o.task_key, o.group, o.run_index,
-                        1 if o.ok else 0,
-                        1 if o.self_reported_ok else 0,
-                        json.dumps(o.failed_checks, ensure_ascii=False),
-                        json.dumps(o.process_flags, ensure_ascii=False),
-                        o.task_id, o.sut_name, o.tokens, o.cost_usd, o.elapsed_ms,
-                        o.llm_calls, o.tool_calls, o.steps_done, o.error_type, o.error,
-                        json.dumps(o.budget_violated, ensure_ascii=False),
-                        1 if o.budget_would_stop else 0, o.action_diversity,
-                        o.postcondition_warnings, o.faults_injected,
-                        datetime.now().isoformat(timespec="seconds"),
-                    )
-                    for o in suite.outcomes
-                ],
+                (
+                    outcome.run_id, outcome.suite_id, outcome.task_uid, outcome.task_key,
+                    outcome.group, outcome.run_index,
+                    1 if outcome.ok else 0,
+                    1 if outcome.self_reported_ok else 0,
+                    json.dumps(outcome.failed_checks, ensure_ascii=False),
+                    json.dumps(outcome.process_flags, ensure_ascii=False),
+                    outcome.task_id, outcome.sut_name, outcome.tokens, outcome.cost_usd,
+                    outcome.elapsed_ms, outcome.llm_calls, outcome.tool_calls, outcome.steps_done,
+                    outcome.error_type, outcome.error,
+                    json.dumps(outcome.budget_violated, ensure_ascii=False),
+                    1 if outcome.budget_would_stop else 0, outcome.action_diversity,
+                    outcome.postcondition_warnings, outcome.faults_injected,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
             )
+
+    def load_task_by_workspace(self, workspace: str) -> Optional[Dict[str, Any]]:
+        """根据工作区路径反查运行记录。
+
+        用途：
+        1. 崩溃后重建评测（把工作区里的产物与已落库的指标重新对应上）；
+        2. 人工排查"这个目录到底是哪次运行"。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT task_id, sut_name, goal, ok, error, error_type, llm_calls, llm_errors,
+                          total_tokens, tool_calls, cost_usd, elapsed_ms, plan_title,
+                          steps_total, steps_done, budget_violated_metrics, budget_would_stop,
+                          action_diversity, postcondition_warnings, faults_injected, started_at
+                   FROM tasks WHERE workspace = ? ORDER BY rowid DESC LIMIT 1""",
+                (workspace,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def list_suites(self, limit: int = 10) -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -450,6 +496,43 @@ class SpanStore:
                 if uid in suites
             ],
         )
+
+    def load_runs_grouped_by_task(self, limit_per_task: int = 500) -> Dict[str, List[Dict[str, Any]]]:
+        """把历史运行按 task_key 分组（用于按分位数推导预算阈值）。
+
+        为什么要限制 limit_per_task：评测跑多了以后这张表会很大，
+        而阈值推导只需要近期的分布（旧版本 SUT 的数据反而会污染阈值）。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT task_key, group_name, tokens, cost_usd, elapsed_ms, tool_calls,
+                          steps_done, ok, created_at
+                   FROM bench_runs ORDER BY created_at DESC"""
+            ).fetchall()
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            key = row["task_key"] or ""
+            bucket = grouped.setdefault(key, [])
+            if len(bucket) < limit_per_task:
+                bucket.append(dict(row))
+        return grouped
+
+    def avg_cost_for_group(self, group: str) -> Optional[float]:
+        """某个分组的历史平均单次成本（用于**预估预算**）。
+
+        为什么需要它：CLI 原本用一个写死的系数（$0.045/次）估成本，
+        那系数来自冒烟测试的简单任务；实测 semireal 任务的平均成本是它的 3 倍，
+        导致"预估 $1.8、实际花 $5" —— 花钱的事上估错 3 倍是不能接受的。
+        改成读实测历史：没有历史时由调用方给保守默认值。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n FROM bench_runs WHERE group_name = ?",
+                (group,),
+            ).fetchone()
+        if not row or not row["n"]:
+            return None
+        return float(row["avg_cost"] or 0.0)
 
     def stats(self, sut_name: Optional[str] = None) -> Dict[str, Any]:
         """跨运行聚合：成功率、tokens/任务、成本/任务、P95 耗时。

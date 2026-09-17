@@ -38,9 +38,26 @@ verify:
 process:
   max_tool_calls: 30
 solution:
+  # config.json 的值**从源码里解析出来**（而不是把 8080/30/5 写死），
+  # 这样期望值写错时自检会失败。
   - kind: write_file
-    path: /home/ubuntu/config.json
-    content: '{"port": 8080, "timeout": 30, "retries": 5}'
+    path: /home/ubuntu/_solve.py
+    content: |
+      import json
+      import pathlib
+      import re
+
+      source = pathlib.Path("input/service.py").read_text()
+      config = {
+          "port": int(re.search(r"port\s*=\s*(\d+)", source).group(1)),
+          "timeout": int(re.search(r"timeout\s*=\s*(\d+)", source).group(1)),
+          "retries": int(re.search(r"retries\s*=\s*(\d+)", source).group(1)),
+      }
+      pathlib.Path("config.json").write_text(json.dumps(config))
+  - kind: exec
+    command: "python _solve.py"
+  # 下面的改写无法"计算"（它是改写而不是推导），所以保留 write_file。
+  # 它的检查是 not_contains（不能出现 8080），属于**否定式**检查，不构成同义反复。
   - kind: write_file
     path: /home/ubuntu/input/service.py
     content: |

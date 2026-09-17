@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import time
 from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -82,6 +82,80 @@ class BudgetPolicy(BaseModel):
     # 硬上限 = 软阈值 × 该系数（Step 4 拿到 n>=20 数据、切换到 enforce 后再启用）
     enforce_multiplier: float = 2.5
 
+    # 显式硬上限（优先于 enforce_multiplier）。
+    # 按分位数定阈值时，硬线应该是历史 P99 而不是"软线×2.5" ——
+    # 后者在一组已校准的阈值上会把硬线推到毫无意义的远处
+    # （例如软线 P95=210k、×2.5=525k，而历史最大值才 953k）。
+    hard_tokens: Optional[float] = None
+    hard_cost_usd: Optional[float] = None
+    hard_seconds: Optional[float] = None
+    hard_steps: Optional[float] = None
+    hard_tool_calls: Optional[float] = None
+    hard_llm_calls: Optional[float] = None
+
+    # 阈值来源说明（进报告，让读者知道数字是怎么来的）
+    source: str = "default"
+
+    @classmethod
+    def from_metrics(
+            cls,
+            metrics: Dict[str, List[float]],
+            *,
+            soft_percentile: float = 0.95,
+            hard_percentile: float = 0.99,
+            hard_floor_multiplier: float = 1.5,
+            source: str = "history",
+            **overrides: Any,
+    ) -> "BudgetPolicy":
+        """根据**历史实测指标**推导阈值：软线 = P95，硬线 = P99。
+
+        metrics 的键是维度名（tokens / cost_usd / elapsed_s / steps / tool_calls），
+        值是历史实测值列表。
+
+        为什么要这样做（而不是继续手工设值）：
+        阈值是"关于这个系统的事实"，而且**任务之间的成本差异比任务内的方差大得多**
+        （sem_sqlite_report 均值 414k vs syn_bug_fix 128k）。
+        一个全局数字必然在某些任务上太紧、在另一些上太松。
+
+        == 为什么硬线要加一个下限倍数（hard_floor_multiplier）==
+        实测：n=5 时经验 P95 与 P99 几乎相同（例如 191k vs 200k）——
+        **样本太少时，分位数对尾部形状没有任何信息量**，P99 退化成"历史最大值"。
+        如果直接拿它当硬线，enforce 模式就变成"比历史最差还差就砍"，
+        一次运气不好就被误杀。
+        所以硬线取 max(P99, 软线 × 1.5)：样本多了以后 P99 自然接管，
+        样本少时这个下限保证硬线仍然表达"明显失控"而不是"略差于以往"。
+        """
+        from lab.bench.stats import quantile
+
+        def soft(key: str) -> Optional[float]:
+            values = metrics.get(key) or []
+            return quantile(values, soft_percentile) if values else None
+
+        def hard(key: str) -> Optional[float]:
+            values = metrics.get(key) or []
+            if not values:
+                return None
+            empirical = quantile(values, hard_percentile)
+            floor = (soft(key) or 0.0) * hard_floor_multiplier
+            return max(empirical, floor)
+
+        return cls(
+            max_tokens=soft("tokens"),
+            max_cost_usd=soft("cost_usd"),
+            max_seconds=soft("elapsed_s"),
+            max_steps=soft("steps"),
+            max_tool_calls=soft("tool_calls"),
+            max_llm_calls=soft("llm_calls"),
+            hard_tokens=hard("tokens"),
+            hard_cost_usd=hard("cost_usd"),
+            hard_seconds=hard("elapsed_s"),
+            hard_steps=hard("steps"),
+            hard_tool_calls=hard("tool_calls"),
+            hard_llm_calls=hard("llm_calls"),
+            source=source,
+            **overrides,
+        )
+
     @classmethod
     def from_env(cls) -> "BudgetPolicy":
         """从环境变量读配置（CI 里换阈值不需要改代码）。"""
@@ -114,7 +188,23 @@ class BudgetPolicy(BaseModel):
         return {metric: value for metric, value in raw.items() if value is not None}
 
     def hard_limits(self) -> Dict[BudgetMetric, float]:
-        return {metric: value * self.enforce_multiplier for metric, value in self.soft_limits().items()}
+        """硬上限：优先用显式值（分位数推导），否则回退到"软线 × 倍数"。"""
+        explicit = {
+            BudgetMetric.TOKENS: self.hard_tokens,
+            BudgetMetric.COST: self.hard_cost_usd,
+            BudgetMetric.ELAPSED: self.hard_seconds,
+            BudgetMetric.STEPS: self.hard_steps,
+            BudgetMetric.TOOL_CALLS: self.hard_tool_calls,
+            BudgetMetric.LLM_CALLS: self.hard_llm_calls,
+        }
+        result: Dict[BudgetMetric, float] = {}
+        for metric, soft in self.soft_limits().items():
+            value = explicit.get(metric)
+            if value is not None:
+                result[metric] = max(float(value), soft)
+            else:
+                result[metric] = soft * self.enforce_multiplier
+        return result
 
 
 class BudgetViolation(BaseModel):
@@ -143,6 +233,8 @@ class BudgetReport(BaseModel):
     hard_exceeded: bool = False  # 是否突破了硬上限
     final: Dict[str, float] = Field(default_factory=dict)  # 结束时各项实际值
     limits: Dict[str, float] = Field(default_factory=dict)  # 生效的软阈值（留档，便于复现）
+    hard_limits: Dict[str, float] = Field(default_factory=dict)  # 生效的硬上限
+    source: str = "default"  # 阈值来源：default / history / env
 
 
 class Budget:
@@ -251,6 +343,8 @@ class Budget:
             hard_exceeded=hard_exceeded,
             final={metric.value: round(value, 4) for metric, value in self.snapshot().items()},
             limits={metric.value: value for metric, value in self.policy.soft_limits().items()},
+            hard_limits={metric.value: value for metric, value in self.policy.hard_limits().items()},
+            source=self.policy.source,
         )
 
     @property

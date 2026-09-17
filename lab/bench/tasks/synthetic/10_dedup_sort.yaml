@@ -37,13 +37,14 @@ process:
   max_tool_calls: 12
 solution:
   - kind: write_file
-    path: /home/ubuntu/tags_clean.txt
+    path: /home/ubuntu/_solve.py
     content: |
-      CI
-      docker
-      git
-      linux
-      python
+      import pathlib
+      lines = pathlib.Path("input/tags.txt").read_text().splitlines()
+      unique = sorted({line.strip() for line in lines if line.strip()})
+      pathlib.Path("tags_clean.txt").write_text(chr(10).join(unique) + chr(10))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/tags_clean.txt

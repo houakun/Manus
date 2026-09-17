@@ -107,6 +107,9 @@ class ToolGuard:
         self.error_types: Dict[str, int] = {}
         # 硬编码可疑记录：{文件或命令: [命中的字面量]}
         self.hardcode_suspects: Dict[str, List[str]] = {}
+        # 工作区外写入记录：{函数名: [被写到工作区外的文件]}
+        # 安全类信号，必须进报告 —— 只躺在日志里等于没有
+        self.escaped_writes: Dict[str, List[str]] = {}
 
     def _note_error_type(self, error_type: Optional[str]) -> None:
         """累计失败类型（供过程规则与归因统计使用）。"""
@@ -263,12 +266,25 @@ class ToolGuard:
                 self.postcondition_warnings.append(f"{function_name}: {warning}")
 
         # 5.把结论写进当前 span（由适配器在收到 ToolEvent(CALLED) 时一并收口）
+        escaped: List[str] = []
+        if isinstance(result.data, dict):
+            escaped = [str(item) for item in (result.data.get("escaped_paths") or [])]
+        if escaped:
+            self.escaped_writes.setdefault(function_name, [])
+            for item in escaped:
+                if item not in self.escaped_writes[function_name]:
+                    self.escaped_writes[function_name].append(item)
+
         if self._recorder is not None:
             attrs: Dict[str, Any] = {
                 "repeat_consecutive": hit.consecutive,
                 "action_diversity": round(hit.diversity, 3),
                 "idempotent": is_idempotent(function_name),
             }
+            if escaped:
+                # 轨迹里能看到"命令把文件写到工作区外了" —— 这是 fast mode 特有的失真，
+                # 不标出来就无法区分"Agent 没做对"与"产物落在了错地方"
+                attrs["writes_outside_workspace"] = len(escaped)
             if attempt > 1:
                 attrs["retry_reasons"] = ",".join(dict.fromkeys(retry_reasons))
             if faults:
@@ -291,6 +307,10 @@ class ToolGuard:
         }
         if self.hardcode_suspects:
             data["hardcode_suspects"] = {key: sorted(set(value)) for key, value in self.hardcode_suspects.items()}
+        if self.escaped_writes:
+            data["escaped_writes"] = {
+                key: sorted(set(value))[:10] for key, value in self.escaped_writes.items()
+            }
         if self.budget is not None:
             data["budget"] = self.budget.report().model_dump(mode="json")
         if self.injector is not None:

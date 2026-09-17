@@ -22,8 +22,16 @@ process:
   max_tool_calls: 15
 solution:
   - kind: write_file
-    path: /home/ubuntu/merged.json
-    content: '{"host": "localhost", "port": 9000, "debug": true, "timeout": 30}'
+    path: /home/ubuntu/_solve.py
+    content: |
+      import json
+      import pathlib
+
+      base = json.loads(pathlib.Path("input/base.json").read_text())
+      override = json.loads(pathlib.Path("input/override.json").read_text())
+      pathlib.Path("merged.json").write_text(json.dumps({**base, **override}))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/merged.json

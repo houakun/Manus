@@ -26,13 +26,21 @@ verify:
 process:
   max_tool_calls: 15
 solution:
+  # 参考解**真的算一遍**（而不是把期望行写出来），期望值写错时自检会失败。
   - kind: write_file
-    path: /home/ubuntu/filtered.csv
+    path: /home/ubuntu/_solve.py
     content: |
-      id,item,amount
-      2,monitor,320
-      4,ssd,180
-      5,desk,101
+      import csv
+      import io
+      import pathlib
+
+      rows = list(csv.reader(io.StringIO(pathlib.Path("input/orders.csv").read_text())))
+      keep = [rows[0]] + [r for r in rows[1:] if r and int(r[2]) > 100]
+      buf = io.StringIO()
+      csv.writer(buf).writerows(keep)
+      pathlib.Path("filtered.csv").write_text(buf.getvalue())
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/filtered.csv

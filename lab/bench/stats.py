@@ -175,6 +175,108 @@ def compare_paired(
     )
 
 
+def bootstrap_ci(
+        values: Sequence[float],
+        *,
+        statistic: str = "mean",
+        resamples: int = 2000,
+        confidence: float = 0.95,
+        seed: int = 42,
+) -> Interval:
+    """自助法（bootstrap）置信区间。
+
+    == 为什么除了 t 区间还需要它 ==
+    分组对比实测：semireal 的 tokens 是 210k ± 58k、**max/均值 = 4.5×** ——
+    这是明显的重尾分布。t 区间假设（近似正态、方差有限）在重尾下会低估不确定性，
+    尤其是当最贵的那次运行刚好在/不在样本里时，均值会大幅飘移。
+
+    自助法不假设分布形状：它直接重采样"如果重新跑 n 次，均值会怎么变"。
+    代价是它无法超出观测到的极值范围（对尾部仍偏乐观），
+    所以报告里会**同时给 t 区间和 bootstrap 区间**，两者差得多就说明分布很偏。
+
+    固定 seed → 可复现（评测工具的基本要求）。
+    """
+    import random
+
+    values = [float(v) for v in values]
+    n = len(values)
+    if n == 0:
+        return Interval(point=0.0, n=0, method="none")
+    if n == 1:
+        return Interval(point=values[0], n=1, method="none")
+
+    def _stat(sample: List[float]) -> float:
+        if statistic == "median":
+            ordered = sorted(sample)
+            mid = len(ordered) // 2
+            return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        return sum(sample) / len(sample)
+
+    rng = random.Random(seed)
+    estimates = []
+    for _ in range(resamples):
+        sample = [values[rng.randrange(n)] for _ in range(n)]
+        estimates.append(_stat(sample))
+    estimates.sort()
+
+    alpha = (1 - confidence) / 2
+    low = estimates[max(0, int(alpha * resamples) - 1)]
+    high = estimates[min(resamples - 1, int((1 - alpha) * resamples))]
+    point = _stat(values)
+    return Interval(
+        point=point, low=low, high=high, half_width=(high - low) / 2,
+        n=n, method=f"bootstrap{int(confidence * 100)}:{statistic}",
+    )
+
+
+def paired_bootstrap_ci(
+        differences: Sequence[float],
+        *,
+        resamples: int = 2000,
+        confidence: float = 0.95,
+        seed: int = 42,
+) -> Interval:
+    """配对差值的 bootstrap 区间。
+
+    为什么要配对：同一个任务在两个方案上各跑一次，差值只反映**方案差异**，
+    任务本身简单或困难的影响被减掉了。本项目的任务难度跳度极大
+    （syn_sum_range 与 sem_sqlite_report 差 10 倍以上），不配对的话
+    任务集排序或调度的小变化就会污染结论。
+
+    注意：配对**抵消不了时间相关的混淆**（两组跑在不同时段时，服务端漂移会同时
+    影响两边）—— 那需要交错设计（interleaved），见 Step 5 报告的诚实声明。
+    """
+    return bootstrap_ci(differences, resamples=resamples, confidence=confidence, seed=seed)
+
+
+def quantile(values: Sequence[float], p: float) -> float:
+    """经验分位数（线性插值）。
+
+    == 为什么用分位数而不是均值来定预算阈值 ==
+    分组对比给出的直接证据：semireal 的 tokens 区间是 210k ± 58k（相对宽 28%）、
+    max/均值 = **4.5×**；synthetic 是 124k ± 14k（宽 11%）、max/均值 = 2.2×。
+    在这么重的长尾下，**按"均值 + 一点余量"设的阈值会被长尾频繁击穿** ——
+    实测 semireal 的软阈值越界率高达 60%，切 enforce 就等于随机砍任务。
+
+    改用分位数后，越界率就是**定义上**的概率：
+    软线取 P95 → 约 5% 的正常运行会越界；硬线取 P99 → 约 1%。
+
+    == n 很小时不要平滑 ==
+    n=5 时 P99 几乎就是最大值。这是诚实的行为：样本少就不该假装知道尾部形状。
+    调用方应该用 min_samples 拦住样本太少的情况（见 lab/bench/policy.py）。
+    """
+    if not values:
+        return 0.0
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = p * (len(ordered) - 1)
+    low, high = math.floor(position), math.ceil(position)
+    if low == high:
+        return ordered[int(position)]
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
 def aggregate(values: Sequence[float]) -> Dict[str, float]:
     """一组数值的常用汇总（供报告用）。"""
     values = [float(v) for v in values]

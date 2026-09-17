@@ -108,7 +108,20 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
                          "仍然返回 `ok=True`（`error=None`）。"
                          "独立判定则发现产物根本不存在。")
         else:
-            lines.append("本次没有出现虚报（自述与判定一致），说明 SUT 的自我评估是可靠的。")
+            lines.append("本次没有出现虚报成功。")
+
+        false_negative = suite.false_negative_runs
+        if false_negative:
+            lines.append("")
+            lines.append(f"⚠️ **{false_negative} 次运行是「自报失败但产物合格」**"
+                         f"（占 {false_negative / max(1, suite.total_runs):.0%}）"
+                         f"—— 与虚报相反的方向，它会让自述**低估**成功率。")
+            lines.append("")
+            lines.append("> 实测的三个典型原因：活干完了但**汇总阶段的 LLM 调用失败**、"
+                         "活干完了但 Agent **又去问用户问题**（headless 下无法继续）、"
+                         "活干完了但**整任务超时**被砍。")
+            lines.append("> 三者共同说明：「任务完成」应当看**交付物**，"
+                         "而不是看 Agent 有没有好好收尾。")
         lines.append("")
 
     # ==================== 分组 ====================

@@ -261,4 +261,11 @@ def evaluate_process(task: BenchTask, result: Any) -> List[str]:
     if diversity is not None and diversity < 0.4 and (tool_calls or 0) >= 5:
         flags.append(f"low_action_diversity:{diversity}")
 
+    # 工作区外写入：fast mode 特有的失真（沙箱路径映射管不到脚本内容）。
+    # 为什么归为**过程问题**而不是直接判失败：产物可能同时存在正确的一份（工具写的），
+    # 所以不能断定任务失败；但它一定意味着"有东西跑到工作区外了"，需要人工看一眼。
+    escaped = guard.get("escaped_writes") or {}
+    if escaped:
+        flags.append(f"writes_outside_workspace:{sum(len(v) for v in escaped.values())}")
+
     return flags

@@ -109,13 +109,38 @@ async def _async(value):
 
 
 class _FakeStore:
-    """只实现 CLI 用到的那几个方法的内存替身。"""
+    """只实现 CLI 用到的那几个方法的内存替身。
+
+    注意要包含**增量落库**接口（save_suite_header / save_outcome / finalize_suite）：
+    CLI 会把这三个方法作为回调传给 run_suite —— 即使 run_suite 被替换掉，
+    属性查找也会在构造 kwargs 时立刻发生（这正是这条测试能抓到漏 import 的原因）。
+    """
 
     def __init__(self) -> None:
         self.suites = {}
 
     def save_suite(self, suite) -> None:
         self.suites[suite.suite_id] = suite
+
+    def save_suite_header(self, suite) -> None:
+        self.suites.setdefault(suite.suite_id, suite)
+
+    def save_outcome(self, outcome) -> None:
+        suite = self.suites.get(outcome.suite_id)
+        if suite is not None:
+            suite.outcomes = [o for o in suite.outcomes if o.run_id != outcome.run_id]
+            suite.outcomes.append(outcome)
+
+    def finalize_suite(self, suite) -> None:
+        self.suites[suite.suite_id] = suite
+
+    def avg_cost_for_group(self, group: str):
+        """CLI 的预算预估会读它；没有历史时返回 None（走保守默认值）。"""
+        return None
+
+    def load_runs_grouped_by_task(self, limit_per_task: int = 500):
+        """CLI 的阈值推导会读它；替身里返回空 → 退回默认阈值。"""
+        return {}
 
     def list_suites(self, limit: int = 10):
         return [
@@ -129,3 +154,34 @@ class _FakeStore:
 
     def load_suite(self, suite_id: str):
         return self.suites.get(suite_id)
+
+
+def test_cli_sandbox_clean_escapes_is_dry_run_by_default(tmp_path, monkeypatch):
+    """`sandbox clean-escapes` 默认只报告、不删 —— 它在删工作区**外面**的东西。
+
+    这是 fast mode 的那个真实缺陷（脚本用绝对路径 → 产物落到 `<盘>:/home/ubuntu`）
+    对应的清理命令。实测一天就积了 15MB（含两个 5MB 的 zip 和 24 个分片文件），
+    所以清理必须是可重复的命令。
+    """
+    import lab.infra.local_sandbox as sandbox_module
+
+    fake_root = tmp_path / "home" / "ubuntu"
+    fake_root.mkdir(parents=True)
+    (fake_root / "junk.bin").write_bytes(b"x" * 1024)
+    monkeypatch.setattr(sandbox_module, "escape_roots", lambda: [fake_root])
+
+    # 1.dry-run：只报告
+    assert main(["sandbox", "clean-escapes"]) == 0
+    assert fake_root.exists(), "dry-run 不应该删除任何东西"
+
+    # 2.--yes：真的删掉，并把空的父目录也一起清掉
+    assert main(["sandbox", "clean-escapes", "--yes"]) == 0
+    assert not fake_root.exists()
+    assert not (tmp_path / "home").exists()  # 空父目录也清掉
+
+
+def test_cli_sandbox_clean_reports_nothing_when_clean(monkeypatch):
+    import lab.infra.local_sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module, "escape_roots", lambda: [])
+    assert main(["sandbox", "clean-escapes", "--yes"]) == 0

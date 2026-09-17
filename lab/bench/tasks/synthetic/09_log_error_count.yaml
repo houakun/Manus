@@ -25,8 +25,14 @@ process:
   answer_literals: ["2"]
 solution:
   - kind: write_file
-    path: /home/ubuntu/error_count.txt
-    content: "2"
+    path: /home/ubuntu/_solve.py
+    content: |
+      import pathlib
+      lines = pathlib.Path("input/app.log").read_text().splitlines()
+      count = sum(1 for line in lines if "ERROR" in line)
+      pathlib.Path("error_count.txt").write_text(str(count))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/error_count.txt

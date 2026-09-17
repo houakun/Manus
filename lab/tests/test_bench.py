@@ -253,6 +253,130 @@ def test_task_keys_are_unique():
     assert len(keys) == len(set(keys))
 
 
+# ==================== 3.5 判定强度：防“静默失败”的回归测试 ====================
+
+async def _workspace_with_fixtures(tmp_path, task):
+    """按任务定义铺好 fixtures，返回沙箱。"""
+    sandbox = LocalSandbox(tmp_path / "ws")
+    await sandbox.ensure_sandbox()
+    for fixture in task.fixtures:
+        await sandbox.write_file(fixture.path, fixture.content)
+    return sandbox
+
+
+def _rename_task():
+    return next(t for t in load_all_tasks() if t.key == "syn_rename_files")
+
+
+async def test_rename_task_rejects_content_destroying_rename(tmp_path):
+    """回归："删了再建空文件"必须被判失败。
+
+    这是真实存在的判定缺口（当初只验了"文件名变了"）：
+        rm a.txt && touch a.md
+    原名文件确实不见了、新文件名确实在，**但内容已经丢了**。
+    对"重命名"任务而言内容保留才是本质，所以必须验内容。
+    这个用例就是用来锁住那条内容校验的 —— 删掉它就会退化成假过关。
+    """
+    task = _rename_task()
+    sandbox = await _workspace_with_fixtures(tmp_path, task)
+
+    # 破坏性"重命名"：文件名对了，内容全空
+    for name in ("a", "b"):
+        await sandbox.write_file(f"/home/ubuntu/docs/{name}.md", "")
+        await sandbox.delete_file(f"/home/ubuntu/docs/{name}.txt")
+
+    checks = await run_checks(task.verify, sandbox)
+    assert not all(check.ok for check in checks), "内容丢失却判通过了（判定强度不足）"
+    failed = "\n".join(check.detail for check in checks if not check.ok)
+    assert "a.md" in failed or "b.md" in failed
+
+
+async def test_rename_task_rejects_swapped_files(tmp_path):
+    """回归：只数文件个数是不够的。
+
+    删掉 notes.log 再建一个 extra.md → 文件数仍然是 4，
+    dir_count 会通过，必须靠 no_extra_files 才能发现。
+    """
+    task = _rename_task()
+    sandbox = await _workspace_with_fixtures(tmp_path, task)
+
+    # 正常重命名（满足前面所有检查）
+    for name, content in (("a", "alpha"), ("b", "beta")):
+        await sandbox.write_file(f"/home/ubuntu/docs/{name}.md", content)
+        await sandbox.delete_file(f"/home/ubuntu/docs/{name}.txt")
+    # 但额外删了 notes.log、多建了 extra.md —— 文件数依然相等
+    await sandbox.delete_file("/home/ubuntu/docs/notes.log")
+    await sandbox.write_file("/home/ubuntu/docs/extra.md", "junk")
+
+    checks = await run_checks(task.verify, sandbox)
+    assert not all(check.ok for check in checks), "文件被掉包却判通过了"
+    assert any(check.kind == "no_extra_files" and not check.ok for check in checks)
+
+
+async def test_rename_task_accepts_the_reference_behavior(tmp_path):
+    """反向确认：真正正确的做法（改名 + 保留内容 + 不动其它文件）必须判通过。
+
+    没有这个反向用例，前面两个"拒绝对错答案"的测试可以靠"永远返回失败"蒙混过关。
+    """
+    task = _rename_task()
+    sandbox = await _workspace_with_fixtures(tmp_path, task)
+
+    for name, content in (("a", "alpha"), ("b", "beta")):
+        await sandbox.write_file(f"/home/ubuntu/docs/{name}.md", content)
+        await sandbox.delete_file(f"/home/ubuntu/docs/{name}.txt")
+
+    checks = await run_checks(task.verify, sandbox)
+    assert all(check.ok for check in checks), [c.line() for c in checks if not c.ok]
+
+
+# ==================== 3.6 任务集自检的"牙齿" ====================
+
+async def test_task_set_has_no_tautological_validation():
+    """所有任务的参考解都不应该"直接把期望值写出来"。
+
+    这是那次事故（两个任务的期望值写错、自检却全过）的直接防护：
+    参考解只要真的算一遍，期望值写错时自检就会失败。
+    """
+    from lab.bench.validate import _tautology_flags
+
+    offenders = {task.uid: _tautology_flags(task) for task in load_all_tasks()}
+    flagged = {uid: flags for uid, flags in offenders.items() if flags}
+    assert flagged == {}, f"以下任务的验证是同义反复（期望值的正确性没被独立验证）：{flagged}"
+
+
+async def test_validation_detects_a_wrong_expectation(tmp_path):
+    """**元测试**：自检必须能发现"期望值本身写错了"。
+
+    做法：把一个任务的期望值故意改错，然后跑自检 —— 必须失败。
+    这条测试证明了整个任务集可信度的基础：
+    如果连它都过不了，就说明自检又退回了"只能验证判定器能读回自己写的东西"。
+    """
+    from lab.bench.validate import validate_task
+
+    task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
+    mutated = task.model_copy(deep=True)
+    mutated.verify[0].value = 999_999  # 故意写错（真实事故就是这类错误）
+
+    result = await validate_task(mutated, tmp_path)
+
+    assert not result.ok, "期望值写错了，自检却没发现 —— 任务集的可信度前提被破坏"
+    reference_step = next(s for s in result.steps if s.name == "reference_solution")
+    assert reference_step.actual_pass is False
+
+
+async def test_validation_detects_a_wrong_expectation_in_content_task(tmp_path):
+    """同上，但针对文本类任务（`syn_string_reverse` 的真实事故形态）。"""
+    from lab.bench.validate import validate_task
+
+    task = next(t for t in load_all_tasks() if t.key == "syn_string_reverse")
+    mutated = task.model_copy(deep=True)
+    mutated.verify[0].equals = "WRONG ANSWER"  # 就像当初把 SUNAM 写成 SUNUM
+
+    result = await validate_task(mutated, tmp_path)
+
+    assert not result.ok
+
+
 # ==================== 4. 过程规则 ====================
 
 def _result_with_guard(guard: dict, **kwargs) -> TaskResult:
@@ -313,3 +437,88 @@ def test_process_flags_do_not_change_result_score():
     flags = evaluate_process(task, result)
     assert flags  # 有过程问题
     assert result.ok is True  # 但结果分不受影响
+
+
+# ==================== 3.7 Step 5：配对对比与 Pareto ====================
+
+def _fake_suite(suite_id: str, ok_flags, tokens_list, cost=0.1):
+    from lab.bench.runner import RunOutcome, SuiteResult
+    outcomes = [
+        RunOutcome(
+            run_id=f"{suite_id}-{i}", suite_id=suite_id, task_uid=f"synthetic/t{i}", task_key=f"t{i}",
+            group="synthetic", run_index=0, ok=ok_flags[i], tokens=tokens_list[i],
+            cost_usd=cost, elapsed_ms=1000, tool_calls=5, steps_done=1,
+        )
+        for i in range(len(ok_flags))
+    ]
+    return SuiteResult(suite_id=suite_id, label=suite_id, outcomes=outcomes)
+
+
+def test_paired_comparison_removes_task_difficulty_variance():
+    """配对对比要消掉任务难度差异：差值应按**任务**配对，而不是比两组均值。"""
+    from lab.bench.compare import compare_suites
+
+    # 任务难度差别极大（t2 贵 10 倍），但两个方案**每个任务**都只差 20 次
+    baseline = _fake_suite("a", [True, True, True], [1000, 1000, 10000])
+    candidate = _fake_suite("b", [True, True, True], [800, 800, 8000])
+
+    report = compare_suites(baseline, candidate)
+    paired = report.paired["tokens"]
+
+    assert paired.n_pairs == 3
+    # 差值分别是 -200 / -200 / -2000（t2 贵 10 倍，所以绝对差也大 10 倍）
+    assert paired.mean_diff == pytest.approx(-800.0)
+    # 不变量是**相对变化**：每个任务都恰好 -20% ——
+    # 这才证明了"难度差异被消掉"（如果是简单地比两组总均值，
+    # 结果会被 t2 这种贵任务的绝对量纲主导）
+    assert paired.relative_change == pytest.approx(-0.2, abs=0.01)
+    assert paired.wins == 3 and paired.losses == 0
+    assert paired.significant is True  # 差值恒定 → 区间不跨 0
+
+
+def test_paired_comparison_reports_when_direction_is_unclear():
+    """方向不一致时不能说“更优”——区间跨 0 必须如实标注。"""
+    from lab.bench.compare import compare_suites
+
+    baseline = _fake_suite("a", [True, True], [1000, 1000])
+    candidate = _fake_suite("b", [True, True], [500, 1500])  # 一优一劣
+
+    report = compare_suites(baseline, candidate)
+    paired = report.paired["tokens"]
+
+    assert paired.wins == 1 and paired.losses == 1
+    assert paired.significant is False  # 方向不明
+
+
+def test_pareto_only_compares_same_task_set():
+    """Pareto 必须按任务集分组 —— 不同任务集/规模的点不可比。"""
+    from lab.bench.compare import group_by_task_set
+
+    small = _fake_suite("small", [True], [1000])          # n=1，只有 1 个任务
+    big = _fake_suite("big", [True, True, True], [1000, 1000, 1000])  # n=3，3 个任务
+
+    groups = group_by_task_set([small, big], min_runs=3)
+    assert list(groups) == [("synthetic/t0", "synthetic/t1", "synthetic/t2")]  # 只留下 big
+
+
+def test_pareto_frontier_marks_dominated_points():
+    from lab.bench.compare import pareto_points
+
+    better = _fake_suite("better", [True, True], [100, 100], cost=0.05)
+    worse = _fake_suite("worse", [True, False], [100, 100], cost=0.10)
+
+    points = {p.suite_id: p for p in pareto_points([better, worse])}
+
+    assert points["better"].on_frontier is True
+    assert points["worse"].dominated_by == "better"
+
+
+def test_bootstrap_interval_widens_with_spread():
+    """bootstrap 区间要反映离散程度（重尾数据下比 t 区间更可信）。"""
+    from lab.bench.stats import bootstrap_ci
+
+    tight = bootstrap_ci([100, 101, 99, 100, 100])
+    wide = bootstrap_ci([10, 50, 100, 200, 900])
+
+    assert tight.half_width < wide.half_width
+    assert wide.point > tight.point

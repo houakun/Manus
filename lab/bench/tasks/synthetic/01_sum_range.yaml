@@ -14,9 +14,18 @@ process:
   max_tool_calls: 12
   answer_literals: ["500500"]
 solution:
+  # 参考解**真的算一遍**（而不是把 500500 写出来）：
+  # 这样"期望值写错"时参考解就对不上，三步自检会失败 —— 自检才真正有意义。
+  # （历史事故：syn_string_reverse / syn_word_freq 的期望值就是错的，
+  #   而当时的参考解直接把期望值写出来，所以自检 20/20 全过却掩盖了错误。）
   - kind: write_file
-    path: /home/ubuntu/sum.txt
-    content: "500500"
+    path: /home/ubuntu/_solve.py
+    content: |
+      import pathlib
+      total = sum(range(1, 1001))
+      pathlib.Path("sum.txt").write_text(str(total))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/sum.txt

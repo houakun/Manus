@@ -12,16 +12,32 @@ verify:
   - kind: file_content
     path: /home/ubuntu/reversed.txt
     normalize: strip
-    equals: "TNEGA SUNUM"
+    # 正确值：“Manus Agent”反转→“tnegA sunaM”→大写→TNEGA SUNAM。
+    # 这里曾经写成 TNEGA SUNUM（把 M 误写成 M 前面那个字母），
+    # 导致 Agent 算对了却被判失败 5/5。已由“参考解真的算一遍”的自检抓住。
+    equals: "TNEGA SUNAM"
     description: 反转并大写（顺序与大小写都要对）
 process:
   max_tool_calls: 10
 solution:
+  # 这个任务的期望值曾经写错（写成 TNEGA SUNUM，正确是 TNEGA SUNAM），
+  # Agent 算对了却被判失败 5/5 —— 根因就是参考解直接写出了那个错误的期望值。
   - kind: write_file
-    path: /home/ubuntu/reversed.txt
-    content: "TNEGA SUNUM"
+    path: /home/ubuntu/_solve.py
+    content: |
+      import pathlib
+      text = pathlib.Path("input/word.txt").read_text().strip()
+      pathlib.Path("reversed.txt").write_text(text[::-1].upper())
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/reversed.txt
     content: "MANUS AGENT"
-notes: 错误解只做了大写没做反转，用来确认判定器不会被"部分正确"骗过。
+notes: >-
+  错误解只做了大写没做反转，用来确认判定器不会被"部分正确"骗过。
+
+  这个任务曾经因为**期望值本身写错**而把正确答案判成失败（5/5 全错）：
+  正确值是 TNEGA SUNAM，YAML 里写成了 TNEGA SUNUM。
+  根因是当时参考解直接写出那个错的值，所以三步自检无法发现 ——
+  现已改成“参考解真的算一遍”，这种错误以后会在自检阶段就暴露。

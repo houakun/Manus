@@ -34,13 +34,28 @@ process:
   max_tool_calls: 20
 solution:
   - kind: write_file
-    path: /home/ubuntu/contacts_clean.csv
+    path: /home/ubuntu/_solve.py
     content: |
-      name,email
-      Alice,alice@example.com
-      bob,bob@example.com
-      Carol,carol@example.com
-      dave,dave@example.com
+      import csv
+      import io
+      import pathlib
+
+      rows = list(csv.reader(io.StringIO(pathlib.Path("input/contacts.csv").read_text())))
+      seen = set()
+      out = [rows[0]]
+      for row in rows[1:]:
+          if not row or not any(cell.strip() for cell in row):
+              continue
+          name, email = row[0].strip(), row[1].strip().lower()
+          if (name, email) in seen:
+              continue
+          seen.add((name, email))
+          out.append([name, email])
+      buf = io.StringIO()
+      csv.writer(buf).writerows(out)
+      pathlib.Path("contacts_clean.csv").write_text(buf.getvalue())
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/contacts_clean.csv

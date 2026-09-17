@@ -24,8 +24,22 @@ process:
   max_tool_calls: 20
 solution:
   - kind: write_file
-    path: /home/ubuntu/status.json
-    content: '{"status": {"200": 3, "404": 2, "500": 1}}'
+    path: /home/ubuntu/_solve.py
+    content: |
+      import collections
+      import json
+      import pathlib
+      import re
+
+      counts = collections.Counter()
+      for line in pathlib.Path("input/access.log").read_text().splitlines():
+          found = re.search(r'"\s+(\d{3})\s', line)
+          if found:
+              counts[found.group(1)] += 1
+      ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+      pathlib.Path("status.json").write_text(json.dumps({"status": dict(ordered)}))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/status.json

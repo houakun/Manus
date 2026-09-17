@@ -60,6 +60,7 @@ NON_IDEMPOTENT_TOOLS = {
 # 无论是否幂等，这些失败类型都不该重试（确定性错误，重试必然同样失败）
 FATAL_ERROR_TYPES = {
     "tool_not_found",
+    "invalid_arguments",  # 工具参数不是合法 JSON：重试同一串坏参数没有意义
     "path_escape",
     "invalid_argument",
     "unsupported",

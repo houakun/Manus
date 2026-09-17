@@ -33,12 +33,22 @@ process:
   max_tool_calls: 15
 solution:
   - kind: write_file
-    path: /home/ubuntu/TOC.md
+    path: /home/ubuntu/_solve.py
     content: |
-      - 项目说明
-        - 安装
-          - 依赖
-        - 使用
+      import pathlib
+
+      out = []
+      for line in pathlib.Path("input/README.md").read_text().splitlines():
+          text = line.rstrip()
+          if not text.startswith("#"):
+              continue
+          level = len(text) - len(text.lstrip("#"))
+          if level > 3:
+              continue
+          out.append(" " * (2 * (level - 1)) + "- " + text[level:].strip())
+      pathlib.Path("TOC.md").write_text(chr(10).join(out) + chr(10))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/TOC.md
@@ -47,4 +57,14 @@ wrong:
       - 安装
       - 依赖
       - 使用
-notes: 错误解丢掉了层级缩进 —— 判定器要求缩进完全一致，这是"格式即语义"的任务。
+notes: >-
+  错误解丢掉了层级缩进 —— 判定器要求缩进完全一致，这是"格式即语义"的任务。
+
+  本任务的目标描述经过一次修正（真实评测发现的问题）：
+  原版写的是"所有以 # 开头的标题（包括二三级标题）"，
+  结果有一次运行只提取了二三级标题、跳过了 H1，被判失败。
+  复盘后认定这是**任务描述歧义**而不是 Agent 的能力问题：
+  "包括二三级标题"容易被读成"要提取的是二三级标题"，
+  而且当时的缩进规则也只规定了二三级（没提一级），进一步强化了错误读法。
+  所以改成显式列举"一级二级三级都要 + 一级缩进 0 个空格"。
+  这类假阳性（把任务缺陷当成能力缺陷）正是"任务集也要被验证"要防的东西。

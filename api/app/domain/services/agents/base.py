@@ -9,7 +9,9 @@ import asyncio
 import logging
 import uuid
 from abc import ABC
-from typing import Optional, List, AsyncGenerator, Dict, Any, Callable
+from typing import Optional, List, AsyncGenerator, Dict, Any, Callable, Type, TypeVar
+
+from pydantic import BaseModel, ValidationError
 
 from app.domain.external.json_parser import JSONParser
 from app.domain.external.llm import LLM
@@ -19,9 +21,13 @@ from app.domain.models.memory import Memory
 from app.domain.models.message import Message
 from app.domain.models.tool_result import ToolResult
 from app.domain.repositories.uow import IUnitOfWork
+from app.domain.services.prompts.system import STRUCTURED_OUTPUT_CORRECTION_PROMPT
 from app.domain.services.tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
+
+# 结构化输出的模型类型（Plan / Step / Message ...）
+M = TypeVar("M", bound=BaseModel)
 
 
 class LLMInvocationError(RuntimeError):
@@ -35,6 +41,25 @@ class LLMInvocationError(RuntimeError):
     def __init__(self, message: str, error_type: str = "llm_retry_exhausted") -> None:
         super().__init__(message)
         self.error_type = error_type
+
+
+class StructuredResult:
+    """结构化调用结果的容器。
+
+    为什么用"传入的容器"而不是让生成器 return 值：
+    `invoke()` 是异步生成器（要透传 ToolEvent 等中间事件），
+    异步生成器没法优雅地返回结果值（要靠 StopIteration.value，可读性很差）。
+    传一个容器进去，调用方在 `async for` 结束后直接读，语义最清楚。
+    """
+
+    def __init__(self) -> None:
+        self.value: Optional[BaseModel] = None  # 解析成功后的模型实例
+        self.error: Optional[str] = None  # 失败原因（含期望格式，可直接喂回给 LLM）
+        self.attempts: int = 0  # 实际尝试次数
+
+    @property
+    def ok(self) -> bool:
+        return self.value is not None
 
 
 class BaseAgent(ABC):
@@ -209,6 +234,139 @@ class BaseAgent(ABC):
         async with self._uow:
             await self._uow.session.save_memory(self._session_id, self.name, self._memory)
 
+    # ==================== 结构化输出：解析 + 纠错重试 ====================
+
+    def _expected_schema(self, model_cls: Type[M]) -> str:
+        """把模型的 JSON Schema 压成一小段提示文本。
+
+        为什么不直接抛整份 JSON Schema：
+        完整 schema 动辄上千 token，而模型只需要知道"字段名 + 类型 + 是否必填"
+        就能把格式改对。纠错提示越短，重试越便宜、也越不容易把模型搞糊。
+        """
+        try:
+            schema = model_cls.model_json_schema()
+        except Exception:  # noqa: BLE001
+            return "（无法生成结构说明）"
+
+        properties = schema.get("properties") or {}
+        required = set(schema.get("required") or [])
+        lines = []
+        for name, spec in properties.items():
+            type_name = spec.get("type") or spec.get("anyOf") or "any"
+            if isinstance(type_name, list):
+                type_name = "/".join(
+                    str(item.get("type", item)) if isinstance(item, dict) else str(item)
+                    for item in type_name
+                )
+            mark = "必填" if name in required else "可选"
+            description = (spec.get("description") or "").split("\n")[0][:60]
+            lines.append(f"- {name} ({type_name}, {mark}) {description}")
+        return "\n".join(lines) or "（无字段说明）"
+
+    async def _parse_structured(self, raw: str, model_cls: Type[M]) -> tuple:
+        """解析 + 校验，返回 (模型实例, 错误说明)。
+
+        错误说明是**给 LLM 看的**（会原样拼进纠错提示），所以它必须包含：
+        1. 出错原因（JSON 不合法 / 字段类型不对 / 缺字段）；
+        2. 期望的结构（由 _expected_schema 生成）。
+
+        实测一个容易误判的点：这里的 JSON 解析器是 `json_repair`，它**非常宽容** ——
+        传给它"这不是 JSON"也会返回一个字符串而不是抛异常。
+        所以绝大多数格式错误实际上落到 ValidationError 分支
+        （报"你返回的是 str/list，期望一个对象"），那个分支才是主路径；
+        第一个 except 分支只作为防御（换解析器时才有用）。
+        """
+        try:
+            parsed = await self._json_parser.invoke(raw)
+        except Exception as exc:  # noqa: BLE001
+            return None, f"你的回复不是合法 JSON：{type(exc).__name__}: {exc}"
+
+        try:
+            return model_cls.model_validate(parsed), None
+        except ValidationError as exc:
+            # 把 pydantic 的报错压成两三行：完整报错很长，而且大部分是噪音
+            details = "; ".join(
+                f"{'.'.join(str(x) for x in item['loc'])}: {item['msg']}"
+                for item in exc.errors()[:3]
+            )
+            shape = type(parsed).__name__
+            return None, (
+                f"JSON 结构不匹配。你返回的是 {shape}，期望一个对象。具体问题：{details}"
+            )
+
+    async def invoke_structured(
+            self,
+            query: str,
+            model_cls: Type[M],
+            holder: StructuredResult,
+            *,
+            max_attempts: int = 2,
+    ) -> AsyncGenerator[BaseEvent, None]:
+        """调用 LLM 并解析成结构化模型；格式不符时**把错误回灌给模型重试**。
+
+        == 这解决什么 ==
+        提示词写了"必须返回严格 JSON"，但模型偶尔会违反约定。
+        原来的代码直接 `Model.model_validate(parsed)`，于是：
+          - 模型返回数组 → ValidationError → 整个任务崩掉（实测发生）。
+        光靠 try/except 也能不崩，但那是把活儿丢掉；
+        **正确做法是把"你格式错了 + 期望的格式"告诉模型，让它自己改** ——
+        格式错误是可以低成本自救的，重试一次比丢掉整个任务便宜得多。
+
+        == 为什么放在 BaseAgent 而不是每个调用点 ==
+        这个位置本来就是四个调用点（create_plan / update_plan / execute_step / summarize）
+        的公共父类；四份重复的 try/except 必然会长成四种不同的行为。
+
+        == 为什么重试上限是 2 ==
+        一次纠错重试已经能覆盖"手滑"类错误；两次以上往往说明这个模型
+        确实做不到这个格式，再试只是烧 token（而 Step 4 的预算观察会把它记下来）。
+        """
+        schema_hint = self._expected_schema(model_cls)
+        current_query = query
+
+        for attempt in range(1, max_attempts + 1):
+            holder.attempts = attempt
+            async for event in self.invoke(current_query):
+                if isinstance(event, MessageEvent):
+                    parsed, error = await self._parse_structured(event.message, model_cls)
+                    if parsed is not None:
+                        holder.value = parsed
+                        return
+                    holder.error = error
+                    logger.warning(
+                        f"{self.name} Agent 结构化输出解析失败"
+                        f"（第 {attempt}/{max_attempts} 次）: {error}"
+                    )
+                    # 把模型的**原始输出**记下来（截断）：格式失败时这是最有价值的一条信息，
+                    # 没有它你只能看到"结构不匹配"，看不到它到底回了什么。
+                    # 原实现（在 planner/react 里 logger.info 整条消息）能记到，但会打到 info 级
+                    # 且只在成功路径上；现在改成只在失败时记、并带上前缀便于检索。
+                    logger.warning(
+                        f"{self.name} Agent 原始输出（截断 500 字）: "
+                        f"{(event.message or '')[:500]}"
+                    )
+                    break  # 跳出本次迭代，进入纠错重试
+                if isinstance(event, ErrorEvent):
+                    # LLM 本身调用失败：重试没有意义（invoke 内部已经重试过了），直接上报
+                    holder.error = event.error
+                    yield event
+                    return
+                # 工具事件等中间事件原样透出，让上层照常展示/记录
+                yield event
+
+            if holder.value is not None:
+                return
+            if attempt >= max_attempts:
+                break
+            current_query = STRUCTURED_OUTPUT_CORRECTION_PROMPT.format(
+                error=holder.error or "未知错误",
+                schema=schema_hint,
+            )
+
+        logger.error(f"{self.name} Agent 结构化输出最终失败: {holder.error}")
+        yield ErrorEvent(
+            error=f"Agent输出的内容不符合约定格式（已尝试 {holder.attempts} 次）：{holder.error}"
+        )
+
     async def compact_memory(self) -> None:
         """压缩Agent的记忆"""
         await self._ensure_memory()
@@ -284,10 +442,71 @@ class BaseAgent(ABC):
                 # 6.取出调用工具id、名字、参数信息
                 tool_call_id = tool_call["id"] or str(uuid.uuid4())
                 function_name = tool_call["function"]["name"]
-                function_args = await self._json_parser.invoke(tool_call["function"]["arguments"])
 
-                # 7.取出Agent中对应的工具
-                tool = self._get_tool(function_name)
+                # [lab/兜底] 工具参数解析与工具查找都必须兜住。实测/推断的两类失败：
+                #   1) 模型幻觉出一个不存在的工具名 → `_get_tool` 抛 ValueError；
+                #   2) 模型输出的参数不是合法 JSON → 解析器抛异常。
+                #   原实现两者都是**裸调用**，异常会穿透整个 flow → 任务直接崩（sut_crash）。
+                #   正确处理：产出一个**结构化的失败结果回灌给 LLM**，让它自己换工具/改参数。
+                #
+                #   一个必须注意的细节：assistant 的 tool_calls 必须配对到一条 tool 消息，
+                #   否则下一次请求会被服务端以"tool_calls 没有对应结果"拒绝 ——
+                #   所以这里不能直接 continue 跳过，必须补上 tool_messages。
+                failure: Optional[ToolResult] = None
+                function_args: Dict[str, Any] = {}
+                tool = None
+                try:
+                    function_args = await self._json_parser.invoke(tool_call["function"]["arguments"])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"工具[{function_name}]的参数不是合法 JSON: {exc}")
+                    failure = ToolResult(
+                        success=False,
+                        message=f"工具参数不是合法 JSON，无法解析：{type(exc).__name__}: {exc}。"
+                                f"请检查参数格式后重新发起调用。",
+                        error_type="invalid_arguments",
+                        # retryable=False：重试同一串坏参数没有意义，
+                        # 由 LLM 看到这条结果后**换一种写法**才是正确的恢复路径。
+                        retryable=False,
+                    )
+
+                if failure is None:
+                    try:
+                        # 7.取出Agent中对应的工具
+                        tool = self._get_tool(function_name)
+                    except ValueError as exc:
+                        logger.warning(f"调用了不存在的工具[{function_name}]")
+                        failure = ToolResult(
+                            success=False,
+                            message=f"{exc}。可用的工具请参考工具清单，请改用存在的工具。",
+                            error_type="tool_not_found",
+                            retryable=False,
+                        )
+
+                if failure is not None:
+                    # 事件照常对外产出（轨迹/UI 能看到这次"无效调用"），
+                    # 同时把失败结果回灌给 LLM，让它下一步自己修正。
+                    yield ToolEvent(
+                        tool_call_id=tool_call_id,
+                        tool_name=function_name,
+                        function_name=function_name,
+                        function_args=function_args,
+                        status=ToolEventStatus.CALLING,
+                    )
+                    yield ToolEvent(
+                        tool_call_id=tool_call_id,
+                        tool_name=function_name,
+                        function_name=function_name,
+                        function_args=function_args,
+                        function_result=failure,
+                        status=ToolEventStatus.CALLED,
+                    )
+                    tool_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "function_name": function_name,
+                        "content": failure.model_dump_json(),
+                    })
+                    continue
 
                 # 8.返回工具即将调用事件，其中tool_content比较特殊，需要在具体业务中进行实现，这里留空即可
                 yield ToolEvent(

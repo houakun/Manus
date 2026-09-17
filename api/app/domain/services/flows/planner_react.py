@@ -167,8 +167,18 @@ class PlannerReActFlow(BaseFlow):
                 self.status = FlowStatus.EXECUTING
 
                 # 16.判断计划是否生成，步骤是否正常
+                # [lab/D9-fix] 这里原来是 `if not self.plan or len(self.plan.steps) == 0:`
+                #   然后直接把状态置成 COMPLETED —— 结果是：**计划为空也被当成"任务完成"**。
+                #   实测：某任务 PlannerAgent 产出了 steps=[] 的空计划、一个工具都没调，
+                #   流直接跑到 COMPLETED，TaskResult 却是 ok=True / error=None。
+                #   这是最危险的一类缺陷：Agent 自称成功、代码也认为成功，只有**外部判定器**
+                #   靠"产物不存在"才能发现（Step 4 的 SUT 自述 vs 独立判定交叉校验就是为此）。
+                #   空计划意味着任务根本没做，必须作为错误事件上报。
                 if not self.plan or len(self.plan.steps) == 0:
                     logger.info(f"Planner&ReAct流创建计划失败或无子步骤")
+                    yield ErrorEvent(
+                        error="Agent未能生成任何可执行的计划步骤（Plan 为空），任务未执行"
+                    )
                     self.status = FlowStatus.COMPLETED
             elif self.status == FlowStatus.EXECUTING:
                 # 17.流的状态为执行中，先将计划状态调整为运行中，同时调用执行Agent完成每个子步骤
@@ -206,8 +216,36 @@ class PlannerReActFlow(BaseFlow):
             elif self.status == FlowStatus.SUMMARIZING:
                 # 25.流状态为总结中，则意味着所有子步骤都执行完成
                 logger.info(f"Planner&ReAct流开始总结")
+
+                # [lab/兜底] 收尾阶段失败**不应把已经做完的工作报成失败**。
+                #   实测 4/40 次运行属于"活干完了但收尾失败"：
+                #   汇总阶段的 LLM 调用挂了（网络抖动），但产物已经全部生成。
+                #   它们被判失败纯粹是因为最后一步没写好总结 —— 这是拿"会不会收尾"
+                #   代替了"活干完没干完"，而后者才是任务完成的定义。
+                #
+                #   兜底策略：如果已经有成功的步骤，就用已产出的结果拼一条总结交付；
+                #   如果什么都没做成，则如实上报错误（不能把失败偷偷掩饰成成功）。
+                summary_errors: List[str] = []
+                delivered = False
                 async for event in self.react.summarize():
+                    if isinstance(event, ErrorEvent):
+                        summary_errors.append(event.error)
+                        continue
+                    if isinstance(event, MessageEvent) and event.message:
+                        delivered = True
                     yield event
+
+                if summary_errors and not delivered:
+                    fallback = self._fallback_summary()
+                    if fallback:
+                        logger.warning(
+                            f"收尾阶段失败，已用兜底总结交付（错误：{summary_errors}）"
+                        )
+                        yield MessageEvent(role="assistant", message=fallback)
+                    else:
+                        # 没有任何可用结果 → 如实上报，不能假装完成
+                        for error in summary_errors:
+                            yield ErrorEvent(error=error)
 
                 # 26.总结完毕，意味着流即将结束
                 logger.info(f"Planner&ReAct流状态从{FlowStatus.SUMMARIZING}变成{FlowStatus.COMPLETED}")
@@ -219,9 +257,10 @@ class PlannerReActFlow(BaseFlow):
                 #   原代码无条件执行 self.plan.status 会抛 AttributeError，把"规划失败"
                 #   变成"整个进程崩溃"；PlanEvent(plan=None) 也会触发 pydantic 校验错误。
                 #   评测场景下弱模型/网络抖动很容易触发这条路径，必须转成结构化错误事件。
-                if self.plan is None:
-                    logger.warning(f"Planner&ReAct流结束但计划为空，返回错误事件")
-                    yield ErrorEvent(error="Agent未能生成有效的任务计划(Plan 为空)，任务终止")
+                if self.plan is None or len(self.plan.steps) == 0:
+                    # 计划为空：上面第16步已经报过 ErrorEvent 了，这里不再重复一个
+                    # （重复报错会让错误链出现两条同样的条目，归因时会被重复计数）
+                    logger.warning(f"Planner&ReAct流结束但计划为空，跳过完成事件")
                 else:
                     self.plan.status = ExecutionStatus.COMPLETED
                     yield PlanEvent(status=PlanEventStatus.COMPLETED, plan=self.plan)
@@ -235,3 +274,29 @@ class PlannerReActFlow(BaseFlow):
     def done(self) -> bool:
         """只读属性，返回流是否运行结束"""
         return self.status == FlowStatus.IDLE
+
+    def _fallback_summary(self) -> str:
+        """用已完成的步骤结果拼一条兜底总结。
+
+        只在**至少有一个步骤产出了结果**时才返回非空串 ——
+        没有任何结果时应该如实失败，而不是编一句话把任务包装成成功。
+        """
+        if not self.plan or not self.plan.steps:
+            return ""
+
+        parts = [
+            "任务已执行完成，但**生成总结报告的最后一步失败了**（通常是模型服务端的临时问题）。",
+            "以下是各步骤实际产出的结果，据此交付：",
+        ]
+        has_result = False
+        for index, step in enumerate(self.plan.steps, start=1):
+            if not step.result:
+                continue
+            has_result = True
+            parts.append(f"{index}. {step.description}：{step.result}")
+
+        if not has_result:
+            return ""
+
+        parts.append("如果希望得到一份完整整理的报告，请回复“重新总结”。")
+        return "\n".join(parts)

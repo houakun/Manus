@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import logging
 import os
 import re
 import signal
@@ -50,9 +51,65 @@ ensure_sut_on_path()
 
 from app.domain.models.tool_result import ToolResult  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
 
 class SandboxPathError(ValueError):
     """路径越界或非法时抛出。"""
+
+
+def escape_roots() -> List[Path]:
+    """列出"脚本逃逸"可能写入的根目录（即脚本里写 `/home/ubuntu/x` 会落到的位置）。
+
+    为什么需要它：沙箱的路径映射只作用于文件工具与命令行，**管不到脚本内容**。
+    于是 Agent 写的脚本一旦用绝对路径，产物就会落到 `<当前盘>:/home/ubuntu`。
+    实测这是**常态而不是边缘情况**：一次真实的 semirefactor 运行里
+    Agent 往 D:/home/ubuntu/parts/ 写了 24 个分片文件，
+    另一次往同一个地方下了两个 5MB 的 zip。
+
+    这些文件在工作区之外，不会随任务清理，会一直累积（实测一天就积了 15MB）。
+    所以清理必须是**可重复的命令**，而不是一次性手工删除。
+    """
+    if os.name != "nt":
+        root = Path("/home/ubuntu")
+        return [root] if root.exists() else []
+
+    drives: List[str] = []
+    lister = getattr(os, "listdrives", None)  # Python 3.12+
+    if callable(lister):
+        try:
+            drives = [str(item) for item in lister()]
+        except OSError:
+            drives = []
+    if not drives:
+        drives = [f"{letter}:\\" for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ"]
+
+    found: List[Path] = []
+    for drive in drives:
+        candidate = Path(drive) / "home" / "ubuntu"
+        try:
+            if candidate.exists():
+                found.append(candidate)
+        except OSError:
+            continue
+    return found
+
+
+def describe_escape_roots() -> List[Dict[str, Any]]:
+    """清点逃逸产物（文件数 + 总字节数），供 CLI 与报告使用。"""
+    inventory: List[Dict[str, Any]] = []
+    for root in escape_roots():
+        total = 0
+        count = 0
+        for path in root.rglob("*"):
+            try:
+                if path.is_file():
+                    count += 1
+                    total += path.stat().st_size
+            except OSError:
+                continue
+        inventory.append({"path": str(root), "files": count, "bytes": total})
+    return inventory
 
 
 class LocalSandbox:
@@ -474,8 +531,73 @@ class LocalSandbox:
         env.update(self._extra_env)
         return env
 
+    # 工作区外快照的条目上限（防止 Agent 下载了一个大目录树时把内存吃光）
+    _MAX_OUTSIDE_ENTRIES = 500
+
+    def _snapshot_outside(self) -> Dict[str, float]:
+        """记录工作区外那个位置的 (relative path → mtime) 快照。
+
+        为什么要快照而不是"看目录存不存在"：
+        初版检测器只判断 `Path("D:/home/ubuntu").exists()`，结果一旦某个脚本
+        创建过它，**之后每条命令都会告警** —— 实测一次 40 运行的评测里报了 98 次，
+        几乎全是噪声。噪声化的安全告警比没有告警更糟：它会训练人忽略它。
+        改成比对前后快照，只报"本次命令**新增或改写了**什么"。
+        """
+        root = self._escaped_root()
+        if root is None or not root.exists():
+            return {}
+        snapshot: Dict[str, float] = {}
+        try:
+            for path in root.rglob("*"):
+                if len(snapshot) >= self._MAX_OUTSIDE_ENTRIES:
+                    break
+                try:
+                    if path.is_file():
+                        snapshot[str(path.relative_to(root))] = path.stat().st_mtime
+                except OSError:
+                    continue
+        except OSError:
+            return snapshot
+        return snapshot
+
+    def _detect_escaped_writes(self, before: Dict[str, float]) -> List[str]:
+        """本次命令在工作区外新增/改写了哪些文件（见 _snapshot_outside 的说明）。"""
+        after = self._snapshot_outside()
+        return sorted(name for name, mtime in after.items() if before.get(name) != mtime)[:20]
+
+    def _escaped_root(self) -> Optional[Path]:
+        """返回一个脚本里写 `/home/ubuntu/...` 时会落到的**真实**位置。
+
+        == 为什么需要这个（实测发生的事故）==
+        沙箱的路径映射只作用于两处：
+          1. 文件工具（read_file/write_file ...）
+          2. 命令行字符串（_rewrite_paths 把 /home/ubuntu 换成真实路径）
+        **脚本内容它管不到**。于是当 Agent（或参考解）写一个 Python 脚本、
+        脚本里用 "/home/ubuntu/x" 时，Python 会把它解析成
+        `<当前盘>:/home/ubuntu/x` —— 直接写到工作区**外面**。
+
+        实测：`D:\\home\\ubuntu` 里堆了十几个文件（config.json / days.txt /
+        fizzbuzz.txt / parts/part_000...），它们都是逃跑的产物。
+
+        == 双重危害 ==
+        1. **正确性**：产物没落在工作区 → 判定器读不到 → 正确的工作被判失败；
+        2. **安全**：这意味着 fast mode 的"沙箱"可以被任意脚本逃出 ——
+           它只能用于**可信的任务与内容**，绝不能跑外部输入。
+
+        这里只做**检测与告警**，不做阻断：
+        真要把绝对路径导向工作区需要盘根目录级别的 junction，
+        那是全局状态、并行任务会互相干扰，代价大于收益（已记录为已知限制）。
+        """
+        if os.name == "nt":
+            # Windows：无盘符的绝对路径按"当前盘"解析
+            drive = self._root.drive or "C:"
+            return Path(f"{drive}/home/ubuntu")
+        return Path("/home/ubuntu")
+
     async def exec_command(self, session_id: str, exec_dir: str, command: str) -> ToolResult:
         """执行命令并等待结束（非交互式），返回 returncode 与合并后的输出。"""
+        # 0.执行前先给"工作区外"拍个快照，用于检测脚本逃逸（见 _snapshot_outside）
+        outside_before = self._snapshot_outside()
         # 1.解析工作目录（不存在就创建，避免因为目录问题浪费一次迭代）
         try:
             cwd = self._to_local(exec_dir or self.SANDBOX_HOME)
@@ -549,15 +671,28 @@ class LocalSandbox:
         #（真沙箱只要 HTTP 200 就 success=True，returncode 放在 data 里）。
         # 非零返回码不应该被吞掉，因此 message 里显式提示，供模型判断。
         hint = "" if process.returncode == 0 else f"（返回码 {process.returncode}，命令执行失败）"
+
+        # 逃逸检测：如果脚本用了 /home/ubuntu 绝对路径，产物会落在工作区外面。
+        # 把它写进返回结果与日志，让"产物找不到"这类问题一眼能归因，
+        # 而不是让人去怀疑判定器或模型能力。
+        escaped = self._detect_escaped_writes(outside_before)
+        if escaped:
+            logger.warning(
+                f"检测到工作区外写入（脚本里可能用了 /home/ubuntu 绝对路径）："
+                f"本次新增/修改 {len(escaped)} 个文件，例如 {escaped[0]}。"
+                f"沙箱路径映射只作用于文件工具与命令行，管不到脚本内容。"
+            )
+
         return ToolResult(
             success=True,
-            message=f"命令执行完成{hint}",
+            message=f"命令执行完成{hint}" + ("（检测到工作区外写入）" if escaped else ""),
             data={
                 "session_id": session_id,
                 "command": command,
                 "status": "completed",
                 "returncode": process.returncode,
                 "output": output,
+                "escaped_paths": escaped,
             },
         )
 

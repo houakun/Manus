@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 
@@ -144,6 +145,62 @@ def test_suite_isolates_workspaces_between_runs(tmp_path, monkeypatch, no_sleep)
     workspaces = {outcome.workspace for outcome in suite.outcomes}
     assert len(workspaces) == 2  # 两次运行落在两个不同目录
     assert all(outcome.ok for outcome in suite.outcomes)
+
+
+def test_recover_rebuilds_suite_from_workspaces(tmp_path, monkeypatch, no_sleep):
+    """`recover` 的验收：模拟"落库丢失"后能从工作区重建出**一致**的结论。
+
+    这个能力在真正被 Ctrl-C 打断时是救数据的唯一手段（写它的时候我误判了一次事故，
+    但能力本身是对的）。这里锁住两件事：
+    1. 重建出的判定结论与原始一致（判定器是纯函数）；
+    2. 指标（token/ok）能从轨迹库里正确反查回来。
+    """
+    from lab.bench.recover import recover_suite
+    from lab.bench.runner import run_suite as real_run_suite
+
+    db_path = _wire_fake_llm(monkeypatch, tmp_path, planner_react_script(
+        tool_name="write_file",
+        tool_args={"filepath": "/home/ubuntu/a.txt", "content": "alpha"},
+        final_message="done",
+    ))
+
+    bench_root = tmp_path / "bench"
+    original = asyncio.run(real_run_suite(
+        runs_per_task=1, keys=["syn_sort_numbers"], bench_root=bench_root, progress=False,
+    ))
+    assert original.total_runs == 1
+    original_outcome = original.outcomes[0]
+
+    # 落库（用增量接口，与 CLI 一致），然后模拟"库里的评定结果丢失"
+    store = SpanStore(db_path)
+    store.save_suite_header(original)
+    store.save_outcome(original_outcome)
+    store.finalize_suite(original)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DELETE FROM bench_runs WHERE suite_id = ?", (original.suite_id,))
+    assert store.load_suite(original.suite_id).outcomes == []
+
+    # 从工作区 + 轨迹重建
+    recovered = asyncio.run(recover_suite(
+        bench_root=bench_root, store=store,
+        suite_id="recovered-1", label="重建", group="synthetic",
+    ))
+
+    assert len(recovered.outcomes) == 1
+    rebuilt = recovered.outcomes[0]
+    assert rebuilt.ok == original_outcome.ok
+    assert rebuilt.tokens == original_outcome.tokens
+    assert rebuilt.workspace == original_outcome.workspace
+    # 重建结果也进了库
+    assert len(store.load_suite("recovered-1").outcomes) == 1
+
+    # 分组过滤：指定 semireal 时不应把 synthetic 的工作区扫进来
+    # （这个 bug 真实存在过：重建 semireal 的数据时混进了 synthetic 的工作区）
+    empty = asyncio.run(recover_suite(
+        bench_root=bench_root, store=store,
+        suite_id="recovered-2", label="空", group="semireal",
+    ))
+    assert empty.outcomes == []
 
 
 def test_budget_observation_is_recorded_in_outcomes(tmp_path, monkeypatch, no_sleep):

@@ -28,12 +28,22 @@ process:
   max_tool_calls: 18
 solution:
   - kind: write_file
-    path: /home/ubuntu/products.csv
+    path: /home/ubuntu/_solve.py
     content: |
-      name,price,stock
-      keyboard,89,12
-      monitor,320,4
-      mouse,25,
+      import csv
+      import io
+      import json
+      import pathlib
+
+      items = json.loads(pathlib.Path("input/products.json").read_text())
+      buf = io.StringIO()
+      writer = csv.writer(buf)
+      writer.writerow(["name", "price", "stock"])
+      for item in items:
+          writer.writerow([item.get("name", ""), item.get("price", ""), item.get("stock", "")])
+      pathlib.Path("products.csv").write_text(buf.getvalue())
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/products.csv

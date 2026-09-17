@@ -3,7 +3,7 @@ group: synthetic
 title: 批量重命名文件后缀
 goal: >-
   把 /home/ubuntu/docs/ 目录下所有以 .txt 结尾的文件重命名为 .md 后缀
-  （文件名主体不变），不要修改文件内容，也不要动其他文件。
+  （文件名主体不变），保持文件内容不变，也不要动其他文件。
 tags: [file-io]
 fixtures:
   - path: /home/ubuntu/docs/a.txt
@@ -15,22 +15,38 @@ fixtures:
   - path: /home/ubuntu/docs/notes.log
     content: "log line"
 verify:
-  - kind: file_exists
+  # 1.重命名后的文件存在，**且内容与重命名前一致**。
+  #   为什么必须验内容：这个任务的本质是"改名但保留内容"。
+  #   只验文件名的话，`rm a.txt && touch a.md` 也能通过 —— 内容已经丢了却判成功，
+  #   属于最危险的一类静默失败（没有任何一方会报警）。
+  - kind: file_content
     path: /home/ubuntu/docs/a.md
-    exists: true
-    description: a.txt 已重命名为 a.md
-  - kind: file_exists
+    equals: "alpha"
+    description: a.md 存在且内容与 a.txt 原内容一致
+  - kind: file_content
     path: /home/ubuntu/docs/b.md
-    exists: true
-    description: b.txt 已重命名为 b.md
+    equals: "beta"
+    description: b.md 存在且内容与 b.txt 原内容一致
+  # 2.旧文件必须消失（否则就是 cp 而不是 mv）
   - kind: file_exists
     path: /home/ubuntu/docs/a.txt
     exists: false
     description: 旧文件 a.txt 应已不存在
+  - kind: file_exists
+    path: /home/ubuntu/docs/b.txt
+    exists: false
+    description: 旧文件 b.txt 应已不存在
+  # 3.目录文件数不变（防止留下副本）
   - kind: dir_count
     path: /home/ubuntu/docs
     count: 4
-    description: 目录里仍然只有 4 个文件（没有产生副本）
+    description: 目录里仍然只有 4 个文件
+  # 4.锁定"是哪 4 个"：只数个数是不够的 ——
+  #   删掉 notes.log 再建一个 extra.md 仍然是 4 个，前三条检查也全都通过。
+  - kind: no_extra_files
+    path: /home/ubuntu/docs
+    allow: ["a.md", "b.md", "keep.md", "notes.log"]
+    description: 目录里只应有这 4 个文件，不得多也不得少
 process:
   max_tool_calls: 20
 solution:
@@ -39,4 +55,8 @@ solution:
 wrong:
   - kind: exec
     command: "cd /home/ubuntu/docs && cp a.txt a.md && cp b.txt b.md"
-notes: 错误解用 cp 而不是 mv —— 目录文件数变成 6，被 dir_c
+notes: >-
+  错误解用 cp 而不是 mv：目录文件数变成 6、且 a.txt/b.txt 仍然存在，被两条检查同时抓住。
+  刻意**不**检测"工作区里留下了临时文件"（真实运行中 Agent 把 before.md5 写到了
+  /home/ubuntu/tmp/）—— SUT 的提示词本来就要求它把中间结果存成文件，
+  把这种正常行为当问题会制造大量假阳性。

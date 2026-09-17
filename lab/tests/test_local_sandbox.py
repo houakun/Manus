@@ -257,3 +257,65 @@ async def test_extra_env_is_opt_in(sandbox: LocalSandbox):
     sandbox._extra_env = {"MY_EXPLICIT_VAR": "visible"}
     result = await sandbox.exec_command("s9", "/home/ubuntu", "set" if sys.platform == "win32" else "env")
     assert "visible" in result.data["output"]
+
+
+# ==================== 6. 脚本逃逸检测（安全 + 正确性） ====================
+
+@pytest.mark.asyncio
+async def test_detects_script_writing_outside_workspace(sandbox: LocalSandbox):
+    """脚本里用 `/home/ubuntu/...` 绝对路径会落到工作区外，必须被检测到。
+
+    这是 fast mode 的真实缺陷（不是假设）：路径映射只作用于文件工具与命令行，
+    管不到脚本内容。实测在一次真实的 `sem_refactor_config` 运行里，
+    Agent 把文件写到了 `D:/home/ubuntu/parts/part_000...`（用正斜杠写路径，
+    因为 Windows 风格的反斜杠在这个 docstring 里会被 Python 当成转义序列 —— 
+    这就是为什么本仓库的脚本内容里一律用 chr(10)/chr(47) 拼字符）。
+    """
+    escaped_root = sandbox._escaped_root()
+    if escaped_root is None:
+        pytest.skip("无法确定逃逸目录")
+
+    # 先把逃逸目录建出来：python 的 write_text **不会**自动创建父目录，
+    # 而真实场景里 Agent 的脚本往往会先 mkdir -p 再写（或者直接写失败）。
+    # 不建的话这条测试会在“干净的机器上”因为 FileNotFoundError 而失败 ——
+    # 那种失败看起来像“检测器坏了”，其实是测试自己没铺好前提。
+    escaped_root.mkdir(parents=True, exist_ok=True)
+
+    # 用 chr() 拼出绝对路径：避免测试代码本身被多层转义搞错
+    code = (
+        "import pathlib; p=" + "+".join(f"chr({ord(c)})" for c in "/home/ubuntu/_esc_probe.txt")
+        + "; pathlib.Path(p).write_text(chr(120))"
+    )
+    result = await sandbox.exec_command("esc", "/home/ubuntu", f'python -c "{code}"')
+
+    assert result.data.get("escaped_paths"), "写到了工作区外却没有任何检测结果"
+
+    # 清理探针，避免污染后续测试/后续的真实运行
+    probe = escaped_root / "_esc_probe.txt"
+    if probe.exists():
+        probe.unlink()
+    # 连同空的父目录一起清掉：测试自己弄脏的环境要自己恢复，
+    # 否则每次跑测试都会在盘根留下一个空的 home/ubuntu
+    try:
+        if not any(escaped_root.iterdir()):
+            escaped_root.rmdir()
+            parent = escaped_root.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+    except OSError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_escape_detection_reports_delta_not_existence(sandbox: LocalSandbox):
+    """关键性质：只报**本次新增/修改**的文件，不要因为目录存在就一直告警。
+
+    初版检测器只判断目录存在，结果一次 40 运行的评测报了 98 次告警 ——
+    几乎全是噪声。**噪声化的安全告警比没有告警更糟**：它会训练人忽略它。
+    """
+    first = await sandbox.exec_command("d1", "/home/ubuntu", 'python -c "print(1)"')
+    second = await sandbox.exec_command("d2", "/home/ubuntu", 'python -c "print(2)"')
+
+    # 普通命令（不碰工作区外）不应该产生逃逸报告 —— 无论那个目录是否已被创建
+    assert first.data.get("escaped_paths") == []
+    assert second.data.get("escaped_paths") == []

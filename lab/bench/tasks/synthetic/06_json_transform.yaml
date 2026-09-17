@@ -24,8 +24,17 @@ process:
   max_tool_calls: 15
 solution:
   - kind: write_file
-    path: /home/ubuntu/active.json
-    content: '[{"name": "carol", "age": 28}, {"name": "alice", "age": 31}, {"name": "dave", "age": 44}]'
+    path: /home/ubuntu/_solve.py
+    content: |
+      import json
+      import pathlib
+
+      users = json.loads(pathlib.Path("input/users.json").read_text())
+      active = [{"name": u["name"], "age": u["age"]} for u in users if u["active"]]
+      active.sort(key=lambda u: u["age"])
+      pathlib.Path("active.json").write_text(json.dumps(active))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/active.json

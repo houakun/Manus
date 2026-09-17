@@ -61,10 +61,80 @@ class TaskValidation(BaseModel):
     title: str = ""
     steps: List[StepValidation] = Field(default_factory=list)
     problems: List[str] = Field(default_factory=list)
+    # 同义反复验证（tautology）告警：参考解直接把期望值写了出来。
+    # 单独放一个字段而不是塞进 problems 的原因：
+    # 它是"验证强度弱"而不是"任务不可用"，不应该阻断评测；
+    # 但它必须**显式可见**，否则就会重演那次事故（见下面 _tautology_flags 的注释）。
+    tautology_flags: List[str] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return all(step.ok for step in self.steps) and not self.problems
+
+
+def _tautology_flags(task: BenchTask) -> List[str]:
+    """检测"参考解直接把期望值写出来"的同义反复验证。
+
+    == 为什么必须有这个检测（真实事故）==
+    synthetic 任务集里有两个任务的**期望值本身写错了**：
+      - `syn_string_reverse`："Manus Agent" 反转+大写应该是 `TNEGA SUNAM`，
+        我写成了 `TNEGA SUNUM`；
+      - `syn_word_freq`：词频 Top3 应该是 `the:4 / dog:3 / brown:2`，我写成了 `the:3 / brown:2 / dog:2`。
+    两个任务的三步自检**全部通过**，因为参考解就是"把期望值写进文件" ——
+    它怎么可能发现期望值是错的？自检验证的只是"判定器能不能读回自己刚写的东西"。
+
+    后果很严重：跑真实评测时这两个任务 0/5、0/5，
+    看起来像"Agent 能力不足"，实际是**任务集把对的答案判成了错**（10/60 次假失败）。
+
+    == 检测规则 ==
+    对每条带期望值的检查，看参考解里是否有一模一样的 write_file。
+    有 → 标记：这个任务的验证是自证自话的，期望值的正确性**没有被独立验证过**。
+
+    正确做法：让参考解**真的算一遍**（用 exec 跑 python 从 fixtures 推导），
+    这样期望值写错时参考解就对不上，自检会失败 —— 自检才真正有意义。
+    """
+    flags: List[str] = []
+    written = {
+        step.path: (step.content or "")
+        for step in task.solution
+        if step.kind == "write_file" and step.path
+    }
+    if not written:
+        return flags  # 纯 exec 型参考解：拿不到静态内容，无法判定
+
+    def _norm(text: str, mode: str) -> str:
+        return text.strip() if mode != "none" else text
+
+    for check in task.verify:
+        content = written.get(check.path)
+        if content is None:
+            continue
+        if check.kind == "file_content" and check.equals is not None:
+            if _norm(content, check.normalize) == _norm(check.equals, check.normalize):
+                flags.append(
+                    f"{check.path}: 参考解直接写出了期望内容 → 验证是同义反复"
+                )
+        elif check.kind == "numeric" and check.value is not None:
+            try:
+                if abs(float(content.strip().split()[0]) - float(check.value)) <= check.tolerance:
+                    flags.append(f"{check.path}: 参考解直接写出了期望数值 → 验证是同义反复")
+            except (ValueError, IndexError):
+                pass
+        elif check.kind == "json_equals" and check.equals is not None:
+            import json as _json
+
+            try:
+                if _json.loads(content) == _json.loads(check.equals):
+                    flags.append(f"{check.path}: 参考解直接写出了期望 JSON → 验证是同义反复")
+            except (TypeError, ValueError):
+                pass
+        elif check.kind == "csv_rows" and check.rows:
+            from lab.bench.verifier import _parse_csv
+
+            expected_rows = [[str(c).strip() for c in row] for row in check.rows]
+            if _parse_csv(content) == expected_rows:
+                flags.append(f"{check.path}: 参考解直接写出了期望行 → 验证是同义反复")
+    return flags
 
 
 async def _apply_fixtures(sandbox: LocalSandbox, fixtures: List[Fixture]) -> None:
@@ -75,7 +145,15 @@ async def _apply_fixtures(sandbox: LocalSandbox, fixtures: List[Fixture]) -> Non
 
 
 async def _apply_steps(sandbox: LocalSandbox, steps: List[SolutionStep], step_name: str) -> None:
-    """执行参考解/错误解的步骤。"""
+    """执行参考解/错误解的步骤。
+
+    ⚠️ 关键细节：`exec` 步必须检查**返回码**，不能只看 `result.success`。
+    LocalSandbox（与真沙箱一致）对非零返回码仍然返回 success=True，
+    返回码放在 data 里 —— 于是"参考解脚本报错退出"会被静默忽略，
+    最终表现为"判定器失败"，把排查方向带到完全错误的地方（责怪判定器而不是参考解）。
+    这个坑真实踩过：9 个改成 `python _solve.py` 的参考解全都没跑起来，
+    而报错却全部指向判定器。
+    """
     for index, step in enumerate(steps):
         if step.kind == "write_file":
             result = await sandbox.write_file(step.path, step.content or "")
@@ -83,8 +161,18 @@ async def _apply_steps(sandbox: LocalSandbox, steps: List[SolutionStep], step_na
             result = await sandbox.exec_command(f"validate-{step_name}-{index}", "/home/ubuntu", step.command or "")
         else:
             raise RuntimeError(f"未知的步骤类型: {step.kind}")
+
         if not result.success:
             raise RuntimeError(f"[{step_name}] 第 {index + 1} 步执行失败: {result.message}")
+
+        data = result.data if isinstance(result.data, dict) else {}
+        returncode = data.get("returncode")
+        if returncode not in (None, 0):
+            output = (data.get("output") or "")[-800:]
+            raise RuntimeError(
+                f"[{step_name}] 第 {index + 1} 步（{step.kind}）返回码 {returncode}，步骤失败。\n"
+                f"命令: {step.command}\n输出: {output}"
+            )
 
 
 async def _evaluate(task: BenchTask, workspace: Path, steps: Optional[List[SolutionStep]], name: str) -> StepValidation:
@@ -119,6 +207,8 @@ async def validate_task(task: BenchTask, root: Path) -> TaskValidation:
 
     base = root / task.group / task.key
 
+    result.tautology_flags = _tautology_flags(task)
+
     result.steps.append(await _evaluate(task, base / "empty", None, "fixtures_only"))
     if task.solution:
         result.steps.append(await _evaluate(task, base / "solution", task.solution, "reference_solution"))
@@ -142,8 +232,14 @@ def render_validations(validations: List[TaskValidation]) -> str:
     """把自检结果渲染成文本表。"""
     lines: List[str] = []
     passed = sum(1 for item in validations if item.ok)
+    tautological = [item for item in validations if item.tautology_flags]
     lines.append("=" * 78)
     lines.append(f"任务集自检：{passed}/{len(validations)} 通过")
+    if tautological:
+        lines.append(
+            f"⚠️  {len(tautological)} 个任务的参考解直接写出了期望值："
+            f"自检无法发现它们期望值写错（历史上真出过两次事故）"
+        )
     lines.append("=" * 78)
     for item in validations:
         mark = "✓" if item.ok else "✗"
@@ -158,6 +254,8 @@ def render_validations(validations: List[TaskValidation]) -> str:
             if not step.ok:
                 for detail in step.details:
                     lines.append(f"        {detail}")
+        for flag in item.tautology_flags:
+            lines.append(f"    ⚠ 同义反复: {flag}")
         for problem in item.problems:
             lines.append(f"    ⚠ {problem}")
     return "\n".join(lines)

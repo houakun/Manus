@@ -264,11 +264,27 @@ def _cmd_bench_run(args: argparse.Namespace) -> int:
         print("[lab] 没有找到任务", file=sys.stderr)
         return 2
 
-    # 花钱的事要先说清楚。估算基于"n=5 基线里最贵的任务"，属于上限估计。
+    store = default_trace_store()
+    # 花钱的事要先说清楚。
+    # 早期版本用一个写死的系数（$0.045/次）估算，而那个系数来自冒烟测试的简单任务 ——
+    # 实测 semireal 任务的平均成本是它的 3 倍（预估 $1.8 / 实际 $5.0）。
+    # 花钱的事上估错 3 倍不可接受，所以改成：优先用库里同组任务的实测均值，
+    # 没历史时用一个保守值（宁可高估也不要让用户被意外收费）。
     runs = args.runs * len(tasks)
-    estimate = runs * 0.045
+    groups = {task.group for task in tasks}
+    historical = [
+        cost for cost in (store.avg_cost_for_group(name) for name in groups) if cost is not None
+    ]
+    if historical:
+        per_run = max(historical)  # 多分组时取最贵的，偏保守
+        basis = f"库中同组历史均值（{'/'.join(sorted(groups))}）"
+    else:
+        per_run = 0.15
+        basis = "保守默认值 $0.15/次（库里还没有同类任务的历史）"
+    estimate = runs * per_run
+
     print(f"即将运行 {len(tasks)} 个任务 × {args.runs} 次 = **{runs} 次真模型调用**")
-    print(f"预估成本上限 ≈ ${estimate:.2f}（基于历史上最贵的单次任务估算）")
+    print(f"预估成本 ≈ ${estimate:.2f}（依据：{basis}，单次 ≈ ${per_run:.3f}）")
     if estimate > 1.0 and not args.yes:
         print("\n[lab] 预估成本超过 $1.00，请确认后加 --yes 重跑。", file=sys.stderr)
         print("      先用小规模验证链路：--limit 2 --runs 1", file=sys.stderr)
@@ -277,6 +293,23 @@ def _cmd_bench_run(args: argparse.Namespace) -> int:
     budget_policy = BudgetPolicy.from_env()
     if args.budget_mode:
         budget_policy = budget_policy.model_copy(update={"mode": BudgetMode(args.budget_mode)})
+
+    store = default_trace_store()
+
+    # 阈值来源：默认优先用**历史分位数（per-task）**，没有历史才用环境变量/默认值。
+    # 为什么默认这样：实测同一个全局阈值在 semireal 上的越界率高达 60%
+    # （任务之间成本差 13 倍以上）；按任务分位数校准后越界率回到定义值 ~5%。
+    policy_by_task = None
+    if not args.budget_defaults:
+        from lab.bench.policy import describe_policies, policies_from_history
+
+        policy_by_task = policies_from_history(store, tasks)
+        if policy_by_task:
+            print(f"\n已按历史分位数推导 {len(policy_by_task)}/{len(tasks)} 个任务的预算阈值：")
+            print(describe_policies(policy_by_task, tasks))
+        else:
+            print("\n[lab] 库里还没有足够的同类历史 → 本次用默认阈值"
+                  "（跑完一轮后就会开始用历史校准）")
 
     suite = asyncio.run(run_suite(
         runs_per_task=args.runs,
@@ -288,13 +321,18 @@ def _cmd_bench_run(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         temperature=args.temperature,
         budget_policy=budget_policy,
+        budget_policy_by_task=policy_by_task,
         fault_rules=fault_rules_from_spec(
             args.fault, tool=args.fault_tool, rate=args.fault_rate
         ),
+        # 增量落库：长评测（40 次运行 ≈ 半小时）被中断的途径很多
+        # （Ctrl-C、机器休眠、终端关闭、远程会话断开），
+        # 每次运行完成就落库 → 最坏情况只丢一次运行，而不是丢掉整份数据。
+        on_start=store.save_suite_header,
+        on_outcome=store.save_outcome,
+        on_finish=store.finalize_suite,
     ))
 
-    store = default_trace_store()
-    store.save_suite(suite)
     print("")
     print(f"评测完成: {suite.successes}/{suite.total_runs} 成功"
           f"（{suite.success_rate.point:.1%}，95% 区间 [{suite.success_rate.low:.1%}, "
@@ -352,12 +390,146 @@ def _cmd_bench_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bench_recover(args: argparse.Namespace) -> int:
+    """`lab bench recover`：从工作区 + 轨迹库重建一次评测（崩溃后救数据）。"""
+    import asyncio
+
+    from lab.api import default_trace_store
+    from lab.bench.recover import recover_suite
+    from lab.bench.report import render_report
+
+    store = default_trace_store()
+    suite = asyncio.run(recover_suite(
+        bench_root=ensure_runs_dir() / "bench",
+        store=store,
+        suite_id=args.suite_id,
+        label=args.label,
+        runs_per_task=args.runs,
+        note=args.note or "",
+        group=args.group,
+    ))
+
+    print(f"已重建评测: {suite.total_runs} 次运行，"
+          f"{suite.successes} 成功（{suite.success_rate.point:.1%}，"
+          f"95% 区间 [{suite.success_rate.low:.1%}, {suite.success_rate.high:.1%}]）")
+    if args.report:
+        out_path = _write_report(suite.suite_id[:8], render_report(suite))
+        print(f"报告已写入: {out_path}")
+    return 0
+
+
 def _cmd_bench_list(args: argparse.Namespace) -> int:
     """`lab bench list`：列出历史评测。"""
     from lab.api import default_trace_store
     from lab.bench.report import render_suite_list
 
     print(render_suite_list(default_trace_store().list_suites(limit=args.limit)))
+    return 0
+
+
+def _cmd_sandbox_clean(args: argparse.Namespace) -> int:
+    """`lab sandbox clean-escapes`：清理脚本逃逸到工作区外的残留。
+
+    为什么默认 dry-run：它在删工作区**外面**的东西。
+    即使路径是 `<盘>:/home/ubuntu` 这种几乎不可能是用户数据的目录，
+    删除前也应该让人看一眼清单。
+    """
+    import shutil
+
+    from lab.infra.local_sandbox import describe_escape_roots
+
+    inventory = describe_escape_roots()
+    if not inventory:
+        print("没有检测到工作区外的残留（各盘的 home/ubuntu 都不存在）")
+        return 0
+
+    files = sum(item["files"] for item in inventory)
+    total = sum(item["bytes"] for item in inventory)
+    print(f"检测到 {len(inventory)} 个位置存在工作区外残留，共 {files} 个文件 / {total / 1048576:.2f} MB：")
+    for item in inventory:
+        print(f"  {item['path']}  {item['files']} 个文件 / {item['bytes'] / 1048576:.2f} MB")
+    print("\n来源：脚本里写 `/home/ubuntu/x` 绝对路径时，会被解析到 `<当前盘>:/home/ubuntu`。")
+    print("      沙箱路径映射只作用于文件工具与命令行，管不到脚本内容。")
+
+    if not args.yes:
+        print("\n（dry-run，什么都没删）加 --yes 才会真的删除。")
+        return 0
+
+    for item in inventory:
+        shutil.rmtree(item["path"], ignore_errors=True)
+        parent = Path(item["path"]).parent
+        try:
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()  # 父目录是空的（只是逃逸时顺手建的），一起清掉
+        except OSError:
+            pass
+        print(f"已删除 {item['path']}")
+    return 0
+
+
+def _cmd_bench_compare(args: argparse.Namespace) -> int:
+    """`lab bench compare`：配对对比两个 suite（Step 5 的加固前后对比）。"""
+    from lab.api import default_trace_store
+    from lab.bench.compare import compare_suites, render_comparison
+
+    store = default_trace_store()
+    suites = store.list_suites(limit=200)
+    if len(suites) < 2:
+        print("[lab] 至少需要两个 suite 才能对比", file=sys.stderr)
+        return 2
+
+    resolved = [_resolve_suite_id(store, item) for item in (args.baseline, args.candidate)]
+    if any(item is None for item in resolved):
+        print(f"[lab] 无法唯一确定 suite：{args.baseline} / {args.candidate}", file=sys.stderr)
+        return 2
+
+    baseline = store.load_suite(resolved[0])
+    candidate = store.load_suite(resolved[1])
+    if baseline is None or candidate is None:
+        print("[lab] 加载 suite 失败", file=sys.stderr)
+        return 2
+
+    report = compare_suites(baseline, candidate)
+    rendered = render_comparison(report)
+    if args.out:
+        Path(args.out).write_text(rendered, encoding="utf-8")
+        print(f"对比报告已写入: {args.out}")
+    else:
+        print(rendered)
+    return 0
+
+
+def _resolve_suite_id(store: Any, short: str) -> Optional[str]:
+    """支持短 id（唯一匹配才解析，拿不准就不猜）。"""
+    matches = [row["suite_id"] for row in store.list_suites(limit=200)
+               if row["suite_id"].startswith(short) or short in (row["label"] or "")]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _cmd_bench_pareto(args: argparse.Namespace) -> int:
+    """`lab bench pareto`：成功率 vs 成本的 Pareto 表（文本形式）。"""
+    from lab.api import default_trace_store
+    from lab.bench.compare import render_pareto_groups
+
+    store = default_trace_store()
+    rows = store.list_suites(limit=200)
+    if args.suite:
+        wanted = [_resolve_suite_id(store, item) for item in args.suite]
+        if any(item is None for item in wanted):
+            print(f"[lab] 无法唯一确定 suite：{args.suite}", file=sys.stderr)
+            return 2
+        rows = [row for row in rows if row["suite_id"] in wanted]
+
+    suites = []
+    for row in rows:
+        suite = store.load_suite(row["suite_id"])
+        if suite and suite.outcomes:
+            suites.append(suite)
+    if not suites:
+        print("[lab] 没有可用的 suite", file=sys.stderr)
+        return 2
+
+    print(render_pareto_groups(suites, min_runs=args.min_runs))
     return 0
 
 
@@ -421,6 +593,10 @@ def build_parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--concurrency", type=int, default=1, help="并发度（>1 会让耗时不可比）")
     bench_run.add_argument("--temperature", type=float, default=None)
     bench_run.add_argument("--budget-mode", default=None, choices=["observe", "degrade", "enforce"])
+    bench_run.add_argument(
+        "--budget-defaults", action="store_true",
+        help="用固定的默认阈值（默认行为是按历史分位数 per-task 推导）",
+    )
     bench_run.add_argument("--fault", action="append", default=None, help="注入故障（可多次/逗号分隔）")
     bench_run.add_argument("--fault-tool", default="*")
     bench_run.add_argument("--fault-rate", type=float, default=1.0)
@@ -436,6 +612,43 @@ def build_parser() -> argparse.ArgumentParser:
     bench_list = bench_sub.add_parser("list", help="列出历史评测")
     bench_list.add_argument("--limit", type=int, default=10)
     bench_list.set_defaults(func=_cmd_bench_list)
+
+    bench_compare = bench_sub.add_parser(
+        "compare", help="配对对比两个 suite（加固前后，按任务配对）"
+    )
+    bench_compare.add_argument("baseline", help="基准 suite（支持短 id 或 label 片段）")
+    bench_compare.add_argument("candidate", help="候选 suite")
+    bench_compare.add_argument("--out", default=None, help="写入文件而不是打印")
+    bench_compare.set_defaults(func=_cmd_bench_compare)
+
+    bench_pareto = bench_sub.add_parser(
+        "pareto", help="成功率 vs 成本的 Pareto 表（文本；图在当前模型下不可用）"
+    )
+    bench_pareto.add_argument("--suite", action="append", default=None, help="只纳入指定 suite（可多次）")
+    bench_pareto.add_argument("--min-runs", type=int, default=10,
+                              help="忽略运行数少于此值的 suite（默认 10：n 太小会因运气而'支配'一切）")
+    bench_pareto.set_defaults(func=_cmd_bench_pareto)
+
+    bench_recover = bench_sub.add_parser(
+        "recover", help="从工作区 + 轨迹库重建一次评测（评测被中断后救数据）"
+    )
+    bench_recover.add_argument("--suite-id", required=True, help="给重建的评测指定一个 id")
+    bench_recover.add_argument("--label", default="", help="评测名字")
+    bench_recover.add_argument("--runs", type=int, default=None, help="每个任务的重复次数（用于报告文案）")
+    bench_recover.add_argument("--note", default="", help="附加到报告备注的说明")
+    bench_recover.add_argument("--group", default=None, help="只重建指定分组（必填，否则会混入其它分组的旧工作区）")
+    bench_recover.add_argument("--report", action="store_true", help="重建后直接出报告")
+    bench_recover.set_defaults(func=_cmd_bench_recover)
+
+    # ==================== 沙箱维护 ====================
+    sandbox_parser = sub.add_parser("sandbox", help="沙箱维护（fast mode 的边界与残留）")
+    sandbox_sub = sandbox_parser.add_subparsers(dest="sandbox_command", required=True)
+
+    clean_parser = sandbox_sub.add_parser(
+        "clean-escapes", help="清理脚本逃逸到工作区外的残留（默认只报告，加 --yes 才删）"
+    )
+    clean_parser.add_argument("--yes", action="store_true", help="确认删除（默认 dry-run）")
+    clean_parser.set_defaults(func=_cmd_sandbox_clean)
 
     return parser
 

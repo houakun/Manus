@@ -5,7 +5,6 @@
 @Author  : thezehui@gmail.com
 @File    : planner.py
 """
-import logging
 from typing import Optional, AsyncGenerator
 
 from app.domain.models.event import BaseEvent, MessageEvent, PlanEvent, PlanEventStatus
@@ -18,6 +17,7 @@ from app.domain.services.prompts.planner import (
 )
 from app.domain.services.prompts.system import SYSTEM_PROMPT
 from .base import BaseAgent
+from .base import StructuredResult
 
 """
 多Agent系统/flow=PlannerAgent+ReActAgent
@@ -39,9 +39,6 @@ ReActAgent:
 - 提示词: 执行任务的prompt、汇总总结prompt
 """
 
-logger = logging.getLogger(__name__)
-
-
 class PlannerAgent(BaseAgent):
     """规划Agent，用于将用户的任务/需求拆解成多个子步骤"""
     name: str = "planner"
@@ -58,21 +55,21 @@ class PlannerAgent(BaseAgent):
         )
 
         # 2.调用invoke函数返回迭代事件
-        async for event in self.invoke(query):
-            # 3.规划智能体因为使用json_object，正常情况下会返回MessageEvent
+        #   [lab/D10] 改用 invoke_structured：解析/校验失败时会把"格式错误 + 期望结构"
+        #   回灌给模型重试一次，而不是直接崩溃。
+        #   实测案例：模型在结构化输出位置返回了一个数组 → 原代码
+        #   Plan.model_validate(数组) 抛 ValidationError → 整个任务挂掉。
+        holder = StructuredResult()
+        async for event in self.invoke_structured(query, Plan, holder):
             if isinstance(event, MessageEvent):
-                # 4.记录日志并使用json解析器解析得到对应的数据
-                logger.info(f"PlannerAgent生成消息: {event.message}")
-                parsed_obj = await self._json_parser.invoke(event.message)
-
-                # 5.将解析对象转换成Plan计划
-                plan = Plan.model_validate(parsed_obj)
-
-                # 6.返回PlanEvent表示规划创建成功
-                yield PlanEvent(plan=plan, status=PlanEventStatus.CREATED)
-            else:
-                # 返回不是消息事件的事件
+                # 已由 invoke_structured 内部解析完成，这里不会拿到 MessageEvent
                 yield event
+            else:
+                yield event
+
+        if holder.ok:
+            plan: Plan = holder.value
+            yield PlanEvent(plan=plan, status=PlanEventStatus.CREATED)
 
     async def update_plan(self, plan: Plan, step: Step) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的原始规划+子步骤更新事件"""
@@ -83,37 +80,34 @@ class PlannerAgent(BaseAgent):
         )
 
         # 2.调用invoke获取对应的事件
-        async for event in self.invoke(query):
-            # 3.判断规划Agent生成的事件是不是消息事件
-            if isinstance(event, MessageEvent):
-                # 4.记录日志并解析json
-                logger.info(f"PlannerAgent生成消息: {event.message}")
-                parsed_obj = await self._json_parser.invoke(event.message)
+        #   [lab/D10] 同 create_plan：解析失败 → 纠错重试，不直接崩。
+        holder = StructuredResult()
+        async for event in self.invoke_structured(query, Plan, holder):
+            yield event
 
-                # 5.将解析对象转换成Plan
-                updated_plan = Plan.model_validate(parsed_obj)
+        if not holder.ok:
+            return
 
-                # 6.拷贝更新计划中的steps，避免造成数据污染
-                new_steps = [Step.model_validate(step) for step in updated_plan.steps]
+        updated_plan: Plan = holder.value
 
-                # 7.查询旧计划中第一个未完成的计划
-                first_pending_index = None
-                for idx, step in enumerate(plan.steps):
-                    if not step.done:
-                        first_pending_index = idx
-                        break
+        # 6.拷贝更新计划中的steps，避免造成数据污染
+        new_steps = [Step.model_validate(step) for step in updated_plan.steps]
 
-                # 8.判断是否有未完成的步骤，如果有则执行更新
-                if first_pending_index is not None:
-                    # 9.获取历史已完成的子步骤并更新
-                    updated_steps = plan.steps[:first_pending_index]
-                    updated_steps.extend(new_steps)
+        # 7.查询旧计划中第一个未完成的计划
+        first_pending_index = None
+        for idx, step in enumerate(plan.steps):
+            if not step.done:
+                first_pending_index = idx
+                break
 
-                    # 10.更新plan规划
-                    plan.steps = updated_steps
+        # 8.判断是否有未完成的步骤，如果有则执行更新
+        if first_pending_index is not None:
+            # 9.获取历史已完成的子步骤并更新
+            updated_steps = plan.steps[:first_pending_index]
+            updated_steps.extend(new_steps)
 
-                # 11.返回规划更新事件
-                yield PlanEvent(plan=plan, status=PlanEventStatus.UPDATED)
-            else:
-                # 其他事件则直接返回
-                yield event
+            # 10.更新plan规划
+            plan.steps = updated_steps
+
+        # 11.返回规划更新事件
+        yield PlanEvent(plan=plan, status=PlanEventStatus.UPDATED)

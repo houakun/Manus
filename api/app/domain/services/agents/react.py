@@ -5,7 +5,6 @@
 @Author  : thezehui@gmail.com
 @File    : react.py
 """
-import logging
 from typing import AsyncGenerator
 
 from app.domain.models.event import (
@@ -23,10 +22,7 @@ from app.domain.models.message import Message
 from app.domain.models.plan import Plan, Step, ExecutionStatus
 from app.domain.services.prompts.react import REACT_SYSTEM_PROMPT, EXECUTION_PROMPT, SUMMARIZE_PROMPT
 from app.domain.services.prompts.system import SYSTEM_PROMPT
-from .base import BaseAgent
-
-logger = logging.getLogger(__name__)
-
+from .base import BaseAgent, StructuredResult
 
 class ReActAgent(BaseAgent):
     """基于ReAct架构的执行Agent"""
@@ -49,7 +45,11 @@ class ReActAgent(BaseAgent):
         yield StepEvent(step=step, status=StepEventStatus.STARTED)
 
         # 3.调用invoke获取agent返回的事件内容
-        async for event in self.invoke(query):
+        #   [lab/D10] 改用 invoke_structured：模型返回的最终 JSON 不符合 Step 结构时
+        #   （实测：它把转换后的数据数组当答案交了），会把错误回灌让它重试，
+        #   而不是 Step.model_validate() 抛 ValidationError 把整条流炸掉。
+        holder = StructuredResult()
+        async for event in self.invoke_structured(query, Step, holder):
             # 4.判断事件类型执行不同操作
             if isinstance(event, ToolEvent):
                 # 5.工具事件需要判断工具的名称是否为message_ask_user
@@ -65,26 +65,6 @@ class ReActAgent(BaseAgent):
                         yield WaitEvent()
                         return
                     continue
-            elif isinstance(event, MessageEvent):
-                # 8.返回消息事件，意味着content有内容，content有内容则代表执行Agent已运行完毕
-                step.status = ExecutionStatus.COMPLETED
-
-                # 9.message中输出的数据结构为json，需要提取并解析
-                parsed_obj = await self._json_parser.invoke(event.message)
-                new_step = Step.model_validate(parsed_obj)
-
-                # 10.更新子步骤的数据
-                step.success = new_step.success
-                step.result = new_step.result
-                step.attachments = new_step.attachments
-
-                # 11.返回步骤完成事件
-                yield StepEvent(step=step, status=StepEventStatus.COMPLETED)
-
-                # 12.如果子步骤拿到了结果，还需要返回一段消息给用户(将结果返回给用户)
-                if step.result:
-                    yield MessageEvent(role="assistant", message=step.result)
-                continue
             elif isinstance(event, ErrorEvent):
                 # 13.错误事件更新步骤的状态
                 step.status = ExecutionStatus.FAILED
@@ -96,8 +76,27 @@ class ReActAgent(BaseAgent):
             # 15.其他场景将事件直接返回
             yield event
 
-        # 16.循环迭代完成后代表子步骤已实现，需要更新状态
-        step.status = ExecutionStatus.COMPLETED
+        # 8.拿到结构化结果 → 更新子步骤的数据
+        if holder.ok:
+            new_step: Step = holder.value
+            step.success = new_step.success
+            step.result = new_step.result
+            step.attachments = new_step.attachments
+            step.status = ExecutionStatus.COMPLETED
+
+            # 11.返回步骤完成事件
+            yield StepEvent(step=step, status=StepEventStatus.COMPLETED)
+
+            # 12.如果子步骤拿到了结果，还需要返回一段消息给用户(将结果返回给用户)
+            if step.result:
+                yield MessageEvent(role="assistant", message=step.result)
+
+            # 16.循环迭代完成后代表子步骤已实现，需要更新状态
+            #   注意：这里只在**解析成功**时才置 COMPLETED。
+            #   原代码把这一行放在循环外面无条件执行，会把上面刚设好的 FAILED
+            #   又覆盖成 COMPLETED —— 结果是步骤统计里的 failed 永远是 0，
+            #   失败只在 step.error 里看得到，轨迹上却显示"完成"。
+            step.status = ExecutionStatus.COMPLETED
 
     async def summarize(self) -> AsyncGenerator[BaseEvent, None]:
         """调用Agent汇总历史的消息并生成最终回复+附件"""
@@ -105,25 +104,23 @@ class ReActAgent(BaseAgent):
         query = SUMMARIZE_PROMPT
 
         # 2.调用invoke方法获取Agent生成的事件
-        async for event in self.invoke(query):
-            # 3.判断事件类型是否为消息事件，如果是则表示Agent结构化生成汇总内容
-            if isinstance(event, MessageEvent):
-                # 4.记录日志并解析输出内容
-                logger.info(f"执行Agent生成汇总内容: {event.message}")
-                parsed_obj = await self._json_parser.invoke(event.message)
+        #   [lab/D10] 同其他调用点：汇总输出格式不符 → 纠错重试。
+        holder = StructuredResult()
+        async for event in self.invoke_structured(query, Message, holder):
+            yield event
 
-                # 5.将解析数据转换为Message对象
-                message = Message.model_validate(parsed_obj)
+        if not holder.ok:
+            return
 
-                # 6.提取消息中的附件信息
-                attachments = [File(filepath=filepath) for filepath in message.attachments]
+        # 5.拿到解析好的 Message
+        message: Message = holder.value
 
-                # 7.返回消息事件并将消息+附件进行相应
-                yield MessageEvent(
-                    role="assistant",
-                    message=message.message,
-                    attachments=attachments,
-                )
-            else:
-                # 8.其他事件则直接返回
-                yield event
+        # 6.提取消息中的附件信息
+        attachments = [File(filepath=filepath) for filepath in message.attachments]
+
+        # 7.返回消息事件并将消息+附件进行相应
+        yield MessageEvent(
+            role="assistant",
+            message=message.message,
+            attachments=attachments,
+        )

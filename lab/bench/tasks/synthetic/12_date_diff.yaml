@@ -15,8 +15,14 @@ process:
   answer_literals: ["76"]
 solution:
   - kind: write_file
-    path: /home/ubuntu/days.txt
-    content: "76"
+    path: /home/ubuntu/_solve.py
+    content: |
+      import datetime
+      import pathlib
+      delta = datetime.date(2026, 3, 1) - datetime.date(2025, 12, 15)
+      pathlib.Path("days.txt").write_text(str(abs(delta.days)))
+  - kind: exec
+    command: "python _solve.py"
 wrong:
   - kind: write_file
     path: /home/ubuntu/days.txt

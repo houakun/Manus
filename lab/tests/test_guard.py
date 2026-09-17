@@ -649,8 +649,14 @@ async def test_guard_reports_are_complete():
 
 
 async def test_delay_injection_actually_waits():
-    """latency_spike 必须真的产生延迟（否则"耗时预算"这条防线就是假的）。"""
-    injector = FaultInjector([FaultRule(kind=FaultKind.LATENCY_SPIKE, latency_s=0.15)])
+    """latency_spike 必须真的产生延迟（否则"耗时预算"这条防线就是假的）。
+
+    注意断言的写法：注入 0.2s、断言 >= 0.15s。
+    **不要**写成"注入 0.15 就断言 >= 0.15" —— 卡在精确边界上会偶发失败
+    （事件循环的计时精度、测量本身的开销都会让它偶尔差一点点），
+    这种"假失败"会训练人忽略测试结果，比没有测试更糟。
+    """
+    injector = FaultInjector([FaultRule(kind=FaultKind.LATENCY_SPIKE, latency_s=0.2)])
     guard = ToolGuard(injector=injector)
 
     started = asyncio.get_event_loop().time()

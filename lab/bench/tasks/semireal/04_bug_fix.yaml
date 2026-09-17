@@ -33,7 +33,12 @@ verify:
     description: 脚本里的 off-by-one 已修正
 process:
   max_tool_calls: 25
-  answer_literals: ["385"]
+  # [修正] 这里原本设了 answer_literals: ["385"]，但它是**误报源**：
+  #   这个任务的交付物**就是**那个数字（运行脚本→把输出写进 result.txt），
+  #   于是任何正确的运行都会把 385 当作字面量写进去，每次都被标记为"硬编码"。
+  #   经验：answer_literals 只适用于"答案得靠推导、直接写出字面量才可疑"的任务；
+  #   对于交付物本身就是答案的任务，它就是噪声。
+  answer_literals: []
 solution:
   # 参考解用 exec：这个任务的要点本来就是"能改代码并运行"，直接写产物验证不到这一层。
   # 注意：命令必须写成**平台中立**的形式（python 一行式，只用单引号），
