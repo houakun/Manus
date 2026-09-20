@@ -1,5 +1,9 @@
 key: syn_word_freq
 group: synthetic
+# regression：⚠️ 原始历史是 5/10（看着像 50% 不稳定），但那 5 次失败**全是任务集期望值写错**
+# （词频 Top3 算错），修正后 5/5 全对（docs/baseline-group-comparison.md §3.1）。
+# 这条注释的作用是拦住后来者「看到 50% 就改标 capability」。
+purpose: regression
 title: 词频统计（输出 JSON）
 goal: >-
   读取 /home/ubuntu/input/text.txt，统计其中每个英文单词出现的次数（忽略大小写，

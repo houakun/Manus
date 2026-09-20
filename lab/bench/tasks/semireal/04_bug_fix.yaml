@@ -1,5 +1,7 @@
 key: sem_bug_fix
 group: semireal
+# regression：traces.db 干净运行 33/33 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 修复脚本中的 off-by-one 并运行出结果
 goal: >-
   修复 /home/ubuntu/input/stats.py 中的 bug：它本应统计从 1 到 n（含 n）的

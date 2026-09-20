@@ -1,5 +1,7 @@
 key: syn_sort_numbers
 group: synthetic
+# regression：traces.db 干净运行 10/10 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 数字排序落盘
 goal: >-
   读取 /home/ubuntu/input/numbers.txt（每行一个整数），按从小到大排序，

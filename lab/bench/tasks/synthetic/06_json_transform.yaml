@@ -1,5 +1,7 @@
 key: syn_json_transform
 group: synthetic
+# regression：traces.db 干净运行 10/10 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: JSON 字段提取与重组
 goal: >-
   读取 /home/ubuntu/input/users.json（一个对象数组，字段为 id / name / age / active），

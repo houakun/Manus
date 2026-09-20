@@ -1,5 +1,13 @@
 key: sem_sqlite_report
 group: semireal
+# capability（**不是** regression，但理由和其他 capability 不同）：干净运行 31/32。
+# 那一次失败（2026-09-18 13:55）是 **装置缺陷**：flag 为 `writes_outside_workspace:2`，
+# `sales.db` 没出现在工作区 —— 即 docs/noise-floor-measured.md §8 记录、**至今未修**的
+# 产物逃逸（脚本里的绝对路径不被 `_rewrite_paths` 重写）。
+# 也就是说：**它的失败不可归因于 SUT**，所以不能进回归门禁 ——
+# 否则门禁会因与模型无关的原因变红，而“频繁变红的门禁等于没有门禁”。
+# ⚠️ 修掉逃逸（§7 的🥈项，需先定 `--concurrency > 1` 的语义）后，**应改回 regression**。
+purpose: capability
 title: 用 SQLite 建表并输出汇总
 goal: >-
   创建数据库 /home/ubuntu/sales.db，建表 sales(id INTEGER, region TEXT, amount INTEGER)，

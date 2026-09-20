@@ -1,5 +1,7 @@
 key: syn_fizzbuzz
 group: synthetic
+# regression：traces.db 干净运行 10/10 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: FizzBuzz 序列落盘
 goal: >-
   生成 1 到 30 的 FizzBuzz 序列并写入 /home/ubuntu/fizzbuzz.txt。

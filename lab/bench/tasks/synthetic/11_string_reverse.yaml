@@ -1,5 +1,9 @@
 key: syn_string_reverse
 group: synthetic
+# regression：⚠️ 原始历史是 5/10（看着像 50% 不稳定），但那 5 次失败**全是任务集期望值写错**
+# （`TNEGA SUNUM` 应为 `TNEGA SUNAM`），修正后 5/5 全对（docs/baseline-group-comparison.md §3.1）。
+# 同 syn_word_freq：这条注释用来拦住「看到 50% 就改标 capability」。
+purpose: regression
 title: 字符串处理（反转 + 大写）
 goal: >-
   读取 /home/ubuntu/input/word.txt，把其中的文本先反转、再全部转成大写，

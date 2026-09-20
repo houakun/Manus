@@ -1,5 +1,7 @@
 key: sem_refactor_config
 group: semireal
+# regression：traces.db 干净运行 26/26 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 把硬编码常量抽到配置文件
 goal: >-
   /home/ubuntu/input/service.py 里有三个写死的常量（端口、超时、重试次数）。

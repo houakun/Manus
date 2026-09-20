@@ -1,5 +1,7 @@
 key: syn_dedup_sort
 group: synthetic
+# regression：traces.db 干净运行 14/14 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 去重并排序
 goal: >-
   读取 /home/ubuntu/input/tags.txt，去掉重复行与空行，

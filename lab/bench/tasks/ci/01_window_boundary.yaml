@@ -1,5 +1,7 @@
 key: ci_window_boundary
 group: ci
+# capability：新任务类，**方差未知** —— 只跑过 3 次。在测出它的稳定性之前不进回归门禁
+# （`lab/tests/test_bench.py::test_ci_tasks_are_capability_not_regression` 把这个约定钉住了）。
 purpose: capability
 title: CI 归因：分页少一条 + 标签被共享（两个独立根因）
 tags: [ci-attribution, code-fix, multi-file, exec]

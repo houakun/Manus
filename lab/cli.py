@@ -740,6 +740,27 @@ def _cmd_bench_noise_floor(args: argparse.Namespace) -> int:
     if args.limit:
         tasks = tasks[: args.limit]
     if not tasks:
+        # 空集最常见的成因不是"任务集是空的"，而是 purpose 过滤把整组筛掉了：
+        # 例如 `--group ci` 的 2 个任务全是 capability，而 --purpose 默认是 regression。
+        # 只说"没有任务可测"会把人赶去查任务集，而问题其实在参数上 ——
+        # 诊断信息本身是产品（见 lab/README.md「我错在哪」第 5 条）。
+        in_scope = load_all_tasks(group=args.group)
+        if args.purpose and args.purpose != "all":
+            counts: dict[str, int] = {}
+            for task in in_scope:
+                counts[task.purpose] = counts.get(task.purpose, 0) + 1
+            if counts:
+                detail = "，".join(f"{name}={n}" for name, n in sorted(counts.items()))
+                print(
+                    f"[lab] 没有任务可测：--group {args.group or '（全部）'} 下有 "
+                    f"{len(in_scope)} 个任务，但 --purpose={args.purpose} 一个都不剩（{detail}）。",
+                    file=sys.stderr,
+                )
+                print(
+                    "      改用 `--purpose all`（全部）或 `--purpose capability`（只测能力边界任务）。",
+                    file=sys.stderr,
+                )
+                return 2
         print("[lab] 没有任务可测", file=sys.stderr)
         return 2
     if len(tasks) < 2 and not args.task:

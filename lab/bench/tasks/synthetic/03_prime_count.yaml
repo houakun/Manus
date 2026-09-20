@@ -1,5 +1,7 @@
 key: syn_prime_count
 group: synthetic
+# regression：traces.db 干净运行 10/10 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 统计质数个数
 goal: >-
   统计 1 到 1000 之间（含 1 和 1000）一共有多少个质数，

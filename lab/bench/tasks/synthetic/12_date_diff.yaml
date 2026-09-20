@@ -1,5 +1,11 @@
 key: syn_date_diff
 group: synthetic
+# capability（**不是** regression）：干净运行 14/15。唯一一次失败在 2026-09-18 12:49 ——
+# 它在噪声地板 suite（eabae098）里，两臂**配置完全相同**、另一臂对了，而它算出 **-76**。
+# 题目明写「用后一个日期减去前一个日期」（期望 +76）→ 这不是规格歧义，是真实的符号错误。
+# 同一次还响了 `too_many_tool_calls:13>12` 与 `writes_outside_workspace:1`。
+# 判定依据：**它在同配置对照里翻转过** → 它自带成功率噪声，不能进回归门禁。
+purpose: capability
 title: 计算两个日期相差天数
 goal: >-
   计算 2026-03-01 与 2025-12-15 之间相差多少天（用后一个日期减去前一个日期），

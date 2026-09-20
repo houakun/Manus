@@ -1,5 +1,7 @@
 key: syn_rename_files
 group: synthetic
+# regression：traces.db 干净运行 11/11 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 批量重命名文件后缀
 goal: >-
   把 /home/ubuntu/docs/ 目录下所有以 .txt 结尾的文件重命名为 .md 后缀

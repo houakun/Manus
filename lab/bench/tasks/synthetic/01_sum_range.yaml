@@ -1,5 +1,7 @@
 key: syn_sum_range
 group: synthetic
+# regression：traces.db 干净运行 16/16 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 区间求和写入文件
 goal: >-
   计算 1 到 1000 之间所有整数的和，把结果写入 /home/ubuntu/sum.txt。

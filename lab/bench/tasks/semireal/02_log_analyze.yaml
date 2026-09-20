@@ -1,5 +1,7 @@
 key: sem_log_analyze
 group: semireal
+# regression：traces.db 干净运行 25/25 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: nginx 日志状态码统计
 goal: >-
   分析 /home/ubuntu/input/access.log（标准 nginx combined 格式），

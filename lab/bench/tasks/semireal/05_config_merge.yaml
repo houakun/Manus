@@ -1,5 +1,7 @@
 key: sem_config_merge
 group: semireal
+# regression：traces.db 干净运行 26/26 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 合并两份配置（后者覆盖前者）
 goal: >-
   把 /home/ubuntu/input/base.json 与 /home/ubuntu/input/override.json 合并成一份配置，

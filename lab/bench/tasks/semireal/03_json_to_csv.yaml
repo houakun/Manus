@@ -1,5 +1,8 @@
 key: sem_json_to_csv
 group: semireal
+# regression：干净运行 26/27。唯一一次失败 error_type=`sut_crash`（ValidationError：Step 校验失败），
+# 就是 docs/sut-robustness-fix.md 里修掉的 D10「结构化输出兜底」；修复后连续通过 → 稳定。
+purpose: regression
 title: JSON 数组转 CSV（固定列顺序）
 goal: >-
   读取 /home/ubuntu/input/products.json（对象数组），

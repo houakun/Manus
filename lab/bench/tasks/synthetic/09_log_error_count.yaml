@@ -1,5 +1,9 @@
 key: syn_log_error_count
 group: synthetic
+# regression：干净运行 11/12。唯一一次失败在 2026-09-16 14:05（DB 里最早的一次运行）：
+# 产物文件不存在，error_type 为空、无 process flag —— 那是 SUT 三处兜底修复**之前**的装置问题
+# （docs/sut-robustness-fix.md），不是这个任务的性质。修复后 11/11。
+purpose: regression
 title: 日志错误行计数
 goal: >-
   统计 /home/ubuntu/input/app.log 中包含 "ERROR" 的行数（大小写敏感），

@@ -1,5 +1,7 @@
 key: sem_csv_clean
 group: semireal
+# regression：traces.db 干净运行 25/25 全对（截至 2026-09-18）→ 稳定，可进回归门禁。
+purpose: regression
 title: 清洗脏 CSV（去空行/去重/统一大小写）
 goal: >-
   清洗 /home/ubuntu/input/contacts.csv，规则如下：

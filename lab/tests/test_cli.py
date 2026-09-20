@@ -309,6 +309,18 @@ def test_cli_replay_stats_reports_nondeterminism(tmp_path, monkeypatch):
     assert main(["replay", "stats", "--json"]) == 0
 
 
+def test_cli_noise_floor_empty_purpose_names_the_reason(capsys):
+    """整组都是 capability 时，报错必须说出"是 purpose 过滤筛掉的"。
+
+    为什么值得一个用例：`ci` 组的任务全是 capability，而 `--purpose` 默认是 regression
+    → 空集。只说"没有任务可测"会把人赶去查任务集，而问题其实在参数上。
+    （本用例在**任何网络/花钱之前**就返回，所以它永远不会误花钱。）
+    """
+    assert main(["bench", "noise-floor", "--group", "ci", "--runs", "1"]) == 2
+    err = capsys.readouterr().err
+    assert "--purpose" in err and "capability" in err, err
+
+
 def test_cli_bench_noise_floor_writes_file(tmp_path, monkeypatch):
     """`bench noise-floor` 必须把测出来的地板写盘（`bench gate` 会自动读它）。"""
     from lab import api as lab_api

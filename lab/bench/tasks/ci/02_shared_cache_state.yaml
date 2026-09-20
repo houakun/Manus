@@ -1,5 +1,7 @@
 key: ci_shared_cache_state
 group: ci
+# capability：新任务类，**方差未知** —— 只跑过 3 次。在测出它的稳定性之前不进回归门禁
+# （`lab/tests/test_bench.py::test_ci_tasks_are_capability_not_regression` 把这个约定钉住了）。
 purpose: capability
 title: CI 归因：实例之间串数据（类属性当成了实例状态）
 tags: [ci-attribution, code-fix, state-leak, exec]
