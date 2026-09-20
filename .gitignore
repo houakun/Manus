@@ -1,12 +1,26 @@
 .env
 agent-engineering-handoff.md
-docs
+
+# docs/ 曾经被忽略，但它是**公开材料**的一部分：lab/README.md 的「相关文档」
+# 直接链接到 docs/step6-gap-audit.md、docs/noise-floor-measured.md 等 5 个文件，
+# 而审计里说「最强的地方要主动讲」的那几次自纠就在里面。
+# 忽略它 → 公开仓库里那些链接全部 404、证据链断掉，所以**取消忽略**。
+#
+# 仍然忽略的只有 agent-engineering-handoff.md（会话交接备忘，含个人求职计划），
+# docs/ 已被检查过：无凭据、无学校/个人标识。
 
 # ---- Python ----
-.venv/
+# 用 .venv*/ 而不是逐个列：我为了模拟 CI 依赖单独建过一个 .venv-ci，
+# 而 `.venv/` 匹配不到它 —— 这类临时虚拟环境一旦漏掉就会被 git add . 打包进去。
+.venv*/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# ---- 本地工具配置 ----
+# `.pi/` 是 pi agent 自己的本地配置（里面只有一个指向 skills 目录的相对路径），
+# 它不是项目内容。不忽略的话 `git add .` 会把个人工具配置一起收进去。
+.pi/
 
 # ---- lab 运行产物 ----
 # 任务工作区 / 轨迹 / 验收输出都是"证据"，会随时间膨胀，不进版本管理

@@ -22,9 +22,9 @@ handoff 第 8 节的模板写的 `78.3% ± 2.1%（n=5, 95% CI）` 就是这个�
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # 95% 置信度、双侧、自由度 1..30 的 t 临界值
 _T95 = {
@@ -275,6 +275,107 @@ def quantile(values: Sequence[float], p: float) -> float:
     if low == high:
         return ordered[int(position)]
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+class TaskLevelRates(BaseModel):
+    """任务级指标 —— 与"运行级成功率"是**两个不同的口径**。
+
+    | 口径 | 定义 | 会被什么稀释 |
+    |---|---|---|
+    | 运行级成功率 | 成功运行数 / 总运行数 | 会被"任务数少、每任务跑很多次"稀释 |
+    | **pass^k** | **k 次全对**的任务占比 | 不会被稀释 —— 一个任务只有 0 或 1 |
+    | pass@k | 至少成功 1 次的任务占比 | 同上 |
+
+    == 为什么需要 pass^k（实测动机）==
+    semireal v1：运行级成功率 95.0%（38/40），Wilson 区间与 v3 的 100% **重叠**，
+    看起来"没区别"。但换成任务级口径：
+      pass^5 = **6/8 = 75%**（两个任务分别是 4/5）
+    —— "8 个任务里 2 个不稳定"这件事，在 40 次运行的运行级口径里被平摊掉了。
+    而生产上要的是"同一个任务每次都做对"，这正是 pass^k 的语义。
+
+    ⚠️ **两条必须跟着这个数字一起说的限制**：
+    1. **它不是显著性的提升**：6/8 与 8/8 的 Wilson 区间仍然重叠
+       （[40.9%, 92.9%] vs [67.6%, 100%]），Fisher 精确检验 p≈0.47。
+       它是**更诚实的口径**，不是免费的统计功效。
+    2. **样本量是任务数（n=8），不是运行数（n=40）**。
+       想让区间收窄必须**加任务**，不是加每个任务的重复次数。
+    3. **独立性假设**：pass^k 假设同一任务的 k 次试验独立。
+       而 `runner.py` 支持并发（`asyncio.Semaphore`）—— 并发跑会共享服务端配额与
+       本机资源，引入**相关失败**，此时 pass^k 会偏乐观。并发运行必须在报告里标注。
+    """
+
+    tasks: int = 0
+    k: Optional[int] = None  # 每个任务的重复次数（不一致时取最小值）
+    uniform_k: bool = True  # 所有任务的次数是否一致
+    pass_pow_k: int = 0  # k 次全对的任务数
+    pass_at_k: int = 0  # 至少成功一次的任务数
+    pass_pow_k_rate: Interval = Field(default_factory=Interval)
+    pass_at_k_rate: Interval = Field(default_factory=Interval)
+    unstable: List[str] = Field(default_factory=list)  # 部分成功的任务
+
+    @property
+    def caveats(self) -> List[str]:
+        """渲染时要一并输出的限制（写成方法而不是常量，便于按数据变化）。"""
+        notes = [
+            f"样本量是**任务数 n={self.tasks}**，不是运行数；"
+            "想让区间收窄必须加任务，不是加重复次数。",
+            "pass^k 假设同一任务的 k 次试验独立；**并发运行会引入相关失败**，"
+            "此时该数字偏乐观（本次并发度见报告头部）。",
+            "pass^k 与运行级成功率的差异**不代表显著性**：两者区间可能都重叠。",
+        ]
+        if not self.uniform_k:
+            notes.append(
+                f"各任务的运行次数不一致（k 取最小值 {self.k}）—— "
+                "这会低估实际稳定性，建议补齐或按 k=min 对齐后再比。"
+            )
+        return notes
+
+
+def task_level_rates(per_task: Mapping[str, Sequence[bool]]) -> TaskLevelRates:
+    """从"任务 → 各次成败"算任务级指标。
+
+    要求调用方**先按任务分组**：pass^k 的定义就是"任务级 k 次全对"，
+    直接对全局成功率取 k 次方是错的（那假设了任务之间可互换）。
+
+    传 Mapping 而不是裸序列，是因为报告里要说清楚**是哪个任务**不稳定。
+
+    == 为什么这里要显式检查类型（踩过的坑）==
+    初版签名是 `Sequence[Sequence[bool]]`，而调用方传了 dict。
+    Python 不会报错：迭代 dict 得到的是**键（字符串）**，
+    于是 `map(bool, "semireal/sem_bug_fix")` 把 20 个字符变成了 20 个 True ——
+    结果是 `k=20`、`uniform_k=False`，**数字悄悄错了但没有任何异常**。
+    这种"类型不对但能跑"的静默错误比崩溃危险得多，所以在入口就拦掉。
+    """
+    if not isinstance(per_task, Mapping):
+        raise TypeError(
+            "task_level_rates 需要 Mapping[str, Sequence[bool]]（任务名 → 各次成败），"
+            f"收到 {type(per_task).__name__}。传裸序列会把键/元素误当成试验序列，"
+            "静默算出错误的 k。"
+        )
+
+    items = {key: list(map(bool, value)) for key, value in per_task.items() if value}
+    if not items:
+        return TaskLevelRates()
+
+    sizes = {len(value) for value in items.values()}
+    k = min(sizes)
+    pass_pow = sum(1 for value in items.values() if all(value))
+    pass_at = sum(1 for value in items.values() if any(value))
+    tasks = len(items)
+
+    return TaskLevelRates(
+        tasks=tasks,
+        k=k,
+        uniform_k=len(sizes) == 1,
+        pass_pow_k=pass_pow,
+        pass_at_k=pass_at,
+        pass_pow_k_rate=wilson_interval(pass_pow, tasks),
+        pass_at_k_rate=wilson_interval(pass_at, tasks),
+        unstable=[
+            f"{key.split('/')[-1]}({sum(value)}/{len(value)})"
+            for key, value in items.items() if 0 < sum(value) < len(value)
+        ],
+    )
 
 
 def aggregate(values: Sequence[float]) -> Dict[str, float]:

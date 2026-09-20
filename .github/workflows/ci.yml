@@ -1,0 +1,65 @@
+name: lab
+
+# 这个 workflow **不花钱**：只跑单元测试与任务集自检，不调用任何模型。
+# 花钱的评测（bench run）永远不进 CI —— 它应该由人显式触发。
+on:
+  push:
+    paths:
+      - "lab/**"
+      - "api/app/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "lab/**"
+      - "api/app/**"
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 刻意只装 lab 真正需要的那部分依赖。
+      # 为什么不用 api/requirements.txt：它带着 playwright / docker / alembic / cos-sdk，
+      # 那是 SUT 的运行期依赖，而 lab 的测试只需要 SUT 的**纯 Python 部分**能 import。
+      # 装全量会让 CI 慢十倍，而多出来的东西一个都用不到。
+      - name: Install minimal dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pydantic==2.11.9" \
+            "pyyaml==6.0.2" \
+            "json-repair==0.53.0" \
+            "httpx==0.28.1" \
+            "openai==1.107.2" \
+            "mcp==1.22.0" \
+            "pytest" "pytest-asyncio"
+
+      # 全量单测：覆盖中间件 / 判定器 / 统计 / 任务集 / CLI / SUT 健壮性
+      #              + 录制回放（含"不联网"与"成本口径"两个铁约束）
+      #              + 交错 A/B 排程 / 噪声地板 / 实验条件落库
+      - name: Unit tests
+        run: python -m pytest -q
+
+      # 任务集三步自检 + 同义反复检测。
+      # 这一步是"评测台自身可信度"的门禁：
+      # 期望值写错、判定器太松/太严、参考解直接写出答案，都会在这里暴露。
+      - name: Task set self-check (no API key needed)
+        run: python -m lab bench validate
+
+      # CLI 的可发现性：至少保证 --help 不会崩。
+      # 这里刻意不跑 `replay stats` —— 干净的 CI 环境里没有缓存库，
+      # 它会退 2。那对它自己是"正确行为"，但会把 CI 弄红，所以只测 --help。
+      - name: CLI smoke
+        run: |
+          python -m lab --help
+          python -m lab bench --help
+          python -m lab bench noise-floor --help
+          python -m lab bench gate --help
+          python -m lab replay --help
+          python -m lab sandbox clean-escapes

@@ -231,12 +231,35 @@ async def test_check_file_exists_and_dir_count(tmp_path):
 # ==================== 3. 任务模型与任务集 ====================
 
 def test_task_set_shape():
-    """任务集规模必须是 12 合成 + 8 半真实（这是方案 B 的约定）。"""
+    """任务集形状是**约定**，不能随手变 —— 它直接决定指标的可比性。
+
+    12 合成 + 8 半真实是方案 B 的原始约定；
+    后来加了 `ci` 组（CI 失败归因），因为原来的 20 个任务已经**饱和**：
+    7/7 regression 任务均 42 次运行 100% 成功 —— 成功率这个指标在那里不动，
+    提不了任何改进信号（详见 docs/noise-floor-measured.md）。
+
+    这个断言的价值就在于：任何人往任务集里加/删任务时，都必须到这里来显式改一次，
+    而不是惄惄地让基线数字变得不可比。
+    """
     tasks = load_all_tasks()
     summary = summarize_tasks(tasks)
 
-    assert summary["by_group"] == {"semireal": 8, "synthetic": 12}
-    assert len(tasks) == 20
+    assert summary["by_group"] == {"semireal": 8, "synthetic": 12, "ci": 2}
+    assert len(tasks) == 22
+
+
+def test_ci_tasks_are_capability_not_regression():
+    """新增的 ci 任务必须标 capability，直到我们测出它们的方差。
+
+    为什么要单独钉住：`purpose` 直接决定它进不进回归门禁口径。
+    一个成功率未知、方差未知的新任务类如果被当成 regression，
+    会把回归指标变成一个“看着稳定实际上在抖”的数字。
+    测出方差之后再改分类，是**显式的一次决定**，不是默认值。
+    """
+    ci_tasks = [t for t in load_all_tasks() if t.group == "ci"]
+    assert ci_tasks, "ci 组不应为空"
+    for task in ci_tasks:
+        assert task.purpose == "capability", f"{task.uid} 的 purpose 应为 capability"
 
 
 def test_every_task_has_verifier_solution_and_wrong_answer():
@@ -522,3 +545,53 @@ def test_bootstrap_interval_widens_with_spread():
 
     assert tight.half_width < wide.half_width
     assert wide.point > tight.point
+
+
+# ==================== 3.8 任务级指标 pass^k / pass@k ====================
+
+def test_pass_k_exposes_instability_that_run_level_rate_dilutes():
+    """`pass^k` 的核心价值：把"少数任务不稳定"暴露出来，而不是被平摊掉。
+
+    真实数据：semireal v1 运行级成功率 95.0%（38/40），看起来与 100% 差不多；
+    但 8 个任务里有 2 个是 4/5 → pass^5 = 6/8 = 75%。
+    """
+    from lab.bench.stats import task_level_rates
+
+    per_task = {
+        "t1": [True] * 5, "t2": [True] * 5, "t3": [True] * 5,
+        "t4": [True, True, True, True, False],  # 4/5
+        "t5": [True] * 5, "t6": [True] * 5, "t7": [True] * 5,
+        "t8": [False, True, True, True, True],  # 4/5
+    }
+    metrics = task_level_rates(per_task)
+
+    assert metrics.tasks == 8 and metrics.k == 5
+    assert metrics.pass_pow_k == 6  # 只有 6 个任务 5 次全对
+    assert metrics.pass_pow_k_rate.point == pytest.approx(0.75)
+    assert metrics.pass_at_k == 8  # 但每个任务都至少成功过一次
+    assert len(metrics.unstable) == 2
+    # 运行级口径会把这个差异平摊成 95%
+    assert sum(sum(v) for v in per_task.values()) / 40 == pytest.approx(0.95)
+
+
+def test_task_level_rates_rejects_bare_sequences():
+    """防呆：传裸序列必须报错，不能静默算出错误的 k。
+
+    真事故：初版签名是 Sequence，调用方传了 dict →
+    迭代得到键（字符串）→ `map(bool, "semireal/sem_bug_fix")` 把 20 个字符
+    变成 20 个 True → k=20。**没有异常，只是数字悄悄错了。**
+    """
+    from lab.bench.stats import task_level_rates
+
+    with pytest.raises(TypeError, match="Mapping"):
+        task_level_rates(["semireal/sem_bug_fix"])
+
+
+def test_task_level_rates_flags_non_uniform_k():
+    """各任务次数不一致时要标出来 —— 它会低估实际稳定性。"""
+    from lab.bench.stats import task_level_rates
+
+    metrics = task_level_rates({"t1": [True] * 5, "t2": [True] * 3})
+    assert metrics.uniform_k is False
+    assert metrics.k == 3  # 取最小值
+    assert any("不一致" in note for note in metrics.caveats)

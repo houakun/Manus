@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pydantic import BaseModel, Field
 
 from lab.bench.runner import RunOutcome, SuiteResult
+from lab.bench.task import regression_uids
 from lab.bench.stats import (
     Interval,
     bootstrap_ci,
@@ -163,6 +164,144 @@ class PairedMetric(BaseModel):
         return self.diff_interval.low > 0 or self.diff_interval.high < 0
 
 
+class GateResult(BaseModel):
+    """一条门禁的结果。"""
+
+    name: str
+    threshold: str
+    observed: str
+    passed: bool
+    detail: str = ""
+    # 该指标实测的噪声地板（±）。空字符串 = 没测过。
+    # 没有它，读者无法判断"阈值 5pt"到底是紧还是松 —— 而这一条恰恰决定
+    # 门禁会不会因为噪声频繁变红。
+    resolution: str = ""
+
+
+def evaluate_gates(
+        report: ComparisonReport,
+        *,
+        max_success_drop_pt: float = 5.0,
+        max_passk_drop_pt: float = 10.0,
+        max_cost_increase_pct: float = 20.0,
+        require_significant: bool = True,
+        noise_floor: Any = None,
+        auto_thresholds: bool = False,
+) -> List[GateResult]:
+    """把对比结果变成一组可判定的门禁。
+
+    == 为什么默认 `require_significant=True` ==
+    评测的噪声很大（本项目实测：同一代码不同时段也能差 20% 以上）。
+    如果"只要数值变差就失败"，CI 会因为噪声而频繁变红 ——
+    而**频繁变红的门禁等于没有门禁**（人就会开始习惯性忽略它）。
+    所以默认只有"差值方向可信（bootstrap 区间不跨 0）**且**超过阈值"才判失败。
+
+    成功率与 pass^k 是离散指标，用绝对值差（百分点）；
+    成本是连续量，用配对相对变化（%）。
+
+    == `noise_floor` / `auto_thresholds` ==
+    阈值原来是拍脑袋定的（5pt / 20%）。传实测的噪声地板后：
+    - 每个门禁会**附带**它的实测分辨率，让人看得出阈值是紧还是松；
+    - `auto_thresholds=True` 时，阈值会被抬到"不小于噪声地板"——
+      这是本项目一贯的原则：**阈值必须来自数据，不能拍脑袋**。
+    """
+    floor_success = noise_floor.resolution("success_pt", 0.0) if noise_floor else 0.0
+    floor_passk = floor_success  # pass^k 的样本量同为任务数，分辨率同量级
+    floor_cost = noise_floor.resolution("cost_pct", 0.0) if noise_floor else 0.0
+
+    effective_success = max(max_success_drop_pt, floor_success) if auto_thresholds else max_success_drop_pt
+    effective_passk = max(max_passk_drop_pt, floor_passk) if auto_thresholds else max_passk_drop_pt
+    effective_cost = max(max_cost_increase_pct, floor_cost) if auto_thresholds else max_cost_increase_pct
+
+    auto_note = "（已按噪声地板抬高）" if auto_thresholds else ""
+    results: List[GateResult] = []
+
+    def resolution_of(name: str, unit: str) -> str:
+        if not noise_floor:
+            return "（未测）"
+        metric = noise_floor.get(name)
+        return f"±{metric.resolution:.2f}{unit}" if metric else "（未测）"
+
+    # 1.成功率（运行级）
+    drop_pt = (report.baseline.success_rate.point - report.candidate.success_rate.point) * 100
+    results.append(GateResult(
+        name="运行级成功率下降",
+        threshold=f"≤ {effective_success:.1f}pt{auto_note}",
+        observed=f"{drop_pt:+.1f}pt",
+        passed=drop_pt <= effective_success,
+        detail=f"{report.baseline.success_rate.point:.1%} → {report.candidate.success_rate.point:.1%}",
+        resolution=resolution_of("success_pt", "pt"),
+    ))
+
+    # 2.pass^k（任务级）—— 比运行级更敏感，能抓到"少数任务变不稳"
+    base_pow, cand_pow = report.baseline_passk, report.candidate_passk
+    if base_pow is not None and cand_pow is not None and base_pow.tasks and cand_pow.tasks:
+        pow_drop_pt = (base_pow.pass_pow_k_rate.point - cand_pow.pass_pow_k_rate.point) * 100
+        results.append(GateResult(
+            name=f"pass^{base_pow.k} 下降",
+            threshold=f"≤ {effective_passk:.1f}pt{auto_note}",
+            observed=f"{pow_drop_pt:+.1f}pt",
+            passed=pow_drop_pt <= effective_passk,
+            detail=f"{base_pow.pass_pow_k}/{base_pow.tasks} → {cand_pow.pass_pow_k}/{cand_pow.tasks}",
+            resolution=resolution_of("success_pt", "pt"),
+        ))
+    else:
+        # 跳过的行必须**显式出现**，否则“没有这一行”会被误读成“通过了”。
+        # 典型场景：只含 capability 任务的 suite（如 `--group ci`）——
+        # 回归门禁对它本来就没有话可说，但不能静静地不说。
+        results.append(GateResult(
+            name="pass^k（任务级）",
+            threshold="—",
+            observed="跳过",
+            passed=True,
+            detail="本口径下没有任务（suite 里只有 capability 任务，回归门禁不适用）",
+        ))
+
+    # 3.成本（配对相对变化）
+    paired = report.paired.get("cost_usd")
+    if paired is not None:
+        increase_pct = paired.relative_change * 100
+        over = increase_pct > effective_cost
+        failed = over and (paired.significant or not require_significant)
+        results.append(GateResult(
+            name="成本上升",
+            threshold=f"≤ {effective_cost:.0f}%"
+                      + auto_note
+                      + ("（需方向可信）" if require_significant else ""),
+            observed=f"{increase_pct:+.1f}%"
+                     + ("" if paired.significant else "（区间跨 0，视为噪声）"),
+            passed=not failed,
+            detail=f"${paired.baseline_mean:.4f} → ${paired.candidate_mean:.4f}（配对 n={paired.n_pairs}）",
+            resolution=resolution_of("cost_pct", "%"),
+        ))
+    # 4.回放完整性（×）：回放未命中 → 两边根本不是同一条轨迹。
+    #
+    #    实测踩过：严格回放未命中 6 次时，SUT 降级继续跑，交付了合格产物，
+    #    判定器给 OK —— 于是一个"只剩半条轨迹"的运行会被读成一个干净的成功。
+    #    把回放不完整当成门禁失败，而不是只写在备注里。
+    degraded = report.candidate_replay_missed_runs
+    if degraded:
+        results.append(GateResult(
+            name="回放完整性",
+            threshold="= 0 次未命中",
+            observed=f"{degraded} 次运行回放不完整",
+            passed=False,
+            detail="这些运行的轨迹不是录制时那条；即使判定为成功也不可复现",
+        ))
+    return results
+
+
+def render_gates(results: Sequence[GateResult]) -> str:
+    lines = ["| 门禁 | 阈值 | 实测 | 噪声地板(±) | 结论 |", "|---|---|---|---|---|"]
+    for item in results:
+        lines.append(
+            f"| {item.name} | {item.threshold} | {item.observed} "
+            f"| {item.resolution or '—'} "
+            f"| {'✅ 通过' if item.passed else '❌ 失败'} {item.detail} |"
+        )
+    return "\n".join(lines)
+
+
 class ComparisonReport(BaseModel):
     """两个 suite 的对比。"""
 
@@ -170,8 +309,26 @@ class ComparisonReport(BaseModel):
     candidate: SuiteSummary
     paired: Dict[str, PairedMetric] = Field(default_factory=dict)
     success_rate_delta: float = 0.0
+    baseline_passk: Any = None  # TaskLevelRates（用 Any 避免循环导入）
+    candidate_passk: Any = None
     only_in_baseline: List[str] = Field(default_factory=list)
     only_in_candidate: List[str] = Field(default_factory=list)
+    # 实验条件差异（加固/故障/回放/模型/温度/任务集）。
+    # 非空**不一定**是错：加固对照实验里 guard 本来就该不同。
+    # 但差异必须被**显式看到**，否则很容易把"无加固 vs 有加固"的差异
+    # 归因成"代码回归了"——这是最容易忽略、后果最重的一类比较错误。
+    config_differences: Dict[str, List[Any]] = Field(default_factory=dict)
+    # 两个待比对象是否来自**同一个交错 suite 的两个臂**。
+    # 为真时，时间混淆已被设计消除，是比"分两段跑"强得多的对比。
+    # 交错配对时，时间混淆已被设计消除，不再重复那句警告。
+    interleaved_pair: bool = False
+    # 本次对比的口径（all / regression）。
+    # 必须写进报告：否则“同一对 suite 为什么两个地方数字不同”会让人怀疑工具坏了。
+    scope: str = "all"
+    # 回放不完整的运行数（>0 → 数字不可复现，不能用来下结论）。
+    # 分两侧而非总数：门禁只看**候选**侧（基准侧的未命中是历史事实，已经接受了）。
+    baseline_replay_missed_runs: int = 0
+    candidate_replay_missed_runs: int = 0
     confound_note: str = (
         "配对消掉了任务难度差异，但**消不掉时间相关的服务端漂移**："
         "两组跑在不同时段时，服务端整体变快/变慢会同时影响两边，伪装成方案差异。"
@@ -179,12 +336,99 @@ class ComparisonReport(BaseModel):
         "因此本对比是「同期对比」，不是严格意义上的因果对比。"
     )
 
+    @property
+    def hard_confounds(self) -> List[str]:
+        """让对比**失去意义**的那些差异（与"自变量不同"是两回事）。
 
-def compare_suites(baseline: SuiteResult, candidate: SuiteResult) -> ComparisonReport:
-    """配对对比两个 suite（按 task_key 配对，每边取该任务的均值）。"""
+        - 模型 / 温度不同：两个不同的测量仪器，比出来的不是同一个东西；
+        - 回放模式不同：一边的成本/耗时是等价量，另一边是真值，不可相减；
+        - 任务集不同：问题本身不同（已有单独的 only_in_* 提示）。
+        而 `guard_config` / `fault_spec` 不同是**合法的自变量**，只算提醒。
+        """
+        return [key for key in self.config_differences
+                if key in ("model_name", "temperature", "replay_mode", "task_set")]
+
+    @property
+    def comparable(self) -> bool:
+        """两边是不是同一种实验（仅"自变量不同"不算，那正是要看的东西）。"""
+        return not self.hard_confounds
+
+
+def _scoped_suites(baseline: SuiteResult, candidate: SuiteResult, scope: str) -> tuple:
+    """按口径筛掉不该进这个指标的运行（见 compare_suites 的说明）。
+
+    只在**筛完之后还有任务**时才筛：否则一个只含 capability 任务的 suite
+    会变成空集，所有区间都退化成 0，反而造出“看起来很确定”的假象。
+    那种情况请把空集返回给上层，由上层把“跳过”**显式写出来**。
+    """
+    if scope != "regression":
+        return baseline, candidate
+    keep = regression_uids()
+    if not keep:
+        return baseline, candidate
+    left = {o.task_uid for o in baseline.outcomes} & keep
+    right = {o.task_uid for o in candidate.outcomes} & keep
+    return (
+        baseline.only_tasks(left) if left else baseline,
+        candidate.only_tasks(right) if right else candidate,
+    )
+
+
+def _config_differences(baseline: SuiteResult, candidate: SuiteResult) -> Dict[str, List[Any]]:
+    """列出两边的实验条件差异（逐项列全，严重的在 `hard_confounds` 里挑出来）。
+
+    为什么要列全而不是只列"致命"项：
+    `guard_config` 不同这件事本身很常见（默认就是 all），
+    列出来才能让人自己判断"这是我有意设计的自变量，还是我忘了传参数"。
+    """
+    keys = ("model_name", "temperature", "guard_config", "fault_spec", "replay_mode")
+    a_fp = baseline.config_fingerprint()
+    b_fp = candidate.config_fingerprint()
+    diffs: Dict[str, List[Any]] = {}
+    for key in keys:
+        if a_fp.get(key) != b_fp.get(key):
+            diffs[key] = [a_fp.get(key), b_fp.get(key)]
+    if a_fp.get("task_set") != b_fp.get("task_set"):
+        diffs["task_set"] = [len(a_fp.get("task_set") or []), len(b_fp.get("task_set") or [])]
+    return diffs
+
+
+def compare_suites(
+        baseline: SuiteResult,
+        candidate: SuiteResult,
+        *,
+        scope: str = "all",
+) -> ComparisonReport:
+    """配对对比两个 suite（按 task_key 配对，每边取该任务的均值）。
+
+    :param scope: `all`（全部任务，用于人看的 `bench compare`）
+        或 `regression`（只算 regression 任务，用于 `bench gate`）。
+
+    == 为什么 `bench gate` 必须用 `scope="regression"`（真实缺陷）==
+    本项目自己定义得很清楚（`docs/step6-followup-*.md`）：
+      "regression 口径才是回归门禁指标；capability 任务的波动是**能力边界**，不能进门禁"
+      —— 并给了实测例证：一个 8.3pt 的差异**完全由 `sem_markdown_toc` 一个任务的 3 次运行决定**。
+
+    但 `bench gate` 原来调的是 `task_level()`（不加过滤），也就是**把那个任务算进去了**。
+    后果是门禁会因一个已知不稳定的 capability 任务而变红 ——
+    而“频繁变红的门禁等于没有门禁”。而且它的报告口径（分开列）与门禁口径（混在一起）**不一致**，
+    人看到的两份数字对不上。
+
+    现在把口径做成**显式参数**：报告用 all（信息完整），门禁用 regression（与定义一致）。
+    """
+    baseline, candidate = _scoped_suites(baseline, candidate, scope)
+    parent_a = baseline.suite_id.split("#")[0]
+    parent_b = candidate.suite_id.split("#")[0]
     report = ComparisonReport(
         baseline=summarize_suite(baseline),
         candidate=summarize_suite(candidate),
+        baseline_passk=baseline.task_level(),
+        candidate_passk=candidate.task_level(),
+        config_differences=_config_differences(baseline, candidate),
+        interleaved_pair=bool(parent_a and parent_a == parent_b and "#" in baseline.suite_id),
+        scope=scope,
+        baseline_replay_missed_runs=baseline.replay_missed_runs,
+        candidate_replay_missed_runs=candidate.replay_missed_runs,
         success_rate_delta=(
             sum(1 for o in candidate.outcomes if o.ok) / max(1, len(candidate.outcomes))
             - sum(1 for o in baseline.outcomes if o.ok) / max(1, len(baseline.outcomes))
@@ -374,7 +618,51 @@ def render_comparison(report: ComparisonReport) -> str:
     lines.append("")
     lines.append(f"- A: {a.label}（n={a.n}）")
     lines.append(f"- B: {b.label}（n={b.n}）")
+    if report.scope != "all":
+        lines.append(f"- 口径：**{report.scope}**"
+                     "（capability 任务的波动是能力边界，不进这个口径）")
     lines.append("")
+
+    # ==================== 实验条件对账（放在最前面）====================
+    # 放在最前面是因为它是**读其它数字的前提**：
+    # 如果两边根本不是同一个实验，后面的 delta 再精确也没有意义。
+    if report.interleaved_pair:
+        lines.append("### ✅ 实验条件：交错配对")
+        lines.append("")
+        lines.append("两边来自**同一个交错 suite 的两个臂**（A,B,B,A…），"
+                     "所以「时间相关的服务端漂移」在设计上对两边同权 —— "
+                     "这比「分两段跑」强得多。")
+        lines.append("")
+    if report.baseline_replay_missed_runs or report.candidate_replay_missed_runs:
+        # 回放不完整 → 两边的轨迹根本不是同一条，任何 delta 都没有意义。
+        # 实测踩过：严格回放未命中 6 次仍然判定 OK（SUT 降级继续跑完了活）。
+        lines.append("### 🔴 回放不完整（数字不可复现）")
+        lines.append("")
+        lines.append(f"- A 侧：{report.baseline_replay_missed_runs} 次运行缓存未命中")
+        lines.append(f"- B 侧：{report.candidate_replay_missed_runs} 次运行缓存未命中")
+        lines.append("")
+        lines.append("> 这些运行在 LLM 调用失败后**降级继续**了，所以「仍然成功」**不等于**「复现成功」。"
+                     "先让两边都达到 0 未命中（`--replay-ignore-volatile` 或补录），再看 delta。")
+        lines.append("")
+    if report.config_differences:
+        header = "### ❌ 实验条件不同（不可直接比）" if report.hard_confounds \
+            else "### ⚠️ 实验条件差异（确认是你有意设计的自变量）"
+        lines.append(header)
+        lines.append("")
+        lines.append("| 项 | A | B | 性质 |")
+        lines.append("|---|---|---|---|")
+        for key, values in sorted(report.config_differences.items()):
+            hard = key in report.hard_confounds
+            kind = "❌ 使对比失去意义" if hard else "⚠️ 自变量（合法）"
+            lines.append(f"| `{key}` | {values[0]} | {values[1]} | {kind} |")
+        lines.append("")
+        if report.hard_confounds:
+            lines.append("> 🔴 **两边不是同一个实验**：模型/温度/回放模式/任务集不同，"
+                         "下面的所有 delta **不能**读成「某个改动带来的效果」。")
+        else:
+            lines.append("> 🟡 这里只有自变量（加固/故障）不同 —— 这是合法的对照实验，"
+                         "但结论只能说「在这个自变量下」，**不能**说「代码变好/变差了」。")
+        lines.append("")
 
     lines.append("### 总体")
     lines.append("")
@@ -423,6 +711,10 @@ def render_comparison(report: ComparisonReport) -> str:
     lines.append("")
     lines.append("> 中位数远低于均值 + bootstrap 区间明显宽于 t 区间 = 分布重尾，"
                  "**均值不是个好代表**，报告应该同时给中位数与 P95。")
+    lines.append("")
+    lines.append("> ⚠️ 共上方的 delta 还需要一个**噪声地板**才能解读："
+                 "`python -m lab bench noise-floor` 测出「同一配置跑两次能差多少」，"
+                 "小于它的 delta 不能用。")
     lines.append("")
 
     lines.append("### 可信度与失败模式")

@@ -1,0 +1,288 @@
+key: ci_shared_cache_state
+group: ci
+purpose: capability
+title: CI 归因：实例之间串数据（类属性当成了实例状态）
+tags: [ci-attribution, code-fix, state-leak, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数/方法名。
+  提示：CI 日志里那几个失败的断言，读起来像是"每次调用都多了一点东西"。
+  # 注意：CI 日志里的顺序就是用例的执行顺序，而状态泄漏是**累积**的 ——
+  # 越靠后的用例越脏。这个形状本身就是线索。
+selfcheck:
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  # 内容**逐行来自真实运行**（`selfcheck` 会守住这一点）。
+  # 实测教训：手写的第一版把 test_keys_are_sorted 写成 SKIPPED，实际它是 FAILED
+  # （共享状态把它也污染了）—— 日志不能手写。
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_single_report_has_only_its_own_keys ... PASSED
+      test_second_report_is_independent ... FAILED
+          expected ['b']，actual ['a', 'b']
+      test_third_report_is_independent ... FAILED
+          expected ['c']，actual ['a', 'b', 'c']
+      test_two_fresh_instances_do_not_share ... FAILED
+          expected []，actual ['a', 'b', 'c', 'x']
+      test_keys_are_sorted ... FAILED
+          expected ['a', 'b']，actual ['a', 'b', 'c', 'x']
+      ---------------------------------------------
+      5 项：1 通过 / 4 失败
+      （注：第一个用例能过 —— 它是第一个跑、还没被污染）
+  # ---------------- 报告层（看起来像问题，其实不是） ----------------
+  - path: /home/ubuntu/repo/report.py
+    content: |
+      """按名字构建一份报告。每次调用都应当互相独立。"""
+      from cache import Cache
+
+      # 看起来可疑，但只是历史遗留：这两个常量与本次失败无关
+      _CACHE_LIMIT = 100
+      _RESERVED_PREFIXES = ("report:",)
+
+
+      def build_report(name, entries):
+          own = Cache()
+          for key, value in entries.items():
+              own.put(key, value)
+          return {"name": name, "keys": own.keys()}
+
+
+      def reset():
+          """清空"当前"缓存。注意：没有任何地方调用它。"""
+          Cache().clear()
+  # ---------------- 真正有 bug 的模块 ----------------
+  - path: /home/ubuntu/repo/cache.py
+    content: |
+      """按 key 缓存计算结果。"""
+      # 接口在 v2 会有调整（仅提示，不是缺陷）
+      from typing import Any, Dict, List, Optional
+
+
+      class Cache:
+          # BUG: 写成了类属性 —— 所有实例共用同一个 dict，
+          # 于是"新建一个 Cache"并不等于"拿到一份干净的状态"
+          _store: Dict[str, Any] = {}
+
+          def put(self, key: str, value: Any) -> "Cache":
+              self._store[key] = value
+              return self
+
+          def get(self, key: str, default: Optional[Any] = None) -> Any:
+              return self._store.get(key, default)
+
+          def keys(self) -> List[str]:
+              return sorted(self._store)
+
+          def clear(self) -> "Cache":
+              self._store.clear()
+              return self
+
+          def snapshot(self) -> Dict[str, Any]:
+              """返回当前内容的**副本**。看起来像能解决共享问题，其实不能：
+              副本只影响返回值，put 写的仍然是那份共享的 dict。"""
+              return dict(self._store)
+  # ---------------- CI 提供的测试运行器（冻结，不得修改） ----------------
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      from cache import Cache
+      from report import build_report
+
+
+      def case_single():
+          keys = build_report("first", {"a": 1})["keys"]
+          return keys == ["a"], keys, ["a"]
+
+
+      def case_second():
+          keys = build_report("second", {"b": 2})["keys"]
+          return keys == ["b"], keys, ["b"]
+
+
+      def case_third():
+          keys = build_report("third", {"c": 3})["keys"]
+          return keys == ["c"], keys, ["c"]
+
+
+      def case_fresh_instances():
+          one = Cache()
+          two = Cache()
+          one.put("x", 1)
+          return two.keys() == [], two.keys(), []
+
+
+      def case_sorted():
+          cache = Cache()
+          cache.put("b", 1)
+          cache.put("a", 2)
+          return cache.keys() == ["a", "b"], cache.keys(), ["a", "b"]
+
+
+      CASES = [
+          ("test_single_report_has_only_its_own_keys", case_single),
+          ("test_second_report_is_independent", case_second),
+          ("test_third_report_is_independent", case_third),
+          ("test_two_fresh_instances_do_not_share", case_fresh_instances),
+          ("test_keys_are_sorted", case_sorted),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # ---- 1. 执行型检查（最强）：脚本来自任务定义，Agent 改不了 ----
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 三次构建必须互相独立，且两个新实例不共享状态
+    script: |
+      import os
+      import sys
+
+      sys.path.insert(0, os.getcwd())
+
+      from cache import Cache
+      from report import build_report
+
+      problems = []
+      first = build_report("first", {"a": 1})
+      second = build_report("second", {"b": 2})
+      third = build_report("third", {"c": 3})
+      if first["keys"] != ["a"]:
+          problems.append(f"first={first['keys']!r}")
+      if second["keys"] != ["b"]:
+          problems.append(f"second={second['keys']!r}")
+      if third["keys"] != ["c"]:
+          problems.append(f"third={third['keys']!r}")
+      one = Cache()
+      two = Cache()
+      one.put("x", 1)
+      if two.keys() != []:
+          problems.append(f"两个新实例共享了状态: {two.keys()!r}")
+      if problems:
+          print("FAIL:", problems)
+          sys.exit(1)
+      print("OK: 实例之间已隔离")
+  # ---- 2. 测试运行器完整性（中）----
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  # ---- 3. 归因报告（中）----
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "cache.py"
+    description: 归因里点名了共享状态所在模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "_store"
+    description: 归因里点名了具体的共享状态
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/cache.py
+    content: |
+      """按 key 缓存计算结果。"""
+      # 接口在 v2 会有调整（仅提示，不是缺陷）
+      from typing import Any, Dict, List, Optional
+
+
+      class Cache:
+          def __init__(self) -> None:
+              # 每个实例一份自己的状态
+              self._store: Dict[str, Any] = {}
+
+          def put(self, key: str, value: Any) -> "Cache":
+              self._store[key] = value
+              return self
+
+          def get(self, key: str, default: Optional[Any] = None) -> Any:
+              return self._store.get(key, default)
+
+          def keys(self) -> List[str]:
+              return sorted(self._store)
+
+          def clear(self) -> "Cache":
+              self._store.clear()
+              return self
+
+          def snapshot(self) -> Dict[str, Any]:
+              return dict(self._store)
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [
+        {"file": "cache.py", "symbol": "Cache._store", "why": "把 _store 写成了类属性（Dict[str, Any] = {}），所有 Cache 实例共用同一个 dict，所以新建实例并不会得到干净状态；snapshot() 只复制返回值，不影响 put 的写入目标"}
+      ]}
+wrong:
+  # 典型错解：调用 snapshot() "拿一份副本"，看起来像在隔离，
+  # 但 put 仍然写进那份共享的 dict，实例之间照旧串。
+  - kind: write_file
+    path: /home/ubuntu/repo/report.py
+    content: |
+      """按名字构建一份报告。每次调用都应当互相独立。"""
+      from cache import Cache
+
+      _CACHE_LIMIT = 100
+      _RESERVED_PREFIXES = ("report:",)
+
+
+      def build_report(name, entries):
+          own = Cache()
+          for key, value in entries.items():
+              own.put(key, value)
+          # 错解：以为 snapshot() 会隔离状态
+          isolated = own.snapshot()
+          return {"name": name, "keys": sorted(isolated)}
+
+
+      def reset():
+          Cache().clear()
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "report.py", "symbol": "build_report", "why": "没有隔离快照"}]}
+notes: >-
+  **与 `ci_window_boundary` 刻意不同：这个任务只有**一个**根因，但根因更隐蔽。**
+  两个诱饵：`report.py` 里的 `_CACHE_LIMIT` / `_RESERVED_PREFIXES` 看起来可疑但无关；
+  `cache.py` 的 `snapshot()` 看起来像"拿副本就能隔离"，但 `put` 写的仍是共享 dict
+  （wrong 解就是这条歧路）。
+  CI 日志里 `test_single_report_has_only_its_own_keys` 通过、后两个失败 ——
+  "第一个过、后面越来越脏"这个形状本身就是状态泄漏的特征，是任务想考的信号。
+  判定强度：主检查是 `exec_script`（脚本存在任务定义里，Agent 改不了，且真的跑代码）。
+  另外：**任何**能让实例相互隔离的实现（__init__ / dataclass / 工厂）都应当通过 ——
+  判定器只看行为，不锁实现。这与 `sem_bug_fix` 里那条 `contains: "range(1, n + 1)"`
+  形成对照（那条锁了实现，是一个**假阴性**来源，已记入待改进项）。

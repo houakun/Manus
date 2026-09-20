@@ -132,14 +132,19 @@ class CountingLLM:
 
         # 3.补齐 span 属性
         if handle is not None:
-            handle.end(
-                status="ok",
-                latency_ms=latency_ms,
-                prompt_tokens=(raw_usage or {}).get("prompt_tokens"),
-                completion_tokens=(raw_usage or {}).get("completion_tokens"),
-                total_tokens=(raw_usage or {}).get("total_tokens"),
-                has_tool_calls=bool(result.get("tool_calls")),
-            )
+            attrs: Dict[str, Any] = {
+                "prompt_tokens": (raw_usage or {}).get("prompt_tokens"),
+                "completion_tokens": (raw_usage or {}).get("completion_tokens"),
+                "total_tokens": (raw_usage or {}).get("total_tokens"),
+                "has_tool_calls": bool(result.get("tool_calls")),
+            }
+            # 录制回放：把"这次响应是缓存来的还是真联网来的"写进 span。
+            # 这是"本次运行确实完全离线"的**取证依据** —— 事后看轨迹就能确认，
+            # 而不是只能相信命令行参数。
+            cache_status = getattr(self._inner, "last_status", "")
+            if cache_status:
+                attrs["cache_status"] = cache_status
+            handle.end(status="ok", latency_ms=latency_ms, **attrs)
 
         # 4.调用后回调（预算检查）。放在最后：此时 span 已经收口，
         #   预算越界会被标注到当前栈顶（即所在 step），而不是这条 llm span 上。

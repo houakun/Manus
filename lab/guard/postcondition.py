@@ -27,6 +27,7 @@ Step 3 的故障注入里有一半（`empty_result` / `malformed_result` /
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 from lab.bootstrap import ensure_sut_on_path
@@ -54,6 +55,114 @@ EXPECTED_DATA_KEYS: Dict[str, Tuple[str, ...]] = {
 
 # 内容校验的大小上限：超过就跳过（校验不能把评测机器拖垮）
 MAX_VERIFY_CHARS = 200_000
+
+
+def _looks_like_json(content: str) -> bool:
+    """内容看起来是不是 JSON（用于结构合法性校验）。"""
+    text = content.lstrip()
+    return text.startswith("{") or text.startswith("[")
+
+
+def _looks_truncated(data: dict, args: dict, content: str) -> bool:
+    """判断内容是否**本来就被截断**（这种情况下不能做结构校验）。
+
+    为什么必须判：`read_file` 默认只读 10000 字符。一个 50KB 的 JSON 文件
+    读回来就是半截，直接拿去做 JSON 解析必然失败 —— 那是**工具的正常行为**，
+    不是故障。不区分就会制造大量假告警（而假告警会让真告警失效）。
+
+    两类证据：
+    1. 工具自己标了 `truncated`（本地沙箱会标）；
+    2. 内容长度正好等于请求的 `max_length`（强提示：是被上限截的）。
+    """
+    if data.get("truncated"):
+        return True
+    limit = args.get("max_length")
+    if isinstance(limit, int) and limit > 0 and len(content) >= limit:
+        return True
+    return False
+
+
+def check_postcondition_content(
+        *,
+        function_name: str,
+        args: Optional[dict],
+        result: ToolResult,
+) -> Optional[str]:
+    """**内容级**后置校验（可 enforce）：目前做 JSON 结构合法性。
+
+    == 为什么需要它（读路径的盲区）==
+    原来 `read_file` 只查 `filepath`/`content` 两个字段存在 —— 只要拿回一个
+    非空字符串就算通过。于是**读路径上的静默损坏**（`truncated_result` /
+    `silent_wrong_result`）完全无人发现：Agent 拿到半截 JSON 也会直接往下用。
+
+    这是唯一一类"**Agent 自身无法发现**"的故障 —— 它没有外部真相可比。
+    而结构合法性（JSON 能不能解析）是一个**与来源无关**的客观不变量，
+    因此可以高置信度地自动判定，适合纳入 enforce。
+
+    误报防范：内容**本来就被截断**（见 `_looks_truncated`）时直接跳过 ——
+    工具按上限截内容是正确的，不能当成损坏。
+    """
+    args = args or {}
+    if not result.success:
+        return None
+    data = _unwrap(result)
+    if data is None:
+        return None
+    content = data.get("content")
+    if not isinstance(content, str) or not content:
+        return None
+    if not _looks_like_json(content):
+        return None
+    if _looks_truncated(data, args, content):
+        return None
+
+    try:
+        json.loads(content)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return (
+            f"{function_name} 返回的内容看起来是 JSON 但无法解析"
+            f"（疑似被截断或损坏）：{exc}；长度 {len(content)} 字符"
+        )
+    return None
+
+
+def _digest(content: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+
+
+def check_read_consistency(
+        *,
+        filepath: Optional[str],
+        content: Optional[str],
+        known_writes: Dict[str, tuple],
+) -> Optional[str]:
+    """**审计级**校验：读回的内容与最近一次成功写入是否一致。
+
+    == 为什么这条只做审计、不纳入 enforce ==
+    它能抓到"读路径静默损坏"，但**有真实的误报风险**：
+    文件可能被 `shell_execute` 里的命令改过（sed/重定向），
+    或被另一个步骤改过 —— 这时读写不一致是**正常现象**。
+    拿它去 enforce 会造成假失败（把正确的工作判错）。
+
+    所以它只作为**审计信号**（进 trace 与报告），提醒人看一眼；
+    高置信度的那部分（JSON 结构）已经在 `check_postcondition_content` 里 enforce 了。
+    这正是"检测强度"的取舍点：要抓住真问题，但不能把正常行为当问题。
+    """
+    if not filepath or content is None:
+        return None
+    known = known_writes.get(filepath)
+    if not known:
+        return None
+    known_length, known_digest = known
+    if len(content) == known_length and _digest(content) == known_digest:
+        return None
+    return (
+        f"读回内容与最近一次成功写入不一致：写入 {known_length} 字符（sha1 {known_digest}）"
+        f"→ 读出 {len(content)} 字符（sha1 {_digest(content)}）。"
+        f"可能是读路径静默损坏，**也可能是文件被 shell 命令改过**（故只作审计信号）"
+    )
 
 
 def _unwrap(result: ToolResult) -> Optional[dict]:

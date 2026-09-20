@@ -319,3 +319,97 @@ async def test_escape_detection_reports_delta_not_existence(sandbox: LocalSandbo
     # 普通命令（不碰工作区外）不应该产生逃逸报告 —— 无论那个目录是否已被创建
     assert first.data.get("escaped_paths") == []
     assert second.data.get("escaped_paths") == []
+
+
+# ==================== 4. 子进程输出的解码与归一（噪声地板的主要来源）====================
+#
+# 这一组测试对应一个实测结论：噪声地板 ±29% 里，主导项是**单个任务**的 +118%，
+# 而那条 43 步的轨迹里有 10 步在追行尾（`od -c` / `tr -d '\r'` / `cmp`）。
+# 根因是子进程输出带 CRLF，且 cmd.exe 的错误信息是 GBK 而 Python 是 UTF-8。
+#
+# 目标环境（Ubuntu）不会有这两个现象，所以这里的测试同时是**保真性**测试：
+# "本地 fast mode 的输出看起来应当像 Ubuntu 的输出"。
+
+def test_output_normalises_crlf_to_lf():
+    """CRLF 必须归一成 LF —— 否则模型会去修一个由本地实现造出来的问题。"""
+    from lab.infra.local_sandbox import decode_command_output
+
+    assert decode_command_output(b"a\r\nb\r\n") == "a\nb\n"
+    assert decode_command_output(b"only\r\n") == "only\n"
+    assert decode_command_output(b"\r\n\r\n") == "\n\n"
+
+
+def test_output_preserves_in_line_carriage_return():
+    """行内的 `\r` 是进度条刷新（`\rProgress 50%`），有真实含义，不能一并删掉。"""
+    from lab.infra.local_sandbox import decode_command_output
+
+    assert decode_command_output(b"Progress 10%\rProgress 90%\ndone\n") == \
+        "Progress 10%\rProgress 90%\ndone\n"
+
+
+def test_output_decodes_utf8_first():
+    """Python 子进程的输出是 UTF-8（_build_child_env 固定的），必须原样读出中文。"""
+    from lab.infra.local_sandbox import decode_command_output
+
+    raw = "写入成功: /home/ubuntu/a.txt\n".encode("utf-8")
+    assert decode_command_output(raw) == "写入成功: /home/ubuntu/a.txt\n"
+
+
+def test_output_falls_back_to_oem_codepage_for_cmd_exe_errors():
+    """cmd.exe 的错误信息是 OEM 代码页（中文机器上是 GBK）—— 不能变成乱码进上下文。
+
+    实测原文就是这条：`'command' 不是内部或外部命令`。
+    """
+    from lab.infra.local_sandbox import decode_command_output
+
+    message = "'command' 不是内部或外部命令，也不是可运行的程序\r\n"
+    decoded = decode_command_output(message.encode("cp936"))
+    assert "不是内部或外部命令" in decoded
+    assert "\ufffd" not in decoded, "不该出现替换字符（那是乱码的标志）"
+    assert "\r" not in decoded
+
+
+def test_output_handles_mixed_encodings_in_one_stream():
+    """一次命令里同时有 Python(UTF-8) 与 cmd.exe(GBK) 输出 —— 逐行判定要各自正确。
+
+    这就是**不能整块猜编码**的原因：整块按 UTF-8 解会把 GBK 那行变成乱码，
+    整块按 GBK 解会把 UTF-8 那行变成乱码。
+    """
+    from lab.infra.local_sandbox import decode_command_output
+
+    raw = "中文输出正常\n".encode("utf-8") + "'foo' 不是内部或外部命令\r\n".encode("cp936")
+    decoded = decode_command_output(raw)
+    assert "中文输出正常" in decoded
+    assert "不是内部或外部命令" in decoded
+    assert "\ufffd" not in decoded
+
+
+@pytest.mark.asyncio
+async def test_real_command_output_has_no_crlf(sandbox: LocalSandbox):
+    """端到端：真的跑一条会输出多行的命令，返回给模型的内容不能带 `\r`。
+
+    这是"接线"测试 —— 解码函数写得再对，忘了在 exec_command 里调用就一点用没有。
+    """
+    result = await sandbox.exec_command(
+        "crlf1", "/home/ubuntu", f'"{sys.executable}" -c "print(1);print(2)"'
+    )
+
+    output = result.data["output"]
+    assert "\r" not in output, f"输出里仍有 \r: {output!r}"
+    assert output.strip().splitlines() == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_failed_command_error_text_is_readable(sandbox: LocalSandbox):
+    """命令不存在时的报错必须**可读**（不能是乱码）—— 乱码会误导模型。
+
+    注意：不同 shell 的报错文案不同（cmd.exe / bash），所以这里只断言
+    "没有替换字符"，不断言具体措辞 —— 断言文案会把测试绑死在 Windows 上。
+    """
+    result = await sandbox.exec_command(
+        "bad1", "/home/ubuntu", "this_command_definitely_does_not_exist_zzz"
+    )
+
+    output = result.data["output"]
+    assert "\ufffd" not in output, f"报错里有乱码: {output!r}"
+    assert "\r" not in output

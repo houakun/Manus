@@ -59,6 +59,21 @@ class VerifyCheck(BaseModel):
     # --- 数值比较 ---
     value: Optional[float] = None
     tolerance: float = 1e-6
+    # --- 执行型检查（kind=exec_script）---
+    # 一段**来自任务定义**的 Python 脚本；判定器把它写到沙箱里执行，检查退出码。
+    #
+    # 为什么需要这个原语（真实踩到的漏洞）：
+    # 文件读取型检查有一个绕不过去的弱点 —— 只要期望值是可推导的，
+    # 一个"直接写产物、不改代码"的解就能过关。实测确认过：
+    # 两个 ci 任务都能被"手写 out.json + 手写 diagnosis.json"绕过。
+    # 而"CI 失败归因"这类任务的核心恰恰是"你有没有真的把根因修好"，
+    # 光看产物根本区分不了"跑出来的"和"编出来的"。
+    #
+    # 关键区别：脚本内容存在**任务定义**里，不在工作区里 ——
+    # 所以 Agent 无法篡改它（对比：执行工作区的测试文件，Agent 可以先把它改弱）。
+    script: Optional[str] = None
+    script_cwd: Optional[str] = None  # 执行时的工作目录（逻辑路径），默认 /home/ubuntu
+    expect_exit: int = 0
     # --- 结构比较 ---
     rows: Optional[List[List[str]]] = None
     count: Optional[int] = None
@@ -90,6 +105,41 @@ class SolutionStep(BaseModel):
     command: Optional[str] = None
 
 
+class SelfCheck(BaseModel):
+    """"fixture 必须是真实的"这一条的自检规则。
+
+    == 为什么必须验证"CI 日志"本身（真实踩到的缺陷）==
+    `ci` 类任务把一份 CI 日志当作 Agent 的**主要输入**。
+    而"日志"是一个人写出来的文本 —— 它可能与代码的**实际行为不一致**。
+
+    实测踩到：`ci_window_boundary` 的日志写了
+        `test_page_zero_is_unaffected ... PASSED`
+    但那条 case 实际跑出来是 FAILED（off-by-one 同样会让第 0 页少一条）。
+    后果很隐蔽也很严重：**Agent 拿到的"现象"是假的**，
+    它要么被误导去改一个本来就没问题的东西，要么花大量步骤去调和一个矛盾。
+
+    为什么三次自检抓不到：`fixtures_only` / `reference_solution` / `wrong_solution`
+    跑的都是 `verify`，而日志只是一份 fixture —— **没有人执行过它**。
+    这和历史上那次事故是同一个形状：参考解"把期望值写出来"，
+    就不可能发现期望值本身写错（见 `_tautology_flags`）。
+
+    == 规则 ==
+    在"只铺 fixtures"的工作区里真跑一遍 `command`，然后：
+      1. 退出码必须等于 `expect_exit`；
+      2. 实际输出的**每一行**都必须出现在 `output_recorded_in` 那个文件里。
+
+    第 2 条用"包含"而不是"相等"：日志通常还有 `$ command` 头、时间戳、总结行等装饰，
+    要求逐字节相等会让任务作者为了过自检而删掉那些真实性细节。
+    而反向的"日志里的每一行都在实际输出里"**故意不做** ——
+    装饰行不应被判为造假。但关键结论行（PASSED/FAILED）两边对不上时，
+    实际输出的那一行一定进不了日志 → 第 2 条就会报。
+    """
+
+    command: str
+    output_recorded_in: str
+    expect_exit: int = 1
+
+
 class BenchTask(BaseModel):
     """一个评测任务。"""
 
@@ -102,9 +152,21 @@ class BenchTask(BaseModel):
     fixtures: List[Fixture] = Field(default_factory=list)
     verify: List[VerifyCheck] = Field(default_factory=list)
     process: ProcessRule = Field(default_factory=ProcessRule)
+    # 任务用途：capability = 探测能力边界（允许不稳定）；regression = 回归门禁用（要求稳定）。
+    #
+    # 为什么要这个（审计 §4.9）：semireal 大部分任务已经 100%（已饱和），
+    # 100% 的任务**提不了改进信号，只能追回归**；而少数不稳定任务（如
+    # `sem_markdown_toc` ~70%）会淹掉 A/B 实验里的小效应（实测：8.3pt 的差异
+    # 完全由它一个任务的 3 次运行决定）。两者必须分开看：
+    #   - regression 任务上的 pass^k 才是「回归门禁」的指标；
+    #   - capability 任务上的成功率是「能力边界」的描述，它的波动是发现，不是噪声。
+    purpose: str = "regression"
 
     solution: List[SolutionStep] = Field(default_factory=list)
     wrong: List[SolutionStep] = Field(default_factory=list)
+    # 可选的"fixture 真实性"自检（见 SelfCheck）。只对"输入是一份日志/报告"
+    # 这类任务有意义，所以是可选而不是必填。
+    selfcheck: Optional[SelfCheck] = None
 
     max_seconds: float = 300.0
     notes: str = ""
@@ -132,6 +194,23 @@ def load_all_tasks(group: Optional[str] = None) -> List[BenchTask]:
             continue
         tasks.append(task)
     return sorted(tasks, key=lambda t: (t.group, t.key))
+
+
+def task_purposes() -> Dict[str, str]:
+    """任务 uid → purpose（capability / regression）。
+
+    为什么放在这里而不是报告里：**报告与回归门禁都必须用同一个口径**。
+    两处各写一份的话，早晚会一个改了一个没改（而这类不一致恰恰是静默的）。
+    """
+    try:
+        return {task.uid: task.purpose for task in load_all_tasks()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def regression_uids() -> set:
+    """只属于 regression 的任务 uid 集合（回归口径的唯一真源）。"""
+    return {uid for uid, purpose in task_purposes().items() if purpose == "regression"}
 
 
 def summarize_tasks(tasks: List[BenchTask]) -> Dict[str, Any]:

@@ -193,6 +193,58 @@ async def _evaluate(task: BenchTask, workspace: Path, steps: Optional[List[Solut
     )
 
 
+async def _fixture_truth_problems(task: BenchTask, workspace: Path) -> List[str]:
+    """验证"任务里的那份日志/报告确实是真实产生的"。
+
+    见 `SelfCheck` 的 docstring：实测踩到过一份 CI 日志声称某个用例 PASSED，
+    而它实际是 FAILED —— 三次自检都抓不到，因为**没有人执行过那份日志**。
+    """
+    if task.selfcheck is None:
+        return []
+
+    rule = task.selfcheck
+    sandbox = LocalSandbox(workspace, exec_timeout=60)
+    await sandbox.ensure_sandbox()
+    await _apply_fixtures(sandbox, task.fixtures)
+
+    result = await sandbox.exec_command("selfcheck", "/home/ubuntu", rule.command)
+    data = result.data if isinstance(result.data, dict) else {}
+    returncode = data.get("returncode")
+    output = (data.get("output") or "")
+
+    problems: List[str] = []
+    if returncode != rule.expect_exit:
+        problems.append(
+            f"fixture 真实性：`{rule.command}` 期望退出码 {rule.expect_exit}，"
+            f"实际 {returncode}（CI 日志描述的现象与代码实际行为不符）"
+        )
+
+    recorded = await _read_fixture_text(sandbox, rule.output_recorded_in)
+    if recorded is None:
+        problems.append(f"fixture 真实性：找不到声明的日志文件 {rule.output_recorded_in}")
+        return problems
+
+    missing = [
+        line for line in (l.strip() for l in output.splitlines())
+        if line and line not in recorded
+    ]
+    if missing:
+        problems.append(
+            f"fixture 真实性：`{rule.command}` 的**实际输出**里有 {len(missing)} 行"
+            f"未出现在 {rule.output_recorded_in} 中：{missing[:4]}"
+            "（说明那份日志是编的，不是跑出来的）"
+        )
+    return problems
+
+
+async def _read_fixture_text(sandbox: LocalSandbox, path: str) -> Optional[str]:
+    result = await sandbox.read_file(path, max_length=1_000_000)
+    if not result.success:
+        return None
+    data = result.data if isinstance(result.data, dict) else {}
+    return data.get("content")
+
+
 async def validate_task(task: BenchTask, root: Path) -> TaskValidation:
     """三步自检一个任务。"""
     result = TaskValidation(uid=task.uid, title=task.title)
@@ -214,6 +266,12 @@ async def validate_task(task: BenchTask, root: Path) -> TaskValidation:
         result.steps.append(await _evaluate(task, base / "solution", task.solution, "reference_solution"))
     if task.wrong:
         result.steps.append(await _evaluate(task, base / "wrong", task.wrong, "wrong_solution"))
+
+    # 最后一次：任务里的那份"现象"（CI 日志等）是否真的是跑出来的。
+    # 放在最后是因为它会真的执行命令：把上面的纯文件检查先跑完，
+    # 即使这一条挂掉也能看到判定器本身是否正常。
+    if task.selfcheck is not None:
+        result.problems.extend(await _fixture_truth_problems(task, base / "truth"))
 
     return result
 

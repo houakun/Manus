@@ -134,8 +134,11 @@ class _FakeStore:
     def finalize_suite(self, suite) -> None:
         self.suites[suite.suite_id] = suite
 
-    def avg_cost_for_group(self, group: str):
-        """CLI 的预算预估会读它；没有历史时返回 None（走保守默认值）。"""
+    def avg_cost_for_group(self, group: str, *, faulted=None):
+        """CLI 的预算预估会读它；没有历史时返回 None（走保守默认值）。
+
+        注意签名要跟随真实实现 —— 少一个关键字参数就是 TypeError（踩过）。
+        """
         return None
 
     def load_runs_grouped_by_task(self, limit_per_task: int = 500):
@@ -185,3 +188,207 @@ def test_cli_sandbox_clean_reports_nothing_when_clean(monkeypatch):
 
     monkeypatch.setattr(sandbox_module, "escape_roots", lambda: [])
     assert main(["sandbox", "clean-escapes", "--yes"]) == 0
+
+
+def test_cli_bench_gate_passes_and_fails(tmp_path, monkeypatch):
+    """`bench gate` 必须用**退出码**表达结论（0 通过 / 1 失败）—— 这是 CI 门禁的全部意义。"""
+    from lab import api as lab_api
+    from lab.bench.runner import RunOutcome, SuiteResult, summarize_task
+    from lab.bench.task import load_all_tasks
+
+    task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
+
+    def _suite(suite_id, ok_count):
+        outcomes = [
+            RunOutcome(run_id=f"{suite_id}-{i}", suite_id=suite_id, task_uid=task.uid,
+                       task_key=task.key, group=task.group, run_index=i, ok=(i < ok_count),
+                       tokens=1000, cost_usd=0.001, elapsed_ms=5000, tool_calls=3, steps_done=1)
+            for i in range(10)
+        ]
+        return SuiteResult(suite_id=suite_id, label=suite_id, outcomes=outcomes,
+                           task_summaries=[summarize_task(task, outcomes)])
+
+    store = _FakeStore()
+    store.save_suite(_suite("base-ok", 10))  # 基准：10/10
+    store.save_suite(_suite("cand-good", 10))  # 候选：同样 10/10 → 应通过
+    store.save_suite(_suite("cand-bad", 5))  # 候选：5/10 → 成功率掉 50pt → 应失败
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
+
+    assert main(["bench", "gate", "--baseline", "base-ok", "--candidate", "cand-good"]) == 0
+    assert main(["bench", "gate", "--baseline", "base-ok", "--candidate", "cand-bad"]) == 1
+
+
+def test_cli_bench_gate_refuses_tiny_candidate(tmp_path, monkeypatch):
+    """候选样本太小时拒绝判定 —— 否则 CI 会被噪声反复弄红。"""
+    from lab import api as lab_api
+    from lab.bench.runner import RunOutcome, SuiteResult, summarize_task
+    from lab.bench.task import load_all_tasks
+
+    task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
+
+    def _suite(suite_id, n):
+        outcomes = [
+            RunOutcome(run_id=f"{suite_id}-{i}", suite_id=suite_id, task_uid=task.uid,
+                       task_key=task.key, group=task.group, run_index=i, ok=True,
+                       tokens=1000, cost_usd=0.001, elapsed_ms=5000, tool_calls=3, steps_done=1)
+            for i in range(n)
+        ]
+        return SuiteResult(suite_id=suite_id, label=suite_id, outcomes=outcomes,
+                           task_summaries=[summarize_task(task, outcomes)])
+
+    store = _FakeStore()
+    store.save_suite(_suite("base-ok", 20))
+    store.save_suite(_suite("tiny", 2))
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
+
+    assert main(["bench", "gate", "--baseline", "base-ok", "--candidate", "tiny", "--min-runs", "10"]) == 2
+
+
+def test_cli_bench_run_accepts_new_replay_and_ab_arguments():
+    """新增的录制回放 / 交错 A/B 参数都必须**编译通过并被解析出来**。
+
+    沿用小节上一条测试的教训：子命令用了 `args.X` 而没在**该子命令**上声明，
+    是"静态看不出来、跑到才炸"的那种 bug。
+    """
+    from lab.cli import build_parser
+
+    args = build_parser().parse_args([
+        "bench", "run", "--runs", "2", "--yes",
+        "--ab-guard", "none", "--ab-guard", "retry,postcondition",
+        "--ab-label", "无加固", "--ab-label", "加固",
+        "--replay", "record", "--replay-cache", "x.db",
+        "--replay-ignore-volatile",
+    ])
+
+    assert args.ab_guard == ["none", "retry,postcondition"]
+    assert args.ab_label == ["无加固", "加固"]
+    assert args.replay == "record" and args.replay_cache == "x.db"
+    assert args.replay_ignore_volatile is True
+    assert args.no_interleave is False
+
+    noise = build_parser().parse_args([
+        "bench", "noise-floor", "--runs", "3", "--replay", "replay",
+        "--replay-cache", "y.db", "--replay-ignore-volatile", "--yes",
+    ])
+    for name in ("runs", "purpose", "label_a", "label_b", "file", "yes",
+                 "replay", "replay_cache", "replay_ignore_volatile", "guard"):
+        assert hasattr(noise, name), f"bench noise-floor 缺少参数 {name}"
+
+    compare = build_parser().parse_args(
+        ["bench", "compare", "abc123", "--arm", "A", "--arm", "B"]
+    )
+    assert compare.arm == ["A", "B"] and compare.candidate is None
+
+    gate = build_parser().parse_args(["bench", "gate", "--baseline", "x"])
+    assert gate.noise_floor == "auto" and gate.auto_thresholds is False
+
+
+def test_cli_replay_stats_without_cache(tmp_path, monkeypatch):
+    """缓存库不存在时给可操作的提示（告诉用户怎么产生它），退出码非 0。"""
+    monkeypatch.setenv("LAB_LLM_CACHE", str(tmp_path / "nope.db"))
+    assert main(["replay", "stats"]) == 2
+
+
+def test_cli_replay_stats_reports_nondeterminism(tmp_path, monkeypatch):
+    """`replay stats` 的核心产出是**服务端非确定性**比例。"""
+    import asyncio
+
+    from lab.replay.cache import LLMCache
+    from lab.replay.llm import CachedLLM, ReplayMode
+    from lab.tests.fakes import ScriptedLLM, content
+
+    cache_path = tmp_path / "cache.db"
+    cache = LLMCache(cache_path)
+    # 同一个请求、两次不同的回答 → 应该被统计成非确定性
+    llm = CachedLLM(ScriptedLLM([content("a"), content("b")]), cache, mode=ReplayMode.RECORD)
+    asyncio.run(llm.invoke([{"role": "user", "content": "q"}]))
+    asyncio.run(llm.invoke([{"role": "user", "content": "q"}]))
+
+    monkeypatch.setenv("LAB_LLM_CACHE", str(cache_path))
+    assert main(["replay", "stats"]) == 0
+    assert main(["replay", "stats", "--json"]) == 0
+
+
+def test_cli_bench_noise_floor_writes_file(tmp_path, monkeypatch):
+    """`bench noise-floor` 必须把测出来的地板写盘（`bench gate` 会自动读它）。"""
+    from lab import api as lab_api
+    from lab.bench.noise import load_noise_floor
+
+    monkeypatch.setattr("lab.bench.runner.run_suite", lambda **kwargs: _async(_two_arm_suite()))
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: _FakeStore())
+    monkeypatch.setattr("lab.cli.ensure_runs_dir", lambda: tmp_path)
+
+    target = tmp_path / "floor.json"
+    # --purpose all：本用例测的是"写盘 + 链路"，而假的 suite 里只有 1 个任务，
+    # 默认的 regression 口径会把另外 1 个任务也纳入 → 口径与数据不匹配。
+    # 口径过滤本身另有专门用例（见 test_noise_floor_filters_non_regression_tasks）。
+    code = main(["bench", "noise-floor", "--runs", "1", "--limit", "2",
+                 "--purpose", "all", "--file", str(target), "--yes"])
+
+    assert code == 0
+    floor = load_noise_floor(target)
+    assert floor is not None and floor.arms == ["noise-a", "noise-b"]
+    assert floor.interleaved is True
+
+
+def test_cli_bench_compare_splits_arms_by_flag(tmp_path, monkeypatch):
+    """`compare <suite> --arm A --arm B` 要能从**一个**交错 suite 里拆臂对比。"""
+    from lab import api as lab_api
+
+    suite = _two_arm_suite()
+    store = _FakeStore()
+    store.save_suite(suite)
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
+
+    assert main(["bench", "compare", suite.suite_id[:8],
+                 "--arm", "noise-a", "--arm", "noise-b"]) == 0
+    # 臂名写错 → 必须报错，而不是安静地拆出空集
+    assert main(["bench", "compare", suite.suite_id[:8],
+                 "--arm", "noise-a", "--arm", "typo"]) == 2
+
+
+def _two_arm_suite():
+    """两个同配置臂交错跑出来的最小 suite（不调模型）。"""
+    from lab.bench.runner import ArmConfig, RunOutcome, SuiteResult, summarize_task
+
+    task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
+    outcomes = []
+    for index in range(1):
+        for arm_label in ("noise-a", "noise-b"):
+            outcomes.append(RunOutcome(
+                run_id=f"{arm_label}-{index}", suite_id="s-noise", task_uid=task.uid,
+                task_key=task.key, group=task.group, run_index=index, ok=True,
+                tokens=1000, cost_usd=0.001, elapsed_ms=5000, tool_calls=3, steps_done=1,
+                arm=arm_label,
+            ))
+    return SuiteResult(
+        suite_id="s-noise", label="噪声地板", model_name="fake", runs_per_task=1,
+        arms=[ArmConfig(label="noise-a").to_metadata(), ArmConfig(label="noise-b").to_metadata()],
+        interleaved=True, outcomes=outcomes,
+        task_summaries=[summarize_task(task, outcomes)],
+    )
+
+
+def test_cli_bench_run_accepts_every_referenced_fault_argument():
+    """子命令的每个被代码引用的参数都必须在**该子命令**上声明。
+
+    实测踩过两次同类 bug：
+      1. `bench run` 的主体用了 `ensure_runs_dir` 但没 import；
+      2. `bench run` 引用了 `args.fault_latency`，而 `--fault-latency`
+         只声明在顶层 `run` 上 → 只有真跑到那条分支才炸。
+    这类 bug 的共同点是"静态看不出来、跑到才炸"，所以用一条
+    **把参数全传一遍**的解析测试来兜住。
+    """
+    from lab.cli import build_parser
+
+    args = build_parser().parse_args([
+        "bench", "run", "--runs", "1", "--guard", "none",
+        "--fault", "latency_spike", "--fault-tool", "shell_*",
+        "--fault-rate", "0.5", "--fault-latency", "0.01",
+        "--budget-mode", "observe", "--concurrency", "1", "--yes",
+    ])
+
+    # 这些属性都被 _cmd_bench_run 引用过，少一个就会 AttributeError
+    for name in ("guard", "fault", "fault_tool", "fault_rate", "fault_latency",
+                 "budget_mode", "budget_defaults", "concurrency", "runs", "yes", "limit", "task"):
+        assert hasattr(args, name), f"bench run 缺少参数 {name}，而代码里会引用它"

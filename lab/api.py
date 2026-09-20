@@ -20,7 +20,7 @@ import asyncio
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from lab.bootstrap import ensure_runs_dir, ensure_sut_on_path
 
@@ -32,10 +32,19 @@ from lab.config import load_agent_config, load_llm_config  # noqa: E402
 from lab.faults.injector import FaultInjector  # noqa: E402
 from lab.faults.kinds import FaultKind, FaultRule  # noqa: E402
 from lab.guard.budget import Budget, BudgetPolicy  # noqa: E402
+from lab.guard.config import GuardConfig  # noqa: E402
 from lab.infra.counting_llm import CountingLLM  # noqa: E402
 from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
 from lab.infra.nulls import NullBrowser, NullSearchEngine  # noqa: E402
 from lab.middleware import ToolGuard  # noqa: E402
+from lab.replay.cache import LLMCache  # noqa: E402
+from lab.replay.llm import (  # noqa: E402
+    CachedLLM,
+    ReplayMode,
+    resolve_cache_path,
+    resolve_ignore_volatile,
+    resolve_mode,
+)
 from lab.sut.base import TaskResult  # noqa: E402
 from lab.sut.manus_adapter import ManusSUT  # noqa: E402
 from lab.trace.span import TraceRecorder  # noqa: E402
@@ -102,6 +111,10 @@ async def run_task(
         fault_rules: Optional[List[FaultRule]] = None,
         budget_policy: Optional[BudgetPolicy] = None,
         watch_literals: Optional[List[str]] = None,
+        guard_config: Optional[GuardConfig] = None,
+        replay: Optional[str] = None,
+        replay_cache: Optional[Path] = None,
+        replay_ignore_volatile: Optional[bool] = None,
 ) -> TaskResult:
     """跑一个任务，返回标准化结果。
 
@@ -118,19 +131,39 @@ async def run_task(
     :param fault_rules: 故障注入规则（None = 不注入，即 baseline）
     :param budget_policy: 预算策略（None = 用环境变量/默认值，默认 observe 模式不干预）
     :param watch_literals: 需要盯的"答案字面量"（bench 层用来检测硬编码作弊）
+    :param guard_config: 加固开关（None = 全部开启）。传 `GuardConfig.from_spec("none")`
+        可关掉加固，用来做"无加固 vs 加固"对照实验。
+    :param replay: LLM 录制回放模式（`off` / `record` / `reuse` / `replay`）。
+        None 时读 `LAB_LLM_REPLAY`。**`replay` 模式不需要 API Key、不联网**，
+        未命中缓存即失败 —— 这是"离线复现一次失败"的入口。
+    :param replay_cache: 缓存库路径（None 时读 `LAB_LLM_CACHE` 或 lab/runs/llm_cache.db）。
+    :param replay_ignore_volatile: 算键前是否抹平 UUID / 时间戳。
+        某些 SUT 会把随机计划 id 放进提示词（实测本项目的 SUT 就是这样），
+        不抹平则严格回放**永远未命中**。默认 False（精确优先）；
+        先看未命中诊断（`stats.miss_diagnosis`）确认"确实只是 UUID"，再打开它。
     """
     # 1.准备配置（唯一真源是 SUT 的 config.yaml，环境变量可覆盖）
     llm_config = load_llm_config(temperature=temperature)
     agent_config = load_agent_config(max_iterations=max_iterations)
+    replay_mode = resolve_mode(replay)
 
     # 2.预检：API Key 缺失是最常见的"跑不起来"原因，提前给出可操作的报错，
     #   而不是让 openai SDK 在深处抛一个含糊的 AuthenticationError。
-    if not llm_config.api_key:
+    #
+    #   ⚠️ 严格回放（replay）是例外：它一次网络调用都不会发生，
+    #   所以**不该要求 Key** —— 否则"没 Key 也能离线复现"这个最有价值的用法
+    #   （例如在 CI 里跑回归）会直接因为预检而失效。
+    if not llm_config.api_key and replay_mode.needs_network:
         raise LabConfigError(
             "未配置 LLM API Key。请任选一种方式：\n"
             "  1) 在 api/config.yaml 的 llm_config.api_key 中填写；\n"
-            "  2) 设置环境变量 LAB_LLM_API_KEY（推荐，避免 key 进仓库）。"
+            "  2) 设置环境变量 LAB_LLM_API_KEY（推荐，避免 key 进仓库）。\n"
+            "  3) 若只是想离线复现已录制过的运行：--replay replay（不需要 Key）。"
         )
+    if not llm_config.api_key:
+        # OpenAI SDK 不允许空 key；回放模式下这个客户端永远不会被调用，
+        # 所以填一个占位符而不是让构造直接抛异常。
+        llm_config = llm_config.model_copy(update={"api_key": "offline-replay-no-key"})
 
     # 3.准备任务工作区（一个任务一个目录，评测之间天然隔离）
     task_id = str(uuid.uuid4())
@@ -161,12 +194,26 @@ async def run_task(
     guard = ToolGuard(
         recorder=recorder, budget=budget, injector=injector, sandbox=sandbox,
         watch_literals=watch_literals,
+        config=guard_config or GuardConfig.from_env(),
     )
 
     # 4.2 LLM 代理：采集用量 + **每次 LLM 调用后**触发预算检查。
     #     为什么要在 LLM 调用后也查：token/成本是在 LLM 调用时涨的，
     #     只在工具调用前查会漏掉"不停思考、不调工具"的失控路径。
-    llm = CountingLLM(OpenAILLM(llm_config), usage, sink=recorder, after_call=guard.check_budget)
+    #
+    #     回放的位置很关键：CachedLLM 在**最内层**，只替换"网络调用"这一步。
+    #     CountingLLM 依旧在最外层 → token/成本/span 的采集口径完全不变。
+    cached_llm: Optional[CachedLLM] = None
+    base_llm: Any = OpenAILLM(llm_config)
+    if replay_mode is not ReplayMode.OFF:
+        cached_llm = CachedLLM(
+            base_llm,
+            LLMCache(resolve_cache_path(replay_cache)),
+            mode=replay_mode,
+            ignore_volatile=resolve_ignore_volatile(replay_ignore_volatile),
+        )
+        base_llm = cached_llm
+    llm = CountingLLM(base_llm, usage, sink=recorder, after_call=guard.check_budget)
 
     sut = ManusSUT(
         llm=llm,
@@ -218,6 +265,33 @@ async def run_task(
             )
         result.cost_usd = usage.cost_usd(llm_config.model_name)
         result.elapsed_ms = max(result.elapsed_ms, int((time.monotonic() - started_at) * 1000))
+
+        # 回放统计必须无条件落进结果 —— 包括**失败**路径。
+        # 一条"失败了"的运行如果没有回放统计，事后就无法区分
+        # "SUT 真的做错了" 与 "缓存没录全，其实是回放未命中"。
+        if cached_llm is not None:
+            snapshot = cached_llm.finalize()
+            # 实际消费只有非回放模式才有意义；回放模式恒为 0（一次网络调用都没发生）
+            if replay_mode.needs_network:
+                snapshot.actual_spend_usd = result.cost_usd
+            result.replay = snapshot.model_dump(mode="json")
+            if replay_mode is ReplayMode.REPLAY and snapshot.misses:
+                # 根因是"缓存里没有这次请求"，而不是 SUT 报出来的下游症状（llm_error）。
+                # 与 error_chain 的理念一致：把根因提到 error_type，别让人追错方向。
+                result.error_chain.append(
+                    f"replay_miss: 严格回放有 {snapshot.misses} 次未命中缓存"
+                )
+                # 未命中诊断（人话）进 error_chain：它能把"缓存里没有"变成
+                # "第 3 条消息里的 UUID 不一样"，否则人会去怀疑自己刚改的那行代码。
+                for line in (snapshot.miss_diagnosis or [])[:3]:
+                    result.error_chain.append(f"replay_miss 诊断: {line}")
+                if not result.ok:
+                    result.error_type = "replay_miss"
+                    diagnosis = (snapshot.miss_diagnosis or [""])[0]
+                    result.error = (
+                        f"严格回放未命中缓存（{snapshot.misses} 次）—— 本次运行的请求集合"
+                        f"与录制时不同。{diagnosis}\n原因：{result.error}"
+                    )
 
         # 轨迹落盘放在 finally 的最外层：崩溃/超时路径的 trace 才是最需要留下的证据
         if recorder is not None and recorder.spans:

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,13 +36,19 @@ from lab.usage import Usage
 
 
 def _workspace_layout(bench_root: Path, group: Optional[str] = None) -> List[tuple]:
-    """扫描 bench_root 下所有"已完成的工作区"，返回 (task_uid, run_index, workspace)。
+    """扫描 bench_root 下所有"已完成的工作区"，返回 (task_uid, run_index, arm, workspace)。
 
     group 过滤不是可选项而是必需：bench_root 下同时存着多个分组的产物
     （实测踩过：重建"semireal n=5"时把之前跑过的 synthetic 工作区也扫了进去，
     结果数字里混进 4 次不属于本次评测的运行）。
+
+    目录名有两种形态：`run3`（单臂）与 `run3-guard-none`（交错多臂）。
+    后者不能靠 `int(name.replace("run", ""))` 解析 —— 那会抛 ValueError，
+    而旧代码是 `continue` **静默跳过**：恢复出来的评测会少掉整条臂的样本，
+    却看不出任何异常。所以这里用正则，并把臂名一并带出来。
     """
     found: List[tuple] = []
+    pattern = re.compile(r"^run(\d+)(?:-(.+))?$")
     for workspace in sorted(bench_root.glob("*/*/run*/workspace")):
         if not workspace.is_dir():
             continue
@@ -49,12 +56,13 @@ def _workspace_layout(bench_root: Path, group: Optional[str] = None) -> List[tup
         if group and group_name != group:
             continue
         key = workspace.parents[1].name
-        run_dir = workspace.parent.name  # run0 / run1 ...
-        try:
-            run_index = int(run_dir.replace("run", ""))
-        except ValueError:
+        run_dir = workspace.parent.name  # run0 / run1 / run2-guard-none ...
+        match = pattern.match(run_dir)
+        if match is None:
             continue
-        found.append((f"{group_name}/{key}", run_index, workspace))
+        run_index = int(match.group(1))
+        arm = match.group(2) or ""
+        found.append((f"{group_name}/{key}", run_index, arm, workspace))
     return found
 
 
@@ -125,7 +133,7 @@ async def recover_suite(
     outcomes: List[RunOutcome] = []
     skipped: List[str] = []
 
-    for task_uid, run_index, workspace in _workspace_layout(bench_root, group=group):
+    for task_uid, run_index, arm, workspace in _workspace_layout(bench_root, group=group):
         task = tasks_by_uid.get(task_uid)
         if task is None:
             skipped.append(f"{task_uid}（任务已从任务集中移除）")
@@ -149,7 +157,8 @@ async def recover_suite(
         guard = result.guard or {}
 
         outcomes.append(RunOutcome(
-            run_id=f"recovered-{task_uid.replace('/', '-')}-run{run_index}",
+            run_id=f"recovered-{task_uid.replace('/', '-')}-run{run_index}"
+                   + (f"-{arm}" if arm else ""),
             suite_id=suite_id,
             task_uid=task_uid,
             task_key=task.key,
@@ -176,6 +185,9 @@ async def recover_suite(
             postcondition_warnings=int(row.get("postcondition_warnings") or 0),
             faults_injected=int(row.get("faults_injected") or 0),
             workspace=str(workspace),
+            # 臂名从**目录名**恢复（它已被规范化成 slug）。
+            # `for_arm()` 两边都过同一个 slug 函数，所以按原始 label 也能筛到。
+            arm=arm,
         ))
 
     suite = SuiteResult(

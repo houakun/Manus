@@ -11,12 +11,14 @@
 """
 
 from lab.guard.budget import Budget, BudgetMode, BudgetPolicy, BudgetReport, BudgetViolation
+from lab.guard.config import GuardConfig
 from lab.guard.loop_guard import LoopGuard, RepeatHit
 from lab.guard.postcondition import check_postcondition
 from lab.guard.retry import IDEMPOTENT_TOOLS, NON_IDEMPOTENT_TOOLS, RetryDecision, compute_backoff, decide_retry, is_idempotent
 
 __all__ = [
     "Budget", "BudgetMode", "BudgetPolicy", "BudgetReport", "BudgetViolation",
+    "GuardConfig",
     "LoopGuard", "RepeatHit",
     "check_postcondition",
     "RetryDecision", "compute_backoff", "decide_retry", "is_idempotent",

@@ -234,3 +234,48 @@ def test_budget_observation_is_recorded_in_outcomes(tmp_path, monkeypatch, no_sl
     assert stats["violated_runs"] == 1
     assert stats["would_stop_runs"] == 0  # 但没碰硬上限 → enforce 下不会被砍
     assert stats["by_metric"] == {"tokens": 1}
+
+
+def test_guard_config_is_recorded_in_outcome(tmp_path, monkeypatch, no_sleep):
+    """加固配置必须一路透传到落库字段 —— 否则两组数据无法区分是谁的。
+
+    这是 step6-gap-audit §2.1 第 2 条：没有 `guard_config` 字段，
+    "无加固 vs 加固"的数据落库后混在一起，报告里也就无法归因。
+    """
+    from lab.bench.runner import run_suite as real_run_suite
+    from lab.guard.config import GuardConfig
+
+    script = planner_react_script(
+        tool_name="write_file",
+        tool_args={"filepath": "/home/ubuntu/sum.txt", "content": "500500"},
+        final_message="done",
+    )
+    _wire_fake_llm(monkeypatch, tmp_path, script)
+
+    suite = asyncio.run(real_run_suite(
+        runs_per_task=1, keys=["syn_sum_range"], bench_root=tmp_path / "bench",
+        progress=False, guard_config=GuardConfig.from_spec("none"),
+    ))
+
+    assert suite.outcomes[0].guard_config == "none"
+    # 配置也要进 suite 备注（报告里会渲染出来）
+    assert any("加固配置" in note for note in suite.notes)
+
+
+def test_guard_none_produces_no_postcondition_warnings(tmp_path, monkeypatch, no_sleep):
+    """关掉加固后，后置校验告警应当为 0（它是被关掉的那个能力）。"""
+    from lab.bench.runner import run_suite as real_run_suite
+    from lab.guard.config import GuardConfig
+
+    script = planner_react_script(
+        tool_name="write_file",
+        tool_args={"filepath": "/home/ubuntu/sum.txt", "content": "500500"},
+        final_message="done",
+    )
+    _wire_fake_llm(monkeypatch, tmp_path, script)
+
+    suite = asyncio.run(real_run_suite(
+        runs_per_task=1, keys=["syn_sum_range"], bench_root=tmp_path / "bench",
+        progress=False, guard_config=GuardConfig.from_spec("none"),
+    ))
+    assert suite.outcomes[0].postcondition_warnings == 0

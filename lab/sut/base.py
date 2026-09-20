@@ -72,6 +72,10 @@ class TaskResult(BaseModel):
     # 用 dict 而不是一堆具名字段：这一步的观察项还会变（Step 4 会加置信区间相关项），
     # 每次都改 TaskResult 的字段会让所有构造点都要跟着改。
     guard: Dict[str, Any] = Field(default_factory=dict)
+    # LLM 录制回放统计（Step 6）：模式 / 命中 / 未命中 / 冲突 / **等价成本**。
+    # 为什么必须有它：回放运行时 `cost_usd` 是**等价量**（"这次回放等价于花了多少钱"），
+    # 不是实际消费。两者混在一起会让报告里的成本被读成"这次真的花了这么多"。
+    replay: Dict[str, Any] = Field(default_factory=dict)
 
     def summary_line(self) -> str:
         """一行摘要，用于 CLI 输出与 CI 日志。"""

@@ -664,3 +664,293 @@ async def test_delay_injection_actually_waits():
     elapsed = asyncio.get_event_loop().time() - started
 
     assert elapsed >= 0.15
+
+
+# ==================== 7. 加固开关（Step 6：对照实验的前提） ====================
+
+def test_guard_config_parsing():
+    """spec 解析：all / none / 显式能力名；未知名字必须报错而不是静默忽略。"""
+    from lab.guard.config import GuardConfig
+
+    assert GuardConfig.from_spec("all").label == "all"
+    assert GuardConfig.from_spec(None).label == "all"
+
+    none = GuardConfig.from_spec("none")
+    assert none.label == "none"
+    assert not any([none.retry, none.postconditions, none.loop_guard, none.budget])
+
+    # 显式列出 = **只开这些**（其余关闭），这样对照实验才可预测
+    only_retry = GuardConfig.from_spec("retry")
+    assert only_retry.retry is True
+    assert only_retry.postconditions is False
+
+    # 别名
+    assert GuardConfig.from_spec("check").postconditions is True
+    assert GuardConfig.from_spec("retry,postcondition").label == "retry+postconditions"
+
+    with pytest.raises(ValueError, match="未知的加固能力"):
+        GuardConfig.from_spec("retry,bogus")
+
+
+async def test_guard_switch_actually_disables_retry():
+    """开关必须真的改变行为 —— 否则对照实验是假的。
+
+    注入 `transient_error`（幂等工具）：guard=all 会重试，guard=none 不会。
+    """
+    from lab.guard.config import GuardConfig
+    from lab.middleware import ToolGuard
+
+    def _injector():
+        return FaultInjector([FaultRule(kind=FaultKind.TRANSIENT_ERROR, tool="read_file", fail_times=1)])
+
+    with_guard = ToolGuard(injector=_injector(), config=GuardConfig.from_spec("all"))
+    result_all = await with_guard.call_tool(FakeTool(), "read_file", {})
+    assert result_all.attempts == 2  # 重试补上了第一次的失败
+    assert result_all.success is True
+
+    without_guard = ToolGuard(injector=_injector(), config=GuardConfig.from_spec("none"))
+    result_none = await without_guard.call_tool(FakeTool(), "read_file", {})
+    assert result_none.attempts == 1  # 不重试
+    assert result_none.success is False
+
+
+async def test_guard_switch_actually_disables_postconditions(tmp_path):
+    """关掉后置校验 → **静默失败就没人抓**。
+
+    这正是 A/B 实验要展示的东西：加固的价值在"静默失败"上，
+    没有它，`partial_write` 这种只写了一半的写入会被当成成功。
+    """
+    from lab.guard.config import GuardConfig
+    from lab.middleware import ToolGuard
+
+    class WriteFileTool(BaseTool):
+        name: str = "file"
+
+        def __init__(self, sandbox) -> None:
+            super().__init__()
+            self.sandbox = sandbox
+
+        def get_tools(self):
+            return []
+
+        def has_tool(self, tool_name: str) -> bool:
+            return tool_name == "write_file"
+
+        async def invoke(self, tool_name: str, **kwargs):
+            return await self.sandbox.write_file(kwargs["filepath"], kwargs["content"])
+
+    def _injector():
+        return FaultInjector([FaultRule(kind=FaultKind.PARTIAL_WRITE, tool="write_file")])
+
+    args = {"filepath": "/home/ubuntu/a.txt", "content": "x" * 100}
+
+    sandbox_all = LocalSandbox(tmp_path / "with")
+    guard_all = ToolGuard(injector=_injector(), sandbox=sandbox_all, config=GuardConfig.from_spec("all"))
+    result_all = await guard_all.call_tool(WriteFileTool(sandbox_all), "write_file", args)
+    assert result_all.success is True  # 工具自己说成功（静默失败）
+    assert guard_all.postcondition_warnings  # 但后置校验抓到了
+
+    sandbox_none = LocalSandbox(tmp_path / "without")
+    guard_none = ToolGuard(injector=_injector(), sandbox=sandbox_none, config=GuardConfig.from_spec("none"))
+    result_none = await guard_none.call_tool(WriteFileTool(sandbox_none), "write_file", args)
+    assert result_none.success is True  # 同样"成功"
+    assert not guard_none.postcondition_warnings  # 但关掉校验后**没有任何人发现**
+
+    # 两次写入都真的只写了一半（故障是真的发生的）
+    assert (tmp_path / "with" / "home" / "ubuntu" / "a.txt").read_text() == "x" * 50
+    assert (tmp_path / "without" / "home" / "ubuntu" / "a.txt").read_text() == "x" * 50
+
+
+async def test_guard_config_is_recorded_for_attribution():
+    """加固配置必须进报告 —— 没有它，两组数据落库后无法区分是谁的。"""
+    from lab.guard.config import GuardConfig
+    from lab.middleware import ToolGuard
+
+    guard = ToolGuard(config=GuardConfig.from_spec("retry"))
+    await guard.call_tool(FakeTool(), "read_file", {})
+
+    report = guard.report()
+    assert report["config"] == "retry"  # 标签进报告
+    assert report["features"]["retry"] is True
+    assert report["features"]["postconditions"] is False
+
+
+async def test_postcondition_enforce_feedback_closes_the_self_healing_loop(tmp_path):
+    """`enforce` 把「校验发现的问题」变成**对 LLM 可见的失败**。
+
+    默认（observe）下，后置校验只记一条告警，而那个 ToolResult 仍以
+    `success=True` 返回给模型 —— 模型于是继续在错误的事实上推理。
+    `enforce=True` 才是「检测 → 回灌 → 自愈」的闭环。
+    """
+    from lab.guard.config import GuardConfig
+    from lab.middleware import ToolGuard
+
+    class WriteFileTool(BaseTool):
+        name: str = "file"
+
+        def __init__(self, sandbox) -> None:
+            super().__init__()
+            self.sandbox = sandbox
+
+        def get_tools(self):
+            return []
+
+        def has_tool(self, tool_name: str) -> bool:
+            return tool_name == "write_file"
+
+        async def invoke(self, tool_name: str, **kwargs):
+            return await self.sandbox.write_file(kwargs["filepath"], kwargs["content"])
+
+    def _injector():
+        return FaultInjector([FaultRule(kind=FaultKind.PARTIAL_WRITE, tool="write_file")])
+
+    args = {"filepath": "/home/ubuntu/a.txt", "content": "x" * 100}
+
+    # observe（默认）：只有告警，结果仍然"成功" → 模型看不到问题
+    sandbox_observe = LocalSandbox(tmp_path / "observe")
+    guard_observe = ToolGuard(injector=_injector(), sandbox=sandbox_observe,
+                              config=GuardConfig.from_spec("retry,postcondition"))
+    result_observe = await guard_observe.call_tool(WriteFileTool(sandbox_observe), "write_file", args)
+    assert result_observe.success is True  # ← 静默失败：模型以为成功了
+    assert guard_observe.postcondition_warnings
+
+    # enforce：结果变成失败，且告警文本进 message → 模型能自己纠正
+    sandbox_enforce = LocalSandbox(tmp_path / "enforce")
+    guard_enforce = ToolGuard(injector=_injector(), sandbox=sandbox_enforce,
+                              config=GuardConfig.from_spec("retry,postcondition,enforce"))
+    result_enforce = await guard_enforce.call_tool(WriteFileTool(sandbox_enforce), "write_file", args)
+    assert result_enforce.success is False
+    assert result_enforce.error_type == "postcondition_failed"
+    assert "不一致" in (result_enforce.message or "")  # 具体原因回灌给模型
+    assert result_enforce.retryable is False  # 是否重试交给模型判断
+
+
+# ==================== 8. 读路径检测面（唯一"Agent 无法自证"的故障类） ====================
+
+def _result(content=None, **data):
+    from app.domain.models.tool_result import ToolResult
+
+    payload = {"filepath": data.pop("filepath", "/home/ubuntu/a.json")}
+    if content is not None:
+        payload["content"] = content
+    payload.update(data)
+    return ToolResult(success=True, message="ok", data=payload)
+
+
+def test_content_check_catches_broken_json_on_read_path():
+    """读路径的静默损坏：Agent 拿回半截 JSON 也会直接用 —— 只有内容级校验能发现。
+
+    这是**唯一一类 Agent 自身无法发现**的故障：它没有外部真相可比，
+    所以必须由独立的一层来做结构合法性判定（而 JSON 能不能解析是客观不变量）。
+    """
+    from lab.guard.postcondition import check_postcondition_content
+
+    broken = _result('{"items": [1, 2, 3')  # 被截断的 JSON
+    warning = check_postcondition_content(function_name="read_file", args={}, result=broken)
+    assert warning and "无法解析" in warning and "截断" in warning
+
+    healthy = _result('{"items": [1, 2, 3]}')
+    assert check_postcondition_content(function_name="read_file", args={}, result=healthy) is None
+
+    # 非 JSON 内容不该被这条规则碰（避免把普通文本误判）
+    plain = _result("这是一段普通文本，不是 JSON")
+    assert check_postcondition_content(function_name="read_file", args={}, result=plain) is None
+
+
+def test_content_check_skips_legitimately_truncated_content():
+    """误报防范：工具**按上限截内容**是正确行为，不能当成损坏。
+
+    `read_file` 默认只读 10000 字符；一个 50KB 的 JSON 读回来就是半截，
+    直接做 JSON 解析必然失败。不区分就会制造大量假告警 ——
+    而**假告警会让真告警失效**（和之前那次 98 次噪声告警同一个教训）。
+    """
+    from lab.guard.postcondition import check_postcondition_content
+
+    half_json = '{"items": [' + "1," * 50
+    # 1.工具自己标了 truncated
+    assert check_postcondition_content(
+        function_name="read_file", args={}, result=_result(half_json, truncated=True)) is None
+    # 2.内容长度正好等于请求的 max_length → 强提示是被上限截的
+    assert check_postcondition_content(
+        function_name="read_file", args={"max_length": len(half_json)},
+        result=_result(half_json)) is None
+
+
+async def test_read_consistency_is_audit_only_never_enforced(tmp_path):
+    """读写交叉比对**只作审计信号**，绝不参与 enforce。
+
+    理由：文件可能被 `shell_execute` 里的命令改过（sed / 重定向），
+    这时读写不一致是**正常现象**。拿它去 enforce 会造成假失败 ——
+    而把正确的工作判错，比漏掉一次损坏更糟。
+    """
+    from lab.guard.config import GuardConfig
+    from lab.middleware import ToolGuard
+
+    class FileTool(BaseTool):
+        name: str = "file"
+
+        def __init__(self, sandbox) -> None:
+            super().__init__()
+            self.sandbox = sandbox
+
+        def get_tools(self):
+            return []
+
+        def has_tool(self, tool_name: str) -> bool:
+            return tool_name in {"write_file", "read_file"}
+
+        async def invoke(self, tool_name: str, **kwargs):
+            if tool_name == "write_file":
+                return await self.sandbox.write_file(kwargs["filepath"], kwargs["content"])
+            return await self.sandbox.read_file(kwargs["filepath"])
+
+    sandbox = LocalSandbox(tmp_path / "ws")
+    guard = ToolGuard(sandbox=sandbox, config=GuardConfig.from_spec("retry,postcondition,enforce"))
+    tool = FileTool(sandbox)
+
+    await guard.call_tool(tool, "write_file",
+                          {"filepath": "/home/ubuntu/a.txt", "content": "x" * 100})
+    # 模拟文件被 shell 命令改短了（正常现象）
+    await sandbox.write_file("/home/ubuntu/a.txt", "x" * 10)
+
+    result = await guard.call_tool(tool, "read_file", {"filepath": "/home/ubuntu/a.txt"})
+
+    assert guard.audit_warnings, "读写不一致没有被记成审计信号"
+    assert "不一致" in guard.audit_warnings[0]
+    # 关键：即使 enforce 开着，工具结果仍然成功 —— 因为它只是"可疑"，不是"确定错"
+    assert result.success is True
+    assert not guard.postcondition_warnings
+
+
+async def test_read_consistency_passes_when_content_matches(tmp_path):
+    """内容一致时不能误报（否则审计信号同样是噪声）。"""
+    from lab.guard.config import GuardConfig
+    from lab.middleware import ToolGuard
+
+    class FileTool(BaseTool):
+        name: str = "file"
+
+        def __init__(self, sandbox) -> None:
+            super().__init__()
+            self.sandbox = sandbox
+
+        def get_tools(self):
+            return []
+
+        def has_tool(self, tool_name: str) -> bool:
+            return tool_name in {"write_file", "read_file"}
+
+        async def invoke(self, tool_name: str, **kwargs):
+            if tool_name == "write_file":
+                return await self.sandbox.write_file(kwargs["filepath"], kwargs["content"])
+            return await self.sandbox.read_file(kwargs["filepath"])
+
+    sandbox = LocalSandbox(tmp_path / "ws")
+    guard = ToolGuard(sandbox=sandbox, config=GuardConfig.from_spec("all"))
+    tool = FileTool(sandbox)
+
+    await guard.call_tool(tool, "write_file",
+                          {"filepath": "/home/ubuntu/b.txt", "content": "hello"})
+    await guard.call_tool(tool, "read_file", {"filepath": "/home/ubuntu/b.txt"})
+
+    assert guard.audit_warnings == []

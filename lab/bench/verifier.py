@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
+import sys
 from typing import Any, List, Optional
 
 from pydantic import BaseModel
@@ -26,6 +29,10 @@ from lab.bootstrap import ensure_sut_on_path
 ensure_sut_on_path()
 
 from lab.bench.task import BenchTask, VerifyCheck  # noqa: E402
+
+# 命令行总长安全线（Windows 上封顶 ~8191）。超过就让任务作者把脚本写短，
+# 而不是静默截断 —— 截出来的判定器要么永远通过、要么永远失败。
+_EXEC_SCRIPT_COMMAND_LIMIT = 7000
 
 
 class CheckResult(BaseModel):
@@ -87,9 +94,97 @@ def _parse_csv(text: str) -> List[List[str]]:
 
 # ==================== 单条检查 ====================
 
+def _exec_script_command(script: str) -> str:
+    """把检查脚本编成一行命令（base64 + `-c`）。
+
+    抽成独立函数是为了**把不变式变成可测的东西**：
+    命令里不能出现任何会被 `LocalSandbox._rewrite_paths` 改写的片段，
+    否则就会在 Linux/CI 上碎掉、而我本机（Windows）看不出来 —— 真实踩过。
+    """
+    payload = base64.urlsafe_b64encode(script.encode("utf-8")).decode("ascii")
+    return (
+        f'"{sys.executable}" -c '
+        f'"import base64;exec(base64.urlsafe_b64decode(\'{payload}\').decode(\'utf-8\'))"'
+    )
+
+
+async def _run_exec_script(check: VerifyCheck, sandbox: Any) -> "CheckResult":
+    """执行一段**来自任务定义**的脚本，看退出码。
+
+    == 为什么这是判定器里最强的原语 ==
+    其他检查都是"读文件"，而文件是 Agent 可以自由创造的 ——
+    所以它们只能验证"产物对不对"，验证不了"产物是不是真的由正确的代码产生的"。
+    实测确认过这个洞：一个手写 out.json + 手写 diagnosis.json、**一行代码都不改**的解，
+    能通过全部文件型检查。
+
+    本原语把脚本存在**任务定义**里（不是工作区），所以：
+    - Agent 无法篡改断言（对比"执行工作区的测试文件"：Agent 可以先把它改弱）；
+    - 它真的**跑了一遍修完的代码**，退出码就是客观结论。
+
+    == 脚本怎么交给解释器（不要写临时文件） ==
+    初版把脚本写到一个临时文件、再把**路径**放进命令里。两个坑，一个是实测的、一个是推出来的：
+
+    1. 【实测】写进沙箱内的 `/tmp/` → 同任务的下一次运行**能看到上一次的评分脚本**
+       （工作区是按 run 保留的），于是 Agent 可以先去读判定标准。
+       真实轨迹里确实出现了：
+         `read_file /home/ubuntu/../../../../../ci_shared_cache_state/run0/workspace/tmp/_lab_check_xxx.py`
+    2. 【推出】把临时文件放到沙箱**外面**也不行：
+       `LocalSandbox._rewrite_paths` 会把命令里的任何 `/tmp` 换成 `<沙箱根>/tmp`，
+       而 Linux 上 `tempfile.TemporaryDirectory()` 就在 `/tmp` 下 →
+       **路径被改写、脚本找不到、validate 在 CI 上必挂**。
+       （Windows 上临时目录在 AppData，所以本地看不出来 —— 典型“只在我们机器上能跑”。）
+
+    所以现在**根本不用文件**：把脚本 base64 后通过 `-c` 传。
+    用 `urlsafe_b64encode` 是关键：它的字母表不含 `/`，
+    所以命令里**不可能**出现 `/tmp` 或 `/home/ubuntu`，`_rewrite_paths` 必然是无操作。
+    附带好处：没有文件 → 没有泄漏、没有残留、没有清理逻辑。
+
+    == 尺寸限制（显式报错，不静默截断） ==
+    命令行总长在 Windows 上封顶 ~8191 字符，base64 会膨胀 4/3。
+    超过安全线时**直接报错**，让任务作者把检查脚本写短 ——
+    静默截断会产生一个“总是通过”或“总是失败”的判定器，那比报错危险得多。
+    """
+    if not check.script:
+        return CheckResult(kind=check.kind, ok=False, detail="exec_script 检查缺少 script")
+
+    payload = base64.urlsafe_b64encode(check.script.encode("utf-8")).decode("ascii")
+    command = _exec_script_command(check.script)
+    label = check.description or "执行型检查"
+    if len(command) > _EXEC_SCRIPT_COMMAND_LIMIT:
+        return CheckResult(
+            kind=check.kind, ok=False,
+            detail=(f"{label}: 检查脚本过长（命令行 {len(command)} 字符 > "
+                    f"{_EXEC_SCRIPT_COMMAND_LIMIT}）—— 请把 script 写短（参考解一般几十行就够）"),
+        )
+
+    # 不变式（可测）：命令里不可能出现会被路径映射改写的片段。
+    # 这条件如果破了，就是“在 Windows 上过、在 Linux/CI 上挂”的那类错。
+    assert "/tmp" not in command and "/home/ubuntu" not in command, "命令里出现了会被改写的路径"
+
+    result = await sandbox.exec_command(
+        session_id=f"verify-{hashlib.sha1(payload.encode()).hexdigest()[:10]}",
+        exec_dir=check.script_cwd or sandbox.SANDBOX_HOME,
+        command=command,
+    )
+    data = _as_dict(result.data) or {}
+    returncode = data.get("returncode")
+    output = (data.get("output") or "").strip()
+    ok = returncode == check.expect_exit
+    detail = f"{label}: 期望退出码 {check.expect_exit}，实际 {returncode}"
+    if not ok:
+        # 失败时把脚本输出尾部带上 —— 否则报告里只有“退出码 1”，
+        # 没人能判断是任务太难还是判定器/环境出了问题。
+        detail += f"；输出尾部: {output[-400:]!r}"
+    return CheckResult(kind=check.kind, ok=ok, detail=detail)
+
+
 async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
     """执行一条判定。"""
     label = check.description or check.kind
+
+    # --- 执行型（最强）：真的跑一遍代码 ---
+    if check.kind == "exec_script":
+        return await _run_exec_script(check, sandbox)
 
     # --- 存在性 ---
     if check.kind == "file_exists":

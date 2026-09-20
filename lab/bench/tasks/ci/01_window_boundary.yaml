@@ -1,0 +1,278 @@
+key: ci_window_boundary
+group: ci
+purpose: capability
+title: CI 归因：分页少一条 + 标签被共享（两个独立根因）
+tags: [ci-attribution, code-fix, multi-file, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}, ...]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数名。
+  注意：日志里有多个失败，它们**不一定**是同一个原因。
+selfcheck:
+  # 这份日志必须是**真跑出来的**（见 SelfCheck 的说明）。
+  # 实测教训：我手写的第一版日志说"第一页 PASSED"，而实际是 FAILED ——
+  # 三次常规自检都抓不到，因为没有人执行过那份日志。
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  # ---------------- CI 日志（给 Agent 看的"现象"） ----------------
+  # 内容**逐行来自真实运行**（`selfcheck` 会守住这一点）。
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_first_page_keeps_all_items ... FAILED
+          expected [11, 12, 13]，actual [11, 12]
+      test_middle_page_keeps_all_items ... FAILED
+          expected [14, 15, 16]，actual [14, 15]
+      test_final_partial_page_is_correct ... PASSED
+      test_last_chunk_keeps_every_item ... FAILED
+          expected [15, 16, 17, 18]，actual [15, 16, 17]
+      test_tags_are_not_shared ... FAILED
+          expected ['export']，actual ['export', 'export']
+      test_empty_input_is_empty ... PASSED
+      ---------------------------------------------
+      6 项：2 通过 / 4 失败
+      （注：分页那几条不全错，看仔细再改）
+  # ---------------- 调用方（看起来像问题，其实不是） ----------------
+  - path: /home/ubuntu/repo/pager.py
+    content: |
+      """按页读取列表。"""
+      from window import window
+
+
+      def page(items, number, size):
+          """取第 number 页（从 0 开始），每页 size 条。"""
+          return window(items, number, size)
+  - path: /home/ubuntu/repo/exporter.py
+    content: |
+      """导出工具的取数逻辑。"""
+      from window import window
+
+
+      def last_chunk(items, size):
+          """取最后一整页（不足一页也按一页算）。"""
+          if not items:
+              return []
+          pages = (len(items) + size - 1) // size
+          return window(items, pages - 1, size)
+  - path: /home/ubuntu/repo/settings.py
+    content: |
+      """导出时的默认设置。"""
+
+
+      def default_tags(tags=[]):
+          """返回一次导出附带的标准标签。"""
+          tags.append("export")
+          return tags
+  # ---------------- 真正有 bug 的共享模块 ----------------
+  - path: /home/ubuntu/repo/window.py
+    content: |
+      """切片工具：pager 与 exporter 共用这一处取窗口的逻辑。"""
+
+
+      def window(items, page, size):
+          """取 items 中第 page 页（每页 size 条）。"""
+          start = page * size
+          # BUG: 切片终点少了 1。
+          # 注意它**不是每条都错**：当 start+size-1 已经越过列表末尾时，
+          # 切片被列表长度截断，结果恰好是对的（所以"最后一页不满"那条能过）。
+          return items[start:start + size - 1]
+  # ---------------- CI 提供的测试运行器（冻结，不得修改） ----------------
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      from exporter import last_chunk
+      from pager import page
+      from settings import default_tags
+
+      ITEMS = [11, 12, 13, 14, 15, 16, 17, 18]
+
+
+      def case_first_page():
+          actual = page(ITEMS, 0, 3)
+          return actual == [11, 12, 13], actual, [11, 12, 13]
+
+
+      def case_middle_page():
+          actual = page(ITEMS, 1, 3)
+          return actual == [14, 15, 16], actual, [14, 15, 16]
+
+
+      def case_final_partial_page():
+          actual = page(ITEMS, 2, 3)
+          return actual == [17, 18], actual, [17, 18]
+
+
+      def case_last_chunk():
+          actual = last_chunk(ITEMS, 4)
+          return actual == [15, 16, 17, 18], actual, [15, 16, 17, 18]
+
+
+      def case_tags():
+          default_tags()
+          second = default_tags()
+          return second == ["export"], second, ["export"]
+
+
+      def case_empty():
+          actual = last_chunk([], 3)
+          return actual == [], actual, []
+
+
+      CASES = [
+          ("test_first_page_keeps_all_items", case_first_page),
+          ("test_middle_page_keeps_all_items", case_middle_page),
+          ("test_final_partial_page_is_correct", case_final_partial_page),
+          ("test_last_chunk_keeps_every_item", case_last_chunk),
+          ("test_tags_are_not_shared", case_tags),
+          ("test_empty_input_is_empty", case_empty),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # ---- 1. 执行型检查（最强）：脚本来自**任务定义**，Agent 改不了 ----
+  # 它真的跑一遍修完的代码。共享 helper 与可变默认参数两处都必须修对，
+  # 而"只在 pager 里绕过"这类症状级修复会在这里挂掉。
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 修完的代码必须让各页、两个调用方与标签都正确
+    script: |
+      import os
+      import sys
+
+      sys.path.insert(0, os.getcwd())
+
+      from exporter import last_chunk
+      from pager import page
+      from settings import default_tags
+
+      ITEMS = [11, 12, 13, 14, 15, 16, 17, 18]
+      problems = []
+      for number, expected in ((0, [11, 12, 13]), (1, [14, 15, 16]), (2, [17, 18])):
+          actual = page(ITEMS, number, 3)
+          if actual != expected:
+              problems.append(f"page{number}={actual!r}")
+      if last_chunk(ITEMS, 4) != [15, 16, 17, 18]:
+          problems.append(f"tail={last_chunk(ITEMS, 4)!r}")
+      for size in (1, 2, 5):
+          if last_chunk(ITEMS, size) != ITEMS[((len(ITEMS) - 1) // size) * size:]:
+              problems.append(f"tail(size={size})")
+      if last_chunk([], 3) != []:
+          problems.append(f"empty={last_chunk([], 3)!r}")
+      if default_tags() != ["export"] or default_tags() != ["export"]:
+          problems.append("default_tags 在两次调用间不隔离")
+      if problems:
+          print("FAIL:", problems)
+          sys.exit(1)
+      print("OK: 两个根因都已修好")
+  # ---- 2. 测试运行器完整性（中）：挡住"把测试改弱" ----
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  # ---- 3. 归因报告（中）：必须点名两个根因位置 ----
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "window.py"
+    description: 归因里点名了真实的共享模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "default_tags"
+    description: 归因里点名了第二个根因符号
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/window.py
+    content: |
+      """切片工具：pager 与 exporter 共用这一处取窗口的逻辑。"""
+
+
+      def window(items, page, size):
+          """取 items 中第 page 页（每页 size 条）。"""
+          start = page * size
+          return items[start:start + size]
+  - kind: write_file
+    path: /home/ubuntu/repo/settings.py
+    content: |
+      """导出时的默认设置。"""
+
+
+      def default_tags(tags=None):
+          """返回一次导出附带的标准标签。"""
+          if tags is None:
+              tags = []
+          tags.append("export")
+          return tags
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [
+        {"file": "window.py", "symbol": "window", "why": "切片终点写成 start+size-1，非末尾页每页少最后一条；pager 与 exporter 共用它，两处症状同一个根因（末尾不满页因被列表长度截断而恰好正确）"},
+        {"file": "settings.py", "symbol": "default_tags", "why": "可变默认参数 tags=[] 在多次调用间共享同一个列表，标签被累积"}
+      ]}
+wrong:
+  # 典型半对解：只在 pager 调用点把丢掉的元素补回来（症状级修复）。
+  # 期望判定器**拒绝**它 —— exporter 的 tail 仍然是错的。
+  - kind: write_file
+    path: /home/ubuntu/repo/pager.py
+    content: |
+      """按页读取列表。"""
+      from window import window
+
+
+      def page(items, number, size):
+          """取第 number 页（从 0 开始），每页 size 条。"""
+          chunk = window(items, number, size)
+          start = number * size
+          # 把被 window 丢掉的那一条补回来（只在调用点绕过去）
+          return chunk + items[start + size - 1:start + size]
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "pager.py", "symbol": "page", "why": "调用点少取一条"}]}
+notes: >-
+  **这是"CI 失败归因"类的第一个样本，判定器用 `exec_script` 而不是读文件。**
+  原因是一个自己踩到的漏洞：初版用 `json_equals` 检查产物 out.json，
+  实测确认**一个手写产物、一行代码都不改的解会被放行**。
+  `exec_script` 的脚本存在**任务定义**里（不在工作区），所以 Agent 改不了断言，
+  而且它真的跑了一遍代码 —— 这才是"你有没有修好根因"的客观裁判。
+
+  设计要点一（防症状级修复）：各页与 tail 走的是**同一处** window()，
+  但分别由 pager.py 与 exporter.py 调用；只在 pager 里打补丁，tail 仍然是错的。
+  设计要点二（两个独立根因）：可变默认参数与切片无关，验证"多个失败 ≠ 一个原因"真的会被考到。
+  设计要点三（真实感来自实测，不是设计）：off-by-one 在**末尾不满页**上恰好看不出来
+  （切片被列表长度截断），所以日志里有一条 PASSED。
+  这一点最初不是我设计出来的，是真实跑出来才发现的 —— 它恰好成了一个好红鲱鱼。

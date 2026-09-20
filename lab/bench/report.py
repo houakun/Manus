@@ -47,6 +47,28 @@ def _interval_row(name: str, interval: Interval, unit: str = "", digits: int = 1
     return f"| {name} | {value} | {spread} | {interval.n} |"
 
 
+def _task_purposes() -> Dict[str, str]:
+    """任务 uid → purpose（capability / regression）。
+
+    报告要按 purpose 分开看口径：regression 任务算回归指标，
+    capability 任务的波动是能力边界发现，**不能进回归门禁**。
+    """
+    try:
+        from lab.bench.task import load_all_tasks
+
+        return {task.uid: task.purpose for task in load_all_tasks()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _uid_by_key(task_key: str, purposes: Dict[str, str]) -> str:
+    """task_level.unstable 里存的是短名，这里反查回 uid 用来查 purpose。"""
+    for uid in purposes:
+        if uid.endswith("/" + task_key) or uid == task_key:
+            return uid
+    return ""
+
+
 def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> str:
     """渲染完整报告。"""
     lines: List[str] = []
@@ -61,6 +83,14 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     lines.append(f"- **规模**: {task_count or len(suite.task_summaries)} 个任务 × {suite.runs_per_task} 次 = "
                  f"**{suite.total_runs}** 次运行")
     lines.append(f"- **预算模式**: `{suite.budget_mode}`（只记录不干预）")
+    # ---- 实验条件：没有这一块，这个报告的数字无法被归因 ----
+    lines.append(f"- **加固配置**: `{suite.guard_config or 'all'}`"
+                 + ("　**故障注入**: ``" + suite.fault_spec + "``" if suite.fault_spec else "")
+                 + ("　**LLM 回放**: `" + suite.replay_mode + "`"
+                    if suite.replay_mode and suite.replay_mode != "off" else ""))
+    if suite.interleaved:
+        lines.append(f"- **交错 A/B**: 是（{len(suite.arm_labels)} 个臂："
+                     f"{'、'.join(suite.arm_labels)}）")
     if suite.concurrency > 1:
         lines.append(f"- ⚠️ **并发度**: {suite.concurrency}（耗时指标不可横向比较）")
     lines.append("")
@@ -69,8 +99,61 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     lines.append("## 一、总体指标")
     lines.append("")
     rate = suite.success_rate
-    lines.append(f"**成功率 {rate.point:.1%}**，95% Wilson 区间 "
-                 f"[{rate.low:.1%}, {rate.high:.1%}]，n={recipe_n(rate)}")
+
+    # ---- 两个口径必须并列：运行级成功率会被"任务数少、每任务多次"平摊掉 ----
+    #      并且按 purpose 分开：regression 才是回归门禁口径，capability 是能力边界。
+    purposes = _task_purposes()
+    regression_uids = {uid for uid, purpose in purposes.items() if purpose == "regression"}
+    task_level = suite.task_level()
+    regression_level = (suite.task_level(only_uids=regression_uids)
+                        if regression_uids else None)
+    lines.append(f"**运行级成功率 {rate.point:.1%}**（成功运行数/总运行数），"
+                 f"95% Wilson 区间 [{rate.low:.1%}, {rate.high:.1%}]，n={rate.n}")
+    if task_level.tasks:
+        pow_rate, at_rate = task_level.pass_pow_k_rate, task_level.pass_at_k_rate
+        lines.append("")
+        lines.append(f"**任务级 pass^{task_level.k} = {pow_rate.point:.1%}**"
+                     f"（{task_level.pass_pow_k}/{task_level.tasks} 个任务 **{task_level.k} 次全对**），"
+                     f"区间 [{pow_rate.low:.1%}, {pow_rate.high:.1%}]；"
+                     f"pass@{task_level.k} = {at_rate.point:.1%}（至少成功一次）")
+        if (regression_level and regression_level.tasks
+                and regression_level.tasks != task_level.tasks):
+            rp, ra = regression_level.pass_pow_k_rate, regression_level.pass_at_k_rate
+            lines.append("")
+            lines.append(
+                f"**只看 regression 任务（回归门禁口径）**：pass^{regression_level.k} = "
+                f"**{rp.point:.1%}**（{regression_level.pass_pow_k}/{regression_level.tasks}），"
+                f"区间 [{rp.low:.1%}, {rp.high:.1%}]；"
+                f"capability 任务（{task_level.tasks - regression_level.tasks} 个）**不计入此口径**。"
+            )
+        # 饱和度：Wilson 下界 > 95% → 已经没有改进信号，只能追回归
+        if pow_rate.point >= 1.0 and (pow_rate.low or 0) > 0.95:
+            lines.append("")
+            lines.append("> 🟡 **已饱和**：pass^k 的 Wilson 下界已超 95% —— "
+                         "**100% 的 eval 只能追踪回归，给不出改进信号**（审计 §4.9）。"
+                         "要恢复区分度必须加任务难度或换更难的任务集。")
+        if task_level.unstable:
+            lines.append("")
+            lines.append(f"不稳定任务（部分成功）：{', '.join(task_level.unstable)}")
+            capability_unstable = [
+                name for name in task_level.unstable
+                if purposes.get(_uid_by_key(name.split("(")[0], purposes)) == "capability"
+            ]
+            if capability_unstable:
+                lines.append(f"> 其中 **capability 任务**：{', '.join(capability_unstable)} —— "
+                             "它们的波动是**能力边界的发现**，不是回归噪声。")
+        lines.append("")
+        if task_level.unstable:
+            lines.append("")
+            lines.append(f"不稳定任务（部分成功）：{', '.join(task_level.unstable)}")
+        lines.append("")
+        lines.append("> **两个口径读法不同**：运行级看「每次尝试的期望」，"
+                     "`pass^k` 看「**同一个任务能不能每次都做对**」（生产的 SLA 语义）。"
+                     "当少数任务不稳定时，后者会把它暴露出来，前者会把它平摊掉。")
+        lines.append("> ⚠️ `pass^k` **不是显著性的提升**：两者的区间可能都重叠；"
+                     "它的样本量是**任务数**，想收窄区间必须加任务。")
+        for caveat in task_level.caveats:
+            lines.append(f"> - {caveat}")
     lines.append("")
     lines.append("| 指标 | 均值 | 95% 区间 | n |")
     lines.append("|---|---|---|---|")
@@ -125,6 +208,44 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
         lines.append("")
 
     # ==================== 分组 ====================
+    # ---- 交错 A/B：必须**先**拆开看，混在一起的成功率没有任何意义 ----
+    if suite.is_multi_arm:
+        lines.append("## 一·五、分臂结果（交错 A/B）")
+        lines.append("")
+        lines.append("| 臂 | 加固 | 故障 | n | 成功 | 成功率 | 95% Wilson |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for arm_label in suite.arm_labels:
+            sub = suite.for_arm(arm_label)
+            rate = sub.success_rate
+            meta = next((a for a in suite.arms if a.get("label") == arm_label), {})
+            lines.append(
+                f"| `{arm_label}` | `{meta.get('guard_label', '')}` "
+                f"| `{meta.get('fault_spec', '') or '无'}` "
+                f"| {sub.total_runs} | {sub.successes} | {rate.point:.1%} "
+                f"| [{rate.low:.1%}, {rate.high:.1%}] |"
+            )
+        lines.append("")
+        lines.append("| 臂 | regression pass^k | 成本/任务 | 成本/成功 |")
+        lines.append("|---|---|---|---|")
+        for arm_label in suite.arm_labels:
+            sub = suite.for_arm(arm_label)
+            reg = sub.task_level(only_uids=regression_uids) if regression_uids else None
+            pow_text = (f"{reg.pass_pow_k}/{reg.tasks} = {reg.pass_pow_k_rate.point:.0%}"
+                        if reg and reg.tasks else "—")
+            cost = sub.cost.point
+            cps = (cost * sub.total_runs / sub.successes) if sub.successes else float("inf")
+            lines.append(f"| `{arm_label}` | {pow_text} | ${cost:.4f} "
+                         f"| {'∞' if cps == float('inf') else f'${cps:.4f}'} |")
+        lines.append("")
+        lines.append("> 两臂来自**同一个交错 suite**（A,B,B,A…），所以时间漂移对两边同权 ——"
+                     "这比分两段跑强。但两臂**不是独立样本**，配对区间要按配对设计读。")
+        lines.append(
+            "> 正式对比：`python -m lab bench compare "
+            + suite.suite_id[:8]
+            + " --arm \"" + suite.arm_labels[0] + "\" --arm \"" + suite.arm_labels[1] + "\"`"
+        )
+        lines.append("")
+
     lines.append("## 二、分组对比")
     lines.append("")
     lines.append("| 分组 | 运行数 | 成功率 | 95% 区间 | tokens/任务 | 耗时/任务 |")
@@ -227,6 +348,24 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     lines.append("")
     for note in suite.notes:
         lines.append(f"- {note}")
+    if suite.replay_mode and suite.replay_mode != "off":
+        lines.append(
+            f"- ⚠️ **本次是 LLM 回放（`{suite.replay_mode}`）**：`成本` / `耗时` / `token` "
+            "都是**等价量**（录制那些请求当时的值），不是本次真实消费。"
+            "回放适合验证 harness/判定器/加固行为；**不能**用来测性能或成本。"
+        )
+        missed = suite.replay_missed_runs
+        if missed:
+            lines.append(
+                f"- 🔴 **{missed}/{suite.total_runs} 次运行的回放不完整**：这些运行在 LLM 调用"
+                "失败后**降级继续**了，所以「仍然成功」**不等于**「复现成功」——"
+                "它们的轨迹不是录制时那条，**不能用于对比**。"
+                "处置：加 `--replay-ignore-volatile`，或补录缺失的请求。"
+            )
+        else:
+            lines.append(
+                "- ✅ **回放是完整的**（0 次缓存未命中）：本次运行与录制时的请求集合逐条一致。"
+            )
     if suite.fixture_failures:
         lines.append(f"- ⚠️ 有 {len(suite.fixture_failures)} 次运行在执行前就失败了，"
                      f"**未计入成功率**（否则会把环境问题算成 Agent 能力问题）")
@@ -242,11 +381,25 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     lines.append("# 1. 先验证任务集本身可信（不需要 API Key，不花钱）")
     lines.append("python -m lab bench validate")
     lines.append("")
-    lines.append("# 2. 复现本次评测（阈值/故障注入都来自命令行，不藏在代码里）")
-    lines.append(f"python -m lab bench run --runs {suite.runs_per_task} --label \"{suite.label}\"")
+    lines.append("# 2. 复现本次评测（阈值/故障注入/加固/交错都来自命令行，不藏在代码里）")
+    replay_flag = "" if suite.replay_mode in ("", "off") else f" --replay {suite.replay_mode}"
+    if suite.interleaved:
+        arm_flags = "".join(
+            f' --ab-guard "{arm.get("guard_spec") or "all"}" --ab-label "{arm.get("label")}"'
+            for arm in suite.arms
+        )
+        lines.append(f"python -m lab bench run --runs {suite.runs_per_task} "
+                     f"--label \"{suite.label}\"{arm_flags}{replay_flag}")
+    else:
+        lines.append(f"python -m lab bench run --runs {suite.runs_per_task} "
+                     f"--guard {suite.guard_config or 'all'} "
+                     f"--label \"{suite.label}\"{replay_flag}")
     lines.append("")
     lines.append("# 3. 重新出报告（不重跑）")
     lines.append(f"python -m lab bench report {suite.suite_id}")
+    lines.append("")
+    lines.append("# 4. 解读任何 delta 之前：先确认噪声地板（<20% 的差异未测地板时不可解释）")
+    lines.append("python -m lab bench noise-floor --runs 3 --group semireal")
     lines.append("```")
     lines.append("")
     return "\n".join(lines)

@@ -51,8 +51,13 @@ from app.domain.services.tools.base import BaseTool  # noqa: E402
 
 from lab.faults.injector import FaultInjector  # noqa: E402
 from lab.guard.budget import Budget  # noqa: E402
+from lab.guard.config import GuardConfig  # noqa: E402
 from lab.guard.loop_guard import LoopGuard  # noqa: E402
-from lab.guard.postcondition import check_postcondition  # noqa: E402
+from lab.guard.postcondition import (  # noqa: E402
+    check_postcondition,
+    check_postcondition_content,
+    check_read_consistency,
+)
 from lab.guard.retry import decide_retry, is_idempotent  # noqa: E402
 
 
@@ -86,14 +91,26 @@ class ToolGuard:
             verify_postconditions: bool = True,
             seed: int = 42,
             watch_literals: Optional[List[str]] = None,
+            config: Optional[GuardConfig] = None,
     ) -> None:
         self._recorder = recorder
         self.budget = budget
         self.loop_guard = loop_guard or LoopGuard()
         self.injector = injector
         self._sandbox = sandbox
-        self._max_attempts = max(1, max_attempts)
-        self._verify = verify_postconditions
+        # 加固开关（Step 6 补）：没有它就无法构造"无加固"对照组。
+        # 优先级：显式参数 > config > 默认全开（保证既有调用行为不变）。
+        self.config = config or GuardConfig()
+        if config is None:
+            self._max_attempts = max(1, max_attempts)
+            self._verify = verify_postconditions
+            self._loop_enabled = True
+            self._budget_enabled = True
+        else:
+            self._max_attempts = max(1, max_attempts) if config.retry else 1
+            self._verify = verify_postconditions and config.postconditions
+            self._loop_enabled = config.loop_guard
+            self._budget_enabled = config.budget
         self._rng = random.Random(seed)
         # 硬编码检测：这些字面量如果直接出现在写入内容/命令里，说明是"抄答案"而不是算出来的。
         # 由 bench 层传入（它才知道答案是什么），guard 只负责盯。
@@ -110,6 +127,11 @@ class ToolGuard:
         # 工作区外写入记录：{函数名: [被写到工作区外的文件]}
         # 安全类信号，必须进报告 —— 只躺在日志里等于没有
         self.escaped_writes: Dict[str, List[str]] = {}
+        # **审计级**告警（不参与 enforce，因为可能有误报）：
+        # 例如"读回内容与最近写入不一致"—— 也可能是文件被 shell 命令改过
+        self.audit_warnings: List[str] = []
+        # 最近成功写入的内容指纹：{路径: (字符数, sha1_12)}，供读路径的交叉校验用
+        self._known_writes: Dict[str, tuple] = {}
 
     def _note_error_type(self, error_type: Optional[str]) -> None:
         """累计失败类型（供过程规则与归因统计使用）。"""
@@ -180,9 +202,11 @@ class ToolGuard:
     async def call_tool(self, inner: BaseTool, function_name: str, args: Dict[str, Any]) -> ToolResult:
         """执行一次工具调用，串联预算 / 循环检测 / 故障注入 / 重试 / 后置校验。"""
         # 1.预算与循环检测
-        if self.budget is not None:
+        #   两个能力关掉后**只影响观测**（它们在 observe 模式下本就不干预成败）——
+        #   这一点必须理解清楚，否则会误以为"关掉 loop_guard 成功率没变 = 它没用"。
+        if self.budget is not None and self._budget_enabled:
             self.budget.note_tool_call()
-        hit = self.loop_guard.observe(function_name, args)
+        hit = self.loop_guard.observe(function_name, args) if self._loop_enabled else None
         self._check_hardcode(function_name, args)
         self.check_budget()
 
@@ -253,17 +277,51 @@ class ToolGuard:
         warning: Optional[str] = None
         if self._verify and result.success:
             try:
+                # 4.1 内容级校验（可 enforce）：JSON 结构合法性等
                 warning = await check_postcondition(
                     function_name=function_name,
                     args=args,  # 注意用**原始**参数：调用方的意图才是判断标准
                     result=result,
                     sandbox=self._sandbox,
                 )
+                warning = warning or check_postcondition_content(
+                    function_name=function_name, args=args, result=result
+                )
+                # 4.2 审计级校验（**不**参与 enforce）：读回内容与最近写入的交叉比对
+                data = result.data if isinstance(result.data, dict) else {}
+                audit = check_read_consistency(
+                    filepath=data.get("filepath") or args.get("filepath"),
+                    content=data.get("content"),
+                    known_writes=self._known_writes,
+                )
+                if audit:
+                    self.audit_warnings.append(f"{function_name}: {audit}")
             except Exception as exc:  # noqa: BLE001
                 # 校验器自己的异常不能影响主流程（校验是"附加信息"，不是关键路径）
                 warning = f"后置校验器异常: {type(exc).__name__}: {exc}"
             if warning:
                 self.postcondition_warnings.append(f"{function_name}: {warning}")
+
+                # [lab] 把校验失败**回灌给模型**（自愈链的最后一环）。
+                # 只记告警是不够的：那个 ToolResult 会以 success=True 返回，
+                # 模型于是继续在错误的事实上推理（静默失败的定义）。
+                # 改成 success=False 后，模型会看到"你声称写成功了，但实际不一致"，
+                # 从而有机会重试或改变做法 —— 这才是"检测 → 回灌 → 自愈"的闭环。
+                # 默认关闭，因为它会真实地改变 SUT 的成功率语义，必须是显式选项。
+                if self.config.postcondition_enforce:
+                    result = ToolResult(
+                        success=False,
+                        message=(
+                            f"后置校验未通过（工具自称成功，但独立核对不成立）：{warning}。"
+                            f"请根据实际情况重新执行或改换做法。"
+                        ),
+                        data=result.data,
+                        error_type="postcondition_failed",
+                        # retryable=False：同一串参数重试未必能成功（例如随机截断），
+                        # 而且 write_file 本身是非幂等的 —— 是否重试交给模型判断。
+                        retryable=False,
+                        attempts=result.attempts,
+                    )
 
         # 5.把结论写进当前 span（由适配器在收到 ToolEvent(CALLED) 时一并收口）
         escaped: List[str] = []
@@ -277,10 +335,11 @@ class ToolGuard:
 
         if self._recorder is not None:
             attrs: Dict[str, Any] = {
-                "repeat_consecutive": hit.consecutive,
-                "action_diversity": round(hit.diversity, 3),
                 "idempotent": is_idempotent(function_name),
             }
+            if hit is not None:
+                attrs["repeat_consecutive"] = hit.consecutive
+                attrs["action_diversity"] = round(hit.diversity, 3)
             if escaped:
                 # 轨迹里能看到"命令把文件写到工作区外了" —— 这是 fast mode 特有的失真，
                 # 不标出来就无法区分"Agent 没做对"与"产物落在了错地方"
@@ -293,6 +352,16 @@ class ToolGuard:
                 attrs["postcondition_warning"] = warning
             self._recorder.annotate(**attrs)
 
+        # 6.记住成功写入的内容（供读路径的交叉校验用）
+        #   只记**非追加**的 write_file：追加模式下的"完整内容"无法从 args 推出来。
+        if function_name == "write_file" and result.success and not args.get("append"):
+            content = args.get("content")
+            path = args.get("filepath")
+            if isinstance(content, str) and path:
+                from lab.guard.postcondition import _digest
+
+                self._known_writes[path] = (len(content), _digest(content))
+
         return result
 
     # ==================== 报告 ====================
@@ -300,7 +369,13 @@ class ToolGuard:
     def report(self) -> Dict[str, Any]:
         """汇总本任务的加固层观察结果（进 TaskResult.guard）。"""
         data: Dict[str, Any] = {
+            # 加固配置必须进报告：没有它，两次运行的数据无法区分是谁的
+            # （这是对照实验能做归因的前提）
+            "config": self.config.label,
+            "features": {name: getattr(self.config, name) for name in
+                         ("retry", "postconditions", "loop_guard", "budget", "postcondition_enforce")},
             "postconditions": {"warnings": self.postcondition_warnings},
+            "audit": {"warnings": self.audit_warnings},
             "retries": {"total": sum(self.retry_stats.values()), "by_reason": dict(self.retry_stats)},
             "loop": self.loop_guard.report(),
             "error_types": dict(self.error_types),

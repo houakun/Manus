@@ -2,11 +2,28 @@
 
 MoocManus 是一个通用的 AI Agent 系统，支持完全私有化部署，使用 A2A + MCP 连接 Agent/Tool，同时支持在沙箱中运行各种内置工具和操作。
 
+> ### 🔬 另附：Agent 可靠性评测实验台（`lab/`）
+>
+> 本仓库同时包含一套独立的、不依赖任何评测框架的 **Agent 评测与加固工具**：
+> 22 个确定性任务集（含 CI 失败归因）、span 级轨迹、10 类故障注入、
+> 预算/熔断/重试/后置校验中间件，
+> 以及统计（Wilson / bootstrap / `pass^k`）与对照实验开关。
+>
+> 它把上方的 Agent 当作**被测对象**，回答"它做得对吗、每次都能做对吗、钱花在哪了、坏了怎么修"。
+>
+> 另外三项让"每个 delta 都可信"的基础设施：
+> - **LLM 录制回放**：真跑 24.5s / $0.057 → 离线复现 **0.4s / $0**（不需要 API Key）；
+> - **交错 A/B**：两条臂在同一个 suite 内轮转，分离"时间相关的服务端漂移"；
+> - **噪声地板**：测出"同一配置跑两次能差多少"，回归门禁的阈值由此而来。
+>
+> 详见 **[lab/README.md](./lab/README.md)**；不花钱的入口：`python -m lab bench validate`。
+
 ## 项目结构
 
 ```
 mooc-manus/
-├── api/              # 后端 API 服务（FastAPI）
+├── api/              # 后端 API 服务（FastAPI）—— 同时是 lab 的**被测对象**
+├── lab/              # Agent 可靠性评测实验台（详见 lab/README.md）
 ├── ui/               # 前端服务（Next.js）
 ├── sandbox/          # 沙箱服务（Ubuntu + Chrome + VNC）
 ├── nginx/            # Nginx 网关配置

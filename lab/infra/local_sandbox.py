@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import io
+import locale
 import logging
 import os
 import re
@@ -52,6 +54,75 @@ ensure_sut_on_path()
 from app.domain.models.tool_result import ToolResult  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# ==================== 子进程输出的解码与归一 ====================
+#
+# == 为什么需要这一层（实测发现，而且是噪声地板的主要来源）==
+# 实测噪声地板时，同一份代码两臂的成本差了 ±29%，而主导项是**单个任务**的 +118%。
+# 读那条 43 步的轨迹发现，其中 10 步在追行尾：
+#
+#     od -c report.txt → tr -d '\r' → cmp → od -c → mv → cmp
+#
+# 根因有两个，**都与模型能力无关，都是本地实现的失真**：
+#
+# 1. **CRLF**：fast mode 在 Windows 上跑，子进程输出一律是 `\r\n`。
+#    SUT 的目标环境是 Ubuntu（提示词里就是这么写的）——**真沙箱不会给 CRLF**。
+#    模型在上下文里看到 `\r\n`，合理地以为文件行尾有问题，于是花掉 10 次迭代。
+#
+# 2. **编码不一致**：这一点最阴。子进程的输出里可能**同时混着两种编码**：
+#      - cmd.exe 内建命令的错误信息用 **OEM 代码页**（中文机器上是 GBK）；
+#      - 而 Python 子进程被 `_build_child_env` 固定成 UTF-8。
+#    一刀切用 UTF-8 解 → 前者的中文变成 `'command' �����ڲ����ⲿ���`，
+#    而这堆乱码会**直接进 LLM 上下文**，让它对自己刚才干了什么判断失准。
+#
+# == 归一为什么是**保真**而不是"掩盖问题" ==
+# 目标环境（Ubuntu）本来就不输出 `\r\n`，也不输出 GBK 乱码。
+# 把本地实现的产物归一到目标环境的形状，是在**降低测量误差**，而不是在作弊。
+# 反过来，把 CRLF 留在上下文里才是真正的失真：它让模型去修一个它自己造出来的问题。
+#
+# == 算法：逐行解码 ==
+# 不整块猜编码，而是按 `\n` 切分后**逐行**试：
+#   UTF-8 严格 → 失败则 OEM/本地代码页 → 再失败则 replace。
+# 两个理由：
+#   a. UTF-8 的多字节序列里**不可能出现 0x0A**，所以按 `\n` 切分是安全的；
+#   b. 混合编码流里每行通常只来自一个来源，逐行判定比整块判定准确得多。
+# 只去掉行尾的 `\r`，**不动行内的 `\r`` —— 后者是进度条刷新（`\rProgress 50%`），有真实含义。
+
+
+def _oem_encoding() -> str:
+    """本机控制台的 OEM 代码页编码名（Windows 上 cmd.exe 的错误信息用的就是它）。"""
+    if sys.platform != "win32":
+        return locale.getpreferredencoding(False) or "utf-8"
+    with contextlib.suppress(Exception):
+        # GetOEMCP 才是控制台的代码页；GetACP 是 ANSI（两者在中文机器上同为 936，但不保证）
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    return "utf-8"
+
+
+def decode_command_output(raw: Optional[bytes]) -> str:
+    """把子进程的原始字节解成**目标环境形状**的文本（UTF-8 + LF）。
+
+    这是模块里唯一该做子进程输出解码的地方 —— 两处输出路径（正常结束 / 超时残留）
+    都调它。否则两条路径会长出两种行为，而超时那条本来就很少有人看。
+    """
+    if not raw:
+        return ""
+    fallback = _oem_encoding()
+    decoded: List[str] = []
+    for raw_line in raw.split(b"\n"):
+        # 行尾的 \r 是 Windows 行尾的一部分，去掉；行内的 \r（进度条）保留。
+        if raw_line.endswith(b"\r"):
+            raw_line = raw_line[:-1]
+        try:
+            decoded.append(raw_line.decode("utf-8"))
+            continue
+        except UnicodeDecodeError:
+            pass
+        try:
+            decoded.append(raw_line.decode(fallback))
+        except (UnicodeDecodeError, LookupError):
+            decoded.append(raw_line.decode("utf-8", errors="replace"))
+    return "\n".join(decoded)
 
 
 class SandboxPathError(ValueError):
@@ -114,7 +185,6 @@ def describe_escape_roots() -> List[Dict[str, Any]]:
 
 class LocalSandbox:
     """Sandbox 协议的本地实现（结构化类型，无需显式继承）。"""
-
     # 与 SUT 提示词保持一致：模型认为自己在家目录 /home/ubuntu 下工作
     SANDBOX_HOME = "/home/ubuntu"
     SANDBOX_TMP = "/tmp"
@@ -157,7 +227,6 @@ class LocalSandbox:
         self._session_returncodes: Dict[str, int] = {}
 
     # ==================== 路径映射与防护 ====================
-
     def _to_local(self, logical_path: str) -> Path:
         """把逻辑路径（/home/ubuntu/a.txt）映射为本地真实路径。"""
         text = str(logical_path).replace("\\", "/")
@@ -206,16 +275,6 @@ class LocalSandbox:
     @property
     def id(self) -> str:
         return f"local-{abs(hash(str(self._root))) % 10 ** 8:08d}"
-
-    @property
-    def vnc_url(self) -> str:
-        """fast mode 没有 VNC（无 GUI），返回空串。"""
-        return ""
-
-    @property
-    def cdp_url(self) -> str:
-        """fast mode 没有 Chrome DevTools Protocol 端点，返回空串。"""
-        return ""
 
     async def ensure_sandbox(self) -> None:
         """确保沙箱"已启动"。本地实现只需确认目录存在，不做任何容器操作。"""
@@ -640,7 +699,7 @@ class LocalSandbox:
             # 进程树死后管道会 EOF，再取一次残余输出（拿不到也不影响结论）
             with contextlib.suppress(Exception):
                 raw_output, _ = await asyncio.wait_for(process.communicate(), timeout=5)
-            partial = (raw_output or b"").decode("utf-8", errors="replace")
+            partial = decode_command_output(raw_output)
             if partial:
                 self._session_outputs[session_id] = partial
             return ToolResult(
@@ -660,7 +719,7 @@ class LocalSandbox:
                 },
             )
 
-        output = (raw_output or b"").decode("utf-8", errors="replace")
+        output = decode_command_output(raw_output)
         if len(output) > self._max_output_chars:
             output = output[: self._max_output_chars] + "\n...[输出过长已截断]"
 

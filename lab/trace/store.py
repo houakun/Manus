@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS bench_runs (
     steps_done             INTEGER,
     error_type             TEXT,
     error                  TEXT,
+    guard_config           TEXT,
     budget_violated        TEXT,
     budget_would_stop      INTEGER,
     action_diversity       REAL,
@@ -143,12 +144,109 @@ _TASKS_GUARD_COLUMNS = {
     "action_diversity": "REAL",
     "postcondition_warnings": "INTEGER",
     "faults_injected": "INTEGER",
+    # LLM 录制回放（Step 6）：模式单独成列（可 GROUP BY），统计整包存 JSON。
+    # 为什么模式不复用 `replay_stats` 里的字段：报告要能按模式过滤（"只看真跑的数据"），
+    # 而过滤一个 JSON 字段要么用 LIKE 猜、要么全表读进内存。
+    "replay_mode": "TEXT",
+    "replay_stats": "TEXT",
 }
 
 # bench_runs 的后加列（同样的迁移理由）
 _BENCH_RUN_COLUMNS = {
     "self_reported_ok": "INTEGER",
+    # 加固配置标签：没有它，"无加固"与"加固"两组数据落库后无法区分
+    "guard_config": "TEXT",
+    # 故障规格的**文本化**形式（如 `partial_write@write_file(rate=0.5)`）。
+    # 原来只有 `faults_injected` 这个**计数**：
+    # 它能让 `avg_cost_for_group(faulted=True)` 工作，却完全答不了
+    # "这次运行注入的是哪一类故障"—— 做到 10 类故障 × 2 种加固的矩阵时，
+    # 分组只能靠人工写在 label 字符串里，事后无法查询、无法自动分组。
+    "fault_spec": "TEXT",
+    # 交错 A/B 的臂名（如 `guard=none` / `guard=all`）。
+    # 一个 suite 里可以同时含多个臂（这正是交错的意义：时间漂移对两边同权），
+    # 所以"哪个臂"必须落在**运行**这一级，而不是 suite 标题里。
+    "arm": "TEXT",
+    "replay_mode": "TEXT",
 }
+
+# bench_suites 的后加列：suite 级的实验条件。
+# 为什么 suite 级也要存（运行级已经存了）：跑完 10 个 suite 后想回答
+# "哪几次是同配置的"，需要一条 SQL 就能筛出来，而不是把几万行 runs 全读一遍。
+_BENCH_SUITE_COLUMNS = {
+    "guard_config": "TEXT",
+    "fault_spec": "TEXT",
+    "replay_mode": "TEXT",
+    "arms": "TEXT",
+    "interleaved": "INTEGER",
+}
+
+
+def _column(row: Any, name: str, default: Any = None) -> Any:
+    """安全读列：老库可能还没跑完迁移（或行来自 LEFT JOIN）。
+
+    为什么不用 `row[name]`：`sqlite3.Row` 对不存在的列会抛 IndexError。
+    而 `load_suite` 里的语句在版本升级前后可能列数不同 ——
+    一句 `SELECT *` 写下去，读旧库就炸，读新库才对，这种错很难在测试里覆盖到。
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return default
+
+
+def _json_list(raw: Any) -> List[str]:
+    """把 TEXT 列里的 JSON 数组读回来（坏数据返回空列表，不抛）。"""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _json_items(raw: Any) -> List[Any]:
+    """同上，但**不**把元素转成字符串（用于 arms 这种 dict 列表）。"""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return list(value) if isinstance(value, list) else []
+
+
+def _replay_misses_from_flags(flags: List[str]) -> int:
+    """从过程 flag 里读回回放未命中次数。
+
+    为什么不用单独一列：这个信息已经写在 `process_flags` 里了（`replay_misses:6`）。
+    多一列就多一份可能与 flag 不一致的状态；直接从 flag 反解，
+    历史数据（加 flag 之前跑的）自然退化成 0 —— 而那时确实没记录过。
+    """
+    for flag in flags:
+        if flag.startswith("replay_misses:"):
+            try:
+                return int(flag.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _tool_calls_from_row(row: Any) -> float:
+    """从事件流（`tasks.tool_sequence`）算工具调用次数，拿不到才回退到存储列。
+
+    为什么必须这样：`bench_runs.tool_calls` 曾经是从 `loop_guard` 取的，
+    而 `loop_guard` 可以被 `--guard none` 关掉 → 对照组的计数全为 0，
+    于是"无加固 vs 加固"会显示出完全虚假的差异（实测：假的 +31 次调用）。
+    **指标不能依赖可以被开关关掉的能力。**
+    """
+    sequence = row["task_tool_sequence"] if "task_tool_sequence" in row.keys() else None
+    if sequence:
+        try:
+            return float(len(json.loads(sequence)))
+        except (TypeError, ValueError):
+            pass
+    return float(row["tool_calls"] or 0)
 
 
 class SpanStore:
@@ -177,6 +275,7 @@ class SpanStore:
         for table, columns in (
                 ("tasks", _TASKS_GUARD_COLUMNS),
                 ("bench_runs", _BENCH_RUN_COLUMNS),
+                ("bench_suites", _BENCH_SUITE_COLUMNS),
         ):
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, ddl in columns.items():
@@ -223,6 +322,12 @@ class SpanStore:
             "action_diversity": loop.get("action_diversity"),
             "postcondition_warnings": len((guard.get("postconditions") or {}).get("warnings") or []),
             "faults_injected": int((guard.get("faults") or {}).get("injections") or 0),
+            # ---- Step 6 回放 ----
+            # 写入时用 `result.replay`；旧调用点没有这个字段 → 退化成空 dict，
+            # 于是模式落成 "off"（而不是 NULL）—— NULL 会被读成"未知"，
+            # 而那时确实就是没开缓存。
+            "replay_mode": (result.replay or {}).get("mode") or "off",
+            "replay_stats": json.dumps(result.replay or {}, ensure_ascii=False),
         }
         placeholders = ",".join("?" for _ in columns)
         column_names = ",".join(columns)
@@ -343,25 +448,42 @@ class SpanStore:
             conn.execute(
                 """INSERT INTO bench_suites
                    (suite_id, label, model_name, temperature, runs_per_task, concurrency,
-                    budget_mode, started_at, elapsed_s, total_runs, successes, task_count, notes)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    budget_mode, started_at, elapsed_s, total_runs, successes, task_count, notes,
+                    guard_config, fault_spec, replay_mode, arms, interleaved)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     suite.suite_id, suite.label, suite.model_name, suite.temperature,
                     suite.runs_per_task, suite.concurrency, suite.budget_mode, suite.started_at,
                     suite.elapsed_s, suite.total_runs, suite.successes, len(suite.task_summaries),
                     json.dumps(suite.notes, ensure_ascii=False),
+                    getattr(suite, "guard_config", "") or "",
+                    getattr(suite, "fault_spec", "") or "",
+                    getattr(suite, "replay_mode", "off") or "off",
+                    json.dumps(getattr(suite, "arms", []) or [], ensure_ascii=False),
+                    1 if getattr(suite, "interleaved", False) else 0,
                 ),
             )
 
     def finalize_suite(self, suite: Any) -> None:
-        """运行结束后回写汇总字段（总数/成功数/耗时）。"""
+        """运行结束后回写汇总字段（总数/成功数/耗时 + 实验条件）。
+
+        实验条件（guard / fault / replay / arms）在这里**再写一次**：
+        header 是在跑之前写的，那时如果调用方还没把臂信息填进 suite，
+        落库的就是空值；事后没人能区分"没记录"与"确实没有"。
+        """
         with self._connect() as conn:
             conn.execute(
                 """UPDATE bench_suites
-                   SET elapsed_s = ?, total_runs = ?, successes = ?, task_count = ?, notes = ?
+                   SET elapsed_s = ?, total_runs = ?, successes = ?, task_count = ?, notes = ?,
+                       guard_config = ?, fault_spec = ?, replay_mode = ?, arms = ?, interleaved = ?
                    WHERE suite_id = ?""",
                 (suite.elapsed_s, suite.total_runs, suite.successes,
                  len(suite.task_summaries), json.dumps(suite.notes, ensure_ascii=False),
+                 getattr(suite, "guard_config", "") or "",
+                 getattr(suite, "fault_spec", "") or "",
+                 getattr(suite, "replay_mode", "off") or "off",
+                 json.dumps(getattr(suite, "arms", []) or [], ensure_ascii=False),
+                 1 if getattr(suite, "interleaved", False) else 0,
                  suite.suite_id),
             )
 
@@ -373,10 +495,10 @@ class SpanStore:
                 """INSERT INTO bench_runs
                    (run_id, suite_id, task_uid, task_key, group_name, run_index, ok, self_reported_ok,
                     failed_checks, process_flags, task_id, sut_name, tokens, cost_usd, elapsed_ms,
-                    llm_calls, tool_calls, steps_done, error_type, error, budget_violated,
+                    llm_calls, tool_calls, steps_done, error_type, error, guard_config, budget_violated,
                     budget_would_stop, action_diversity, postcondition_warnings, faults_injected,
-                    created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    fault_spec, arm, replay_mode, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     outcome.run_id, outcome.suite_id, outcome.task_uid, outcome.task_key,
                     outcome.group, outcome.run_index,
@@ -386,10 +508,13 @@ class SpanStore:
                     json.dumps(outcome.process_flags, ensure_ascii=False),
                     outcome.task_id, outcome.sut_name, outcome.tokens, outcome.cost_usd,
                     outcome.elapsed_ms, outcome.llm_calls, outcome.tool_calls, outcome.steps_done,
-                    outcome.error_type, outcome.error,
+                    outcome.error_type, outcome.error, outcome.guard_config,
                     json.dumps(outcome.budget_violated, ensure_ascii=False),
                     1 if outcome.budget_would_stop else 0, outcome.action_diversity,
                     outcome.postcondition_warnings, outcome.faults_injected,
+                    getattr(outcome, "fault_spec", "") or "",
+                    getattr(outcome, "arm", "") or "",
+                    getattr(outcome, "replay_mode", "off") or "off",
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
@@ -441,7 +566,13 @@ class SpanStore:
             if not suite_row:
                 return None
             run_rows = conn.execute(
-                "SELECT * FROM bench_runs WHERE suite_id = ? ORDER BY task_uid, run_index",
+                # 联表取 tool_sequence：工具调用次数必须从**事件流**算，
+                # 而不是从 bench_runs.tool_calls 列读 —— 那一列的历史数据里，
+                # guard=none 的运行是 0（因为当时的计数靠 loop_guard，而它被关掉了）。
+                # 不这样修的话，"无加固 vs 加固"的对比会出现完全虚假的"+31 次工具调用"。
+                """SELECT b.*, t.tool_sequence AS task_tool_sequence
+                   FROM bench_runs b LEFT JOIN tasks t ON b.task_id = t.task_id
+                   WHERE b.suite_id = ? ORDER BY b.task_uid, b.run_index""",
                 (suite_id,),
             ).fetchall()
 
@@ -463,15 +594,22 @@ class SpanStore:
                 cost_usd=row["cost_usd"] or 0.0,
                 elapsed_ms=row["elapsed_ms"] or 0,
                 llm_calls=row["llm_calls"] or 0,
-                tool_calls=row["tool_calls"] or 0.0,
+                tool_calls=_tool_calls_from_row(row),
                 steps_done=row["steps_done"] or 0,
                 error_type=row["error_type"],
                 error=row["error"],
+                guard_config=row["guard_config"] or "all",
                 budget_violated=json.loads(row["budget_violated"] or "[]"),
                 budget_would_stop=bool(row["budget_would_stop"]),
                 action_diversity=row["action_diversity"],
                 postcondition_warnings=row["postcondition_warnings"] or 0,
                 faults_injected=row["faults_injected"] or 0,
+                fault_spec=_column(row, "fault_spec") or "",
+                arm=_column(row, "arm") or "",
+                replay_mode=_column(row, "replay_mode") or "off",
+                replay_misses=_replay_misses_from_flags(
+                    json.loads(row["process_flags"] or "[]")
+                ),
             )
             for row in run_rows
         ]
@@ -489,6 +627,11 @@ class SpanStore:
             elapsed_s=suite_row["elapsed_s"] or 0.0,
             notes=json.loads(suite_row["notes"] or "[]"),
             self_report_available=all(row["self_reported_ok"] is not None for row in run_rows),
+            guard_config=_column(suite_row, "guard_config") or "",
+            fault_spec=_column(suite_row, "fault_spec") or "",
+            replay_mode=_column(suite_row, "replay_mode") or "off",
+            arms=_json_items(_column(suite_row, "arms")),
+            interleaved=bool(_column(suite_row, "interleaved")),
             outcomes=outcomes,
             task_summaries=[
                 summarize_task(suites[uid], [o for o in outcomes if o.task_uid == uid])
@@ -517,18 +660,30 @@ class SpanStore:
                 bucket.append(dict(row))
         return grouped
 
-    def avg_cost_for_group(self, group: str) -> Optional[float]:
+    def avg_cost_for_group(self, group: str, *, faulted: Optional[bool] = None) -> Optional[float]:
         """某个分组的历史平均单次成本（用于**预估预算**）。
 
-        为什么需要它：CLI 原本用一个写死的系数（$0.045/次）估成本，
+        why 需要它：CLI 原来用一个写死的系数（$0.045/次）估成本，
         那系数来自冒烟测试的简单任务；实测 semireal 任务的平均成本是它的 3 倍，
         导致"预估 $1.8、实际花 $5" —— 花钱的事上估错 3 倍是不能接受的。
         改成读实测历史：没有历史时由调用方给保守默认值。
+
+        :param faulted: True = 只看**带故障注入**的运行；
+            False = 只看无故障的。这一区分很关键：实测故障格的单次成本是基线的
+            2~3 倍（Agent 会因为产物被截断而反复重试），
+            用无故障均值去估故障实验会低估一半以上。
         """
+        clause = ""
+        params: List[Any] = [group]
+        if faulted is True:
+            clause = " AND faults_injected > 0"
+        elif faulted is False:
+            clause = " AND COALESCE(faults_injected, 0) = 0"
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n FROM bench_runs WHERE group_name = ?",
-                (group,),
+                f"SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n FROM bench_runs "
+                f"WHERE group_name = ?{clause}",
+                params,
             ).fetchone()
         if not row or not row["n"]:
             return None
