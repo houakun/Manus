@@ -1335,7 +1335,30 @@ def build_parser() -> argparse.ArgumentParser:
     clean_parser.add_argument("--yes", action="store_true", help="确认删除（默认 dry-run）")
     clean_parser.set_defaults(func=_cmd_sandbox_clean)
 
+    env_parser = sandbox_sub.add_parser(
+        "env", help="打印 Agent 会看到的环境指纹（工具面 + 短摘要）"
+    )
+    env_parser.add_argument("--json", action="store_true", help="输出机器可读的 JSON")
+    env_parser.set_defaults(func=_cmd_sandbox_env)
+
     return parser
+
+
+def _cmd_sandbox_env(args: argparse.Namespace) -> int:
+    """`lab sandbox env`：Agent 到底能看到哪些工具。
+
+    为什么值得一条命令：实测同一个任务从 Git Bash 启动与从 PowerShell 启动，
+    工具面完全不同（后者连 python 都没有）—— 而那种差异会让两次跑不可比。
+    把环境变成一条可查、可落库、可 GROUP BY 的事实，而不是假设。
+    """
+    from lab.infra.env import environment_fingerprint, render_fingerprint
+
+    fingerprint = environment_fingerprint()
+    if args.json:
+        print(json.dumps(fingerprint, ensure_ascii=False, indent=2))
+    else:
+        print(render_fingerprint(fingerprint))
+    return 0
 
 
 def main(argv=None) -> int:

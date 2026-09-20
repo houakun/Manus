@@ -178,6 +178,11 @@ _BENCH_SUITE_COLUMNS = {
     "replay_mode": "TEXT",
     "arms": "TEXT",
     "interleaved": "INTEGER",
+    # 环境指纹（Step 8）：Agent 当时能看到哪些工具。
+    # 两个列而不是一个：`env_digest` 用来 GROUP BY（"这几组是不是同一个环境"），
+    # `env_fingerprint` 存完整 JSON（要解释 digest 时看它）。
+    "env_digest": "TEXT",
+    "env_fingerprint": "TEXT",
 }
 
 
@@ -449,8 +454,9 @@ class SpanStore:
                 """INSERT INTO bench_suites
                    (suite_id, label, model_name, temperature, runs_per_task, concurrency,
                     budget_mode, started_at, elapsed_s, total_runs, successes, task_count, notes,
-                    guard_config, fault_spec, replay_mode, arms, interleaved)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    guard_config, fault_spec, replay_mode, arms, interleaved,
+                    env_digest, env_fingerprint)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     suite.suite_id, suite.label, suite.model_name, suite.temperature,
                     suite.runs_per_task, suite.concurrency, suite.budget_mode, suite.started_at,
@@ -461,6 +467,8 @@ class SpanStore:
                     getattr(suite, "replay_mode", "off") or "off",
                     json.dumps(getattr(suite, "arms", []) or [], ensure_ascii=False),
                     1 if getattr(suite, "interleaved", False) else 0,
+                    getattr(suite, "env_digest", "") or "",
+                    getattr(suite, "env_fingerprint", "") or "",
                 ),
             )
 
@@ -475,7 +483,8 @@ class SpanStore:
             conn.execute(
                 """UPDATE bench_suites
                    SET elapsed_s = ?, total_runs = ?, successes = ?, task_count = ?, notes = ?,
-                       guard_config = ?, fault_spec = ?, replay_mode = ?, arms = ?, interleaved = ?
+                       guard_config = ?, fault_spec = ?, replay_mode = ?, arms = ?, interleaved = ?,
+                       env_digest = ?, env_fingerprint = ?
                    WHERE suite_id = ?""",
                 (suite.elapsed_s, suite.total_runs, suite.successes,
                  len(suite.task_summaries), json.dumps(suite.notes, ensure_ascii=False),
@@ -484,6 +493,8 @@ class SpanStore:
                  getattr(suite, "replay_mode", "off") or "off",
                  json.dumps(getattr(suite, "arms", []) or [], ensure_ascii=False),
                  1 if getattr(suite, "interleaved", False) else 0,
+                 getattr(suite, "env_digest", "") or "",
+                 getattr(suite, "env_fingerprint", "") or "",
                  suite.suite_id),
             )
 
@@ -632,6 +643,8 @@ class SpanStore:
             replay_mode=_column(suite_row, "replay_mode") or "off",
             arms=_json_items(_column(suite_row, "arms")),
             interleaved=bool(_column(suite_row, "interleaved")),
+            env_digest=_column(suite_row, "env_digest") or "",
+            env_fingerprint=_column(suite_row, "env_fingerprint") or "",
             outcomes=outcomes,
             task_summaries=[
                 summarize_task(suites[uid], [o for o in outcomes if o.task_uid == uid])

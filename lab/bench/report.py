@@ -93,6 +93,10 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
                      f"{'、'.join(suite.arm_labels)}）")
     if suite.concurrency > 1:
         lines.append(f"- ⚠️ **并发度**: {suite.concurrency}（耗时指标不可横向比较）")
+    if getattr(suite, "env_digest", ""):
+        # 环境指纹："这次跑的时候 Agent 看到了哪些工具"。
+        # 没有它，换个 shell 启动就能让两次跑不可比，而报告里看不出来。
+        lines.append(f"- **环境指纹**: `{suite.env_digest}`（`python -m lab sandbox env` 看详情）")
     lines.append("")
 
     # ==================== 总体指标 ====================

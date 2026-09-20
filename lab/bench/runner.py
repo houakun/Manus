@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import shutil
 import time
@@ -37,6 +38,7 @@ from lab.api import run_task
 from lab.bench.stats import Interval, TaskLevelRates, mean_ci, wilson_interval
 from lab.bench.task import BenchTask, load_all_tasks
 from lab.bench.verifier import CheckResult, evaluate_process, run_checks
+from lab.infra.env import environment_fingerprint
 from lab.infra.local_sandbox import LocalSandbox
 
 
@@ -221,6 +223,12 @@ class SuiteResult(BaseModel):
     # 旧数据（在加 self_reported_ok 字段之前跑的）没有这个字段。
     # 用显式标志而不是把 NULL 当成 False —— 把"未知"当成"没虚报"就是造假数据。
     self_report_available: bool = True
+    # ---- 环境指纹（Step 8）----
+    # 为什么要落库：噪声地板宽到 ±24% 时，"这次跑的时候 Agent 看到了哪些工具"
+    # 必须能查 —— 否则换个 shell 启动就能让两次跑不可比，而报告里看不出来。
+    # digest 用来 GROUP BY（"这几组是不是同一个环境"），fingerprint 存完整 JSON。
+    env_digest: str = ""
+    env_fingerprint: str = ""
 
     # ---- 实验条件与交错 ----
 
@@ -803,6 +811,8 @@ async def run_suite(
         )
 
     suite_id = str(uuid.uuid4())
+    # 环境指纹：本机工具面的固定函数（不依赖启动上下文，见 lab/infra/env.py）
+    fingerprint = environment_fingerprint()
     llm_config = load_llm_config(temperature=temperature)
 
     suite = SuiteResult(
@@ -824,6 +834,10 @@ async def run_suite(
         replay_mode=str(replay or "off"),
         arms=[arm.to_metadata() for arm in effective_arms],
         interleaved=interleave,
+        # 环境指纹：一次评测只算一次（它是本机的固定函数），落进 suite 头。
+        # 不落它的话，"同一份代码两次跑不可比"这类问题永远查不出来。
+        env_digest=fingerprint["digest"],
+        env_fingerprint=json.dumps(fingerprint, ensure_ascii=False),
     )
 
     started = time.monotonic()

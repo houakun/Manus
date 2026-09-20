@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,7 +24,12 @@ from lab.infra.local_sandbox import LocalSandbox, SandboxPathError
 
 @pytest.fixture()
 def sandbox(tmp_path: Path) -> LocalSandbox:
-    """每个用例一个全新的沙箱根目录，测试之间互不污染。"""
+    """每个用例一个全新的沙箱根目录，测试之间互不污染。
+
+    ⚠️ 这个 fixture 必须**释放沙箱**：`LocalSandbox` 现在会占一个 `subst` 虚拟盘符，
+    而它是**进程外资源** —— 不释放就会一直占着字母。实测：不给 fixture 加清理时，
+    一次 pytest 就把 22 个候选盘符全用光了，后续运行只能静默退化成"逃逸只告警"。
+    """
     return LocalSandbox(tmp_path / "workspace", exec_timeout=20)
 
 
@@ -262,8 +268,13 @@ async def test_extra_env_is_opt_in(sandbox: LocalSandbox):
 # ==================== 6. 脚本逃逸检测（安全 + 正确性） ====================
 
 @pytest.mark.asyncio
-async def test_detects_script_writing_outside_workspace(sandbox: LocalSandbox):
-    """脚本里用 `/home/ubuntu/...` 绝对路径会落到工作区外，必须被检测到。
+async def test_detects_script_writing_outside_workspace(tmp_path: Path, monkeypatch):
+    """**关掉虚拟盘**时，脚本里的绝对路径仍会落到工作区外 —— 那种情况必须被检测到。
+
+    ⚠️ 修好虚拟盘之后，这条用例**必须显式关掉虚拟盘**才有意义：
+    默认路径下产物已经被导回工作区（见 test_script_absolute_paths_land_inside_workspace），
+    逃逸不再发生。保留它是因为 subst 可能不可用（组策略 / 盘符占满），
+    那时它仍是唯一的发现手段 —— 而"产物找不到"这类问题必须能一眼归因。
 
     这是 fast mode 的真实缺陷（不是假设）：路径映射只作用于文件工具与命令行，
     管不到脚本内容。实测在一次真实的 `sem_refactor_config` 运行里，
@@ -271,6 +282,10 @@ async def test_detects_script_writing_outside_workspace(sandbox: LocalSandbox):
     因为 Windows 风格的反斜杠在这个 docstring 里会被 Python 当成转义序列 —— 
     这就是为什么本仓库的脚本内容里一律用 chr(10)/chr(47) 拼字符）。
     """
+    monkeypatch.setenv("LAB_SANDBOX_VIRTUAL_DRIVE", "0")
+    sandbox = LocalSandbox(tmp_path / "ws", exec_timeout=20)
+    await sandbox.ensure_sandbox()
+
     escaped_root = sandbox._escaped_root()
     if escaped_root is None:
         pytest.skip("无法确定逃逸目录")
@@ -413,3 +428,176 @@ async def test_failed_command_error_text_is_readable(sandbox: LocalSandbox):
     output = result.data["output"]
     assert "\ufffd" not in output, f"报错里有乱码: {output!r}"
     assert "\r" not in output
+
+
+# ==================== 5. 两个保真装置（噪声地板实测之后加的） ====================
+#
+# 这两个装置的存在理由都是**实测**出来的（见 docs/noise-floor-measured.md）：
+# 噪声地板 ±24% 里有一大块不是模型抖动，而是本地实现的失真。
+
+@pytest.mark.skipif(sys.platform != "win32", reason="虚拟盘符是 Windows 机制")
+@pytest.mark.asyncio
+async def test_script_absolute_paths_land_inside_workspace(tmp_path: Path):
+    """脚本**内容**里的 `/home/ubuntu/...` 必须落进工作区，而不是真实盘根。
+
+    这是 noise-floor-measured.md §8 那次真实失败的回归测试：
+    Agent 写 `DB_PATH = "/home/ubuntu/sales.db"`，而字符串替换只作用于命令行、
+    管不到脚本内容 → 产物落到 `<盘>:/home/ubuntu/`，判定器读不到 →
+    **正确的工作被判失败，而且 error_type 为空**（SUT 自己以为成功了），
+    看起来像"Agent 写错代码"。
+
+    机制：给每次运行分配一个 subst 虚拟盘指向工作区，子进程 cwd 落在该盘上；
+    Windows 的无盘符绝对路径按"当前盘"解析，于是自动指向工作区内的同一位置。
+    """
+    sb = LocalSandbox(tmp_path / "ws", exec_timeout=30)
+    await sb.ensure_sandbox()
+    script = sb._root / "home" / "ubuntu" / "w.py"
+    script.write_text(
+        "import pathlib\npathlib.Path('/home/ubuntu/inside.txt').write_text('ok')\n",
+        encoding="utf-8",
+    )
+
+    result = await sb.exec_command("d1", "/home/ubuntu", f'"{sys.executable}" /home/ubuntu/w.py')
+
+    assert result.data["returncode"] == 0, result.data["output"]
+    inside = sb._root / "home" / "ubuntu" / "inside.txt"
+    assert inside.exists(), "产物没落在工作区里 —— 逃逸又回来了"
+    assert inside.read_text(encoding="utf-8") == "ok"
+    # 导回工作区之后，逃逸告警就不该再响（否则它又变成噪声化的安全告警）
+    assert result.data["escaped_paths"] == []
+    await sb.destroy()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="虚拟盘符是 Windows 机制")
+@pytest.mark.asyncio
+async def test_virtual_drive_is_released(tmp_path: Path):
+    """盘符必须被释放。
+
+    它**不随进程退出消失**，会一直占着字母直到重启或手工 `subst /D`；
+    26 个字母用完，后续运行就只能退化成"逃逸只告警"。
+    """
+    import os
+
+    sb = LocalSandbox(tmp_path / "ws", exec_timeout=30)
+    await sb.ensure_sandbox()
+    drive = sb._drive
+    assert drive is not None, "没有分配虚拟盘（subst 不可用？）"
+    assert os.path.exists(drive + "\\")
+
+    await sb.destroy()
+
+    assert sb._drive is None
+    assert not os.path.exists(drive + "\\"), f"{drive} 没被释放，会泄漏盘符"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="虚拟盘符是 Windows 机制")
+@pytest.mark.asyncio
+async def test_stale_drive_mapping_is_reclaimed(tmp_path: Path):
+    """目标目录已不存在的陈旧映射不能挡住分配，而且必须被清掉。
+
+    为什么需要回收：盘符是进程外资源，被强杀的进程会留下映射，
+    而候选字母只有 26 个。不回收的话，跑久了就会"拿不到盘符 → 静默退化"。
+
+    只回收"目标已不存在"的：目标还在的映射可能是**另一个并发进程**正在用的，
+    抢它会弄坏别人正在跑的任务。
+
+    ⚠️ 本用例会自己造一个陈旧映射，所以结束前**必须自己清掉** ——
+    测试弄脏的环境要自己恢复，否则每次跑测试都会在盘根留下垃圾映射。
+    """
+    import shutil
+
+    from lab.infra.local_sandbox import _DRIVE_POOL, list_drive_mappings
+
+    ghost = tmp_path / "ghost-ws"
+    ghost.mkdir()
+    probe = LocalSandbox(ghost, exec_timeout=20)
+    await probe.ensure_sandbox()
+    letter = probe._drive
+    assert letter is not None, "没有可用盘符（上一个用例泄漏了？）"
+
+    # 模拟"进程被强杀"：把目标目录删掉，但映射还留着
+    await probe.destroy()
+    probe._drive = letter  # 假装没释放
+    _DRIVE_POOL[letter] = str(ghost)
+    subprocess.run(["subst", letter, str(ghost)], capture_output=True)
+    shutil.rmtree(ghost, ignore_errors=True)
+
+    try:
+        fresh = LocalSandbox(tmp_path / "fresh-ws", exec_timeout=20)
+        await fresh.ensure_sandbox()
+        assert fresh._drive is not None
+        # 不变量：新拿到的盘符必须指向**它自己的工作区**
+        target = {m["drive"]: m["target"] for m in list_drive_mappings()}.get(fresh._drive, "")
+        assert target.lower() == str(fresh._root).lower(), f"{fresh._drive} 指向了别处: {target}"
+        await fresh.destroy()
+    finally:
+        # 自己造的陈旧映射自己清（哪怕断言失败也要清）
+        subprocess.run(["subst", letter, "/D"], capture_output=True)
+        _DRIVE_POOL.pop(letter, None)
+
+
+@pytest.mark.asyncio
+async def test_crlf_written_by_scripts_is_normalized(tmp_path: Path):
+    """脚本写出的 CRLF 要归一为 LF —— 目标环境 Ubuntu 根本不产出 CRLF。
+
+    为什么值得一个用例：模型看到 `\r\n` 会**正确地**（对 Linux 而言）去修它，
+    实测地板 suite 里 **9.5% 的 shell 调用**在追行尾（`od -c` / `cmp` / `tr -d '\r'`），
+    其中 sem_csv_clean 一个任务占 16 次。这是纯浪费，不是能力问题。
+    """
+    sb = LocalSandbox(tmp_path / "ws", exec_timeout=30)
+    await sb.ensure_sandbox()
+    (sb._root / "home" / "ubuntu" / "w.py").write_text(
+        "import pathlib\npathlib.Path('/home/ubuntu/crlf.txt').write_text('a\\nb\\n')\n",
+        encoding="utf-8",
+    )
+
+    result = await sb.exec_command("d1", "/home/ubuntu", f'"{sys.executable}" /home/ubuntu/w.py')
+
+    data = (sb._root / "home" / "ubuntu" / "crlf.txt").read_bytes()
+    # 平台无关的不变量：产物必须是 LF（Ubuntu 的形状）
+    assert data == b"a\nb\n", data
+    if sys.platform == "win32":
+        # Windows 上 Python 文本模式本来会写 CRLF，所以必须真的发生过归一
+        assert "/home/ubuntu/crlf.txt" in result.data["normalized_line_endings"]
+    await sb.destroy()
+
+
+@pytest.mark.asyncio
+async def test_binary_files_are_never_touched(tmp_path: Path):
+    """含 NUL 字节的文件一律不动 —— 数据库 / zip / 图片被改会直接毁掉产物。
+
+    这是归一装置的**反向**保护：只归一文本。用 NUL 字节当判据（而不是后缀名），
+    因为后缀名可以骗人，而 NUL 在文本文件里几乎不会出现。
+    """
+    sb = LocalSandbox(tmp_path / "ws", exec_timeout=30)
+    await sb.ensure_sandbox()
+    payload = b"PK\x03\x04\x00\x00row1\r\nrow2\r\n"
+    (sb._root / "home" / "ubuntu" / "blob.bin").write_bytes(payload)
+
+    await sb.exec_command("d1", "/home/ubuntu", "echo ok")
+
+    assert (sb._root / "home" / "ubuntu" / "blob.bin").read_bytes() == payload
+    await sb.destroy()
+
+
+@pytest.mark.asyncio
+async def test_crlf_normalization_can_be_disabled(tmp_path: Path, monkeypatch):
+    """归一必须能被关掉 —— 否则"这次变化是不是归一带来的"就无法回答。
+
+    开关的意义与 `--guard none` 相同：**对照实验的前提**。
+    """
+    monkeypatch.setenv("LAB_SANDBOX_NORMALIZE_CRLF", "0")
+    sb = LocalSandbox(tmp_path / "ws", exec_timeout=30)
+    await sb.ensure_sandbox()
+    (sb._root / "home" / "ubuntu" / "w.py").write_text(
+        "import pathlib\npathlib.Path('/home/ubuntu/crlf.txt').write_text('a\\nb\\n')\n",
+        encoding="utf-8",
+    )
+
+    result = await sb.exec_command("d1", "/home/ubuntu", f'"{sys.executable}" /home/ubuntu/w.py')
+
+    assert result.data["normalized_line_endings"] == []
+    data = (sb._root / "home" / "ubuntu" / "crlf.txt").read_bytes()
+    if sys.platform == "win32":
+        assert b"\r\n" in data, "关掉开关后应该保留 CRLF（这就是对照组的形状）"
+    await sb.destroy()

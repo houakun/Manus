@@ -22,10 +22,36 @@ SUT 的 FileTool / ShellTool 本身**不含任何业务逻辑**，它们只是 `
    `../../../Users/x/.ssh/id_rsa` 就能读写真实机器上的任意文件。
    这里用两道防线：拒绝含 `..` 的路径 + `resolve()` 后再做包含性检查（防符号链接逃逸）。
 
+== 两个"保真"装置（都是实测噪声地板之后加的，见 noise-floor-measured.md）==
+
+3. **虚拟盘符：把脚本内容里的绝对路径也导回工作区**
+   字符串替换只作用于命令行，**管不到脚本内容** —— 于是 Agent 写的脚本里
+   一句 `/home/ubuntu/sales.db` 就会落到 `<当前盘>:/home/ubuntu`（工作区外）。
+   修法不是改写脚本内容（那会把 `D:\\...` 泄进模型上下文，破坏"我在 Linux 上"的假设），
+   而是：**给每次运行分配一个 `subst` 虚拟盘符指向工作区**，并让子进程的 cwd 落在该盘上。
+   Windows 的无盘符绝对路径是按"**当前盘**"解析的，于是 `/home/ubuntu/x` 自动变成
+   `<虚拟盘>:\\home\\ubuntu\\x` —— 正是工作区里的那个位置，脚本一个字都不用改。
+   并发安全：每次运行用自己的盘符，`--concurrency > 1` 不会互相抢（这也是它优于
+   "在盘根建 junction"的地方 —— 那是全局状态）。
+
+4. **工作区内文本文件的 CRLF 归一为 LF**
+   目标环境是 Ubuntu：在那里 `sqlite3 ... > report.txt` 与 Python 文本模式写入
+   （`write_text` / `open('w')`）都产出 **LF**。Windows 上原生程序会产出 **CRLF**，
+   而模型看到 `\\r\\n` 会**正确地**（对 Linux 而言）去修一个它自己造不出来的问题。
+   实测：修复命令输出行尾之后，地板 suite 里**仍有 9.5% 的 shell 调用在追行尾**
+   （`od -c` / `cmp` / `tr -d '\\r'`），其中 `sem_csv_clean` 一个任务占 16 次。
+   所以命令执行后把工作区内文本文件的 CRLF 归一为 LF（二进制文件按 NUL 字节跳过）。
+
 == 已知限制（Step 1 明确接受，写进文档而不是藏着）==
 - `shell_execute` 是"跑完即返回"，没有 SUT 真沙箱那种可交互的**持久 Shell 会话**；
 - 命令中的沙箱绝对路径靠**字符串替换**成本地真实路径，复杂命令（heredoc、变量拼接、
   通配符展开）可能替换不到 —— 这是近似模拟，不等价于真沙箱；
+  （脚本内容里的绝对路径由上面的虚拟盘符兜住，但**命令里的**复杂 shell 语法仍只是近似）
+- **子进程的 PATH 继承自本进程**：从 Git Bash 启动会带上 Git 的 `usr\\bin`
+  （于是 `sqlite3` / `grep` / `od` / `tr` 全在），从 PowerShell 启动则全都不在。
+  也就是说"Agent 看到的世界"取决于评测是怎么被启动的 —— 这是**已知的、尚未修的可复现性缺陷**
+  （证据：同一段命令在两种上下文里 `where sqlite3` 一个成功一个失败），
+  修它需要先定"fast mode 保证哪些工具存在"，故未在本轮动。
 - 不提供浏览器与网络能力（fast mode 的工具集里已经把浏览器/搜索工具去掉了）。
 以上限制决定了 fast mode 适合**计算 / 文件 IO / 文本处理类确定性任务**，
 不适合浏览器任务 —— 后者仍需真沙箱，Step 4 的任务集要按这个边界来设计。
@@ -34,6 +60,7 @@ SUT 的 FileTool / ShellTool 本身**不含任何业务逻辑**，它们只是 `
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import ctypes
 import io
@@ -44,10 +71,13 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
+import weakref
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Dict, List, Optional
 
 from lab.bootstrap import ensure_sut_on_path
+from lab.infra.env import deterministic_path, environment_fingerprint
 
 ensure_sut_on_path()
 
@@ -127,6 +157,126 @@ def decode_command_output(raw: Optional[bytes]) -> str:
 
 class SandboxPathError(ValueError):
     """路径越界或非法时抛出。"""
+
+
+# ==================== 虚拟盘符池（进程级） ====================
+#
+# 为什么需要"池"而不是"随用随取"：`subst` 映射是**进程外资源** ——
+# 它不随 Python 对象消失，也不随进程退出自动消失。于是任何一条不调 `destroy()`
+# 的路径（测试、验证器、临时脚本）都会永久占着一个字母。
+# 实测：一次 pytest 就把 22 个候选盘符全用光了 —— 而后果是**静默退化**：
+# 后续运行拿不到盘符，脚本逃逸又回来了，但没有任何人会发现。
+# 所以：池 + 显式释放 + 进程退出兑底 + 回收（仅当映射的目标目录已不存在时）。
+# 池里存的是**弱引用**，而不是字符串。
+#
+# 为什么必须是弱引用："盘符在池里"不等于"它正在被使用" ——
+# 一个被丢弃的沙箱对象（测试里最常见：`sandbox = LocalSandbox(...)` 然后函数返回）
+# 仍然占着池条目。只看池的话，这些被丢弃的盘符永远回收不了。
+# 弱引用能精确区分：`ref() is None` = 对象已被回收 = 这个盘符可以抢。
+# （实测：本仓库自己的 5 个测试文件共 18 处构造 LocalSandbox、0 处 destroy，
+#  所以"调用方会释放"这个假设在本仓库里就不成立。）
+_DRIVE_POOL: Dict[str, "weakref.ReferenceType"] = {}
+
+
+def _release_all_drives() -> None:
+    """进程退出时释放本进程占用的所有虚拟盘（atexit 兑底）。"""
+    for letter in list(_DRIVE_POOL):
+        with contextlib.suppress(Exception):
+            subprocess.run(["subst", letter, "/D"], capture_output=True, timeout=10)
+        with contextlib.suppress(Exception):
+            (_drive_registry_dir() / f"{letter.rstrip(':')}.pid").unlink(missing_ok=True)
+        _DRIVE_POOL.pop(letter, None)
+
+
+atexit.register(_release_all_drives)
+
+
+def _drive_registry_dir() -> Path:
+    """盘符归属登记目录。
+
+    ⚠️ 刻意放在**系统临时目录**，而不是工作区：工作区里每一个文件模型都可能看到，
+    一个莫名的 `.lab-drive` 文件就是新的失真源（而我们的目标恰恰是减少失真）。
+    """
+    path = Path(tempfile.gettempdir()) / "lab-drive-registry"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pid_alive(pid: int) -> bool:
+    """该进程是否还活着（用于判断别的进程留下的映射能不能回收）。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _drive_owner(drive: str) -> Optional[int]:
+    """读该盘符登记的属主 pid；没有登记返回 None。"""
+    with contextlib.suppress(Exception):
+        return int((_drive_registry_dir() / f"{drive.rstrip(':')}.pid").read_text().strip())
+    return None
+
+
+def _drive_is_reclaimable(drive: str, target: str) -> bool:
+    """该映射能不能被回收（**绝不能抢活着的别的进程的盘符**）。
+
+    三种可回收情形：
+    1. 目标目录不存在 → 工作区已被删，一定是陈旧的；
+    2. 没有归属登记 → 不是活着的 lab 进程建的；
+    3. 属主是本进程：池里没有记录、或弱引用已死（沙箱对象被丢弃）→ 可回收；
+       属主是**别的**进程且它已经死了 → 被强杀留下的。
+    """
+    if not target or not os.path.exists(target):
+        return True
+    owner = _drive_owner(drive)
+    if owner is None:
+        return True
+    if owner == os.getpid():
+        ref = _DRIVE_POOL.get(drive)
+        # 池里没记录 → 不是本进程现在占着的；弱引用已死 → 沙箱对象被丢弃了
+        return ref is None or ref() is None
+    return not _pid_alive(owner)
+
+
+def list_drive_mappings() -> List[Dict[str, str]]:
+    """列出当前所有 `subst` 映射（`letter -> target`）。供 CLI 与回收使用。"""
+    if os.name != "nt":
+        return []
+    with contextlib.suppress(Exception):
+        done = subprocess.run(["subst"], capture_output=True, text=True, timeout=10, errors="replace")
+        mappings: List[Dict[str, str]] = []
+        for line in (done.stdout or "").splitlines():
+            # 形如 `Z:\: => C:\path\to\ws`
+            if "=>" not in line:
+                continue
+            left, _, right = line.partition("=>")
+            # subst 的输出形如 `Z:\: => C:\path`（盘符后面带一个 `\:`），
+            # 所以只能取冒号**前**的那一段当盘符 —— 直接 rstrip 会得到 `Z:\:`。
+            letter = left.strip().split(":")[0].strip() + ":"
+            mappings.append({"drive": letter, "target": right.strip()})
+        return mappings
+    return []
 
 
 def escape_roots() -> List[Path]:
@@ -221,6 +371,11 @@ class LocalSandbox:
         self._exec_timeout = exec_timeout
         self._max_output_chars = max_output_chars
         self._extra_env = dict(extra_env or {})
+        # 虚拟盘符（见模块文档第 3 条）：None 表示没有/不可用，此时退化为旧行为。
+        self._drive: Optional[str] = None
+        # CRLF 归一（见模块文档第 4 条）。可用环境变量关掉，以便做 A/B 与排查。
+        self._normalize_crlf = os.environ.get("LAB_SANDBOX_NORMALIZE_CRLF", "1") not in ("0", "false", "")
+        self._use_virtual_drive = os.environ.get("LAB_SANDBOX_VIRTUAL_DRIVE", "1") not in ("0", "false", "")
         # shell 是"跑完即返回"，这里按 session_id 记住最后一次的输出/返回码，
         # 以便 shell_read_output / shell_wait_process 这两个工具仍能给出合理结果。
         self._session_outputs: Dict[str, str] = {}
@@ -253,6 +408,141 @@ class LocalSandbox:
         relative = Path(local_path).resolve().relative_to(self._root)
         return "/" + relative.as_posix()
 
+    # ==================== 虚拟盘符（把脚本里的绝对路径导回工作区） ====================
+    # 分配用的候选盘符：从后往前找，尽量不占用用户常用的靠前盘符。
+    _DRIVE_CANDIDATES = "ZYXWVUTSRQPONMLKJIHGFED"
+
+    def _ensure_virtual_drive(self) -> Optional[str]:
+        """为本次运行分配一个 `subst` 虚拟盘符，指向工作区根。
+
+        为什么需要它（见模块文档第 3 条）：命令行的字符串替换管不到**脚本内容**，
+        而 Windows 的无盘符绝对路径按"当前盘"解析 —— 只要子进程的当前盘是这个
+        虚拟盘，`/home/ubuntu/x` 就自动落进工作区，且脚本一个字都不用改。
+
+        失败时返回 None 并退化为旧行为（不做任何事，也不报错）：
+        `subst` 可能被组策略禁用，或候选盘符被占满 —— 那时只是逃逸检测继续告警，
+        而不是让整个评测跑不起来。
+        """
+        if os.name != "nt" or not self._use_virtual_drive:
+            return None
+        if self._drive:
+            return self._drive
+
+        # 1. 先找空闲字母。
+        for letter in self._DRIVE_CANDIDATES:
+            drive = f"{letter}:"
+            try:
+                if os.path.exists(drive + "\\"):
+                    continue  # 已被真实分区或别人的 subst 占用
+                if self._try_claim(drive):
+                    return self._drive
+            except Exception:
+                continue
+
+        # 2. 没有空闲字母：回收陈旧映射。
+        #    ⚠️ 判据必须是"属主已死/无属主"，不能只看"目标目录还在不在" ——
+        #    目标还在的映射可能是**另一个并发进程**正在用的，
+        #    抢它会把它正在跑的任务写到我们的工作区里（而且极难归因）。
+        for item in list_drive_mappings():
+            drive, target = item["drive"], item["target"]
+            if not _drive_is_reclaimable(drive, target):
+                continue
+            with contextlib.suppress(Exception):
+                subprocess.run(["subst", drive, "/D"], capture_output=True, timeout=10)
+            _DRIVE_POOL.pop(drive, None)
+            if self._try_claim(drive):
+                logger.info(f"回收了虚拟盘 {drive}（原目标：{target or '未知'}）")
+                return self._drive
+
+        logger.warning(
+            "未能分配 subst 虚拟盘（候选盘符都被活着的进程占用）：脚本内容里的 "
+            "/home/ubuntu 绝对路径仍会落到工作区外（逃逸检测会告警，但产物不在工作区）。"
+            "用 `subst` 查看映射，`subst <盘符>: /D` 手工清理。"
+        )
+        return None
+
+    def _try_claim(self, drive: str) -> bool:
+        """尝试把一个盘符映射到工作区；成功则记入池与实例。"""
+        with contextlib.suppress(Exception):
+            done = subprocess.run(
+                ["subst", drive, str(self._root)],
+                capture_output=True, text=True, timeout=10, errors="replace",
+            )
+            if done.returncode == 0 and os.path.exists(drive + "\\"):
+                self._drive = drive
+                _DRIVE_POOL[drive] = weakref.ref(self)
+                # 登记属主：别的进程靠它判断"这个映射还能不能抢"
+                with contextlib.suppress(Exception):
+                    (_drive_registry_dir() / f"{drive.rstrip(':')}.pid").write_text(str(os.getpid()))
+                logger.debug(f"已为本次运行分配虚拟盘 {drive} -> {self._root}")
+                return True
+        return False
+
+    def _release_virtual_drive(self) -> None:
+        """释放虚拟盘符。不释放会一直占着字母，直到重启或手工 `subst /D`。"""
+        if not self._drive:
+            return
+        with contextlib.suppress(Exception):
+            subprocess.run(["subst", self._drive, "/D"], capture_output=True, timeout=10)
+        with contextlib.suppress(Exception):
+            (_drive_registry_dir() / f"{self._drive.rstrip(':')}.pid").unlink(missing_ok=True)
+        _DRIVE_POOL.pop(self._drive, None)
+        self._drive = None
+
+    def _to_virtual(self, local_path: Path) -> str:
+        """把工作区内的真实路径换成"虚拟盘视图"，用于给子进程设 cwd。
+
+        必须走虚拟盘（而不是真实路径）的原因：**当前盘**由 cwd 决定，
+        而当前盘正是无盘符绝对路径的解析基准。用真实路径当 cwd 的话，
+        `/home/ubuntu/x` 又会落回真实盘根。
+        """
+        if not self._drive:
+            return str(local_path)
+        try:
+            relative = Path(local_path).resolve().relative_to(self._root)
+        except ValueError:
+            return str(local_path)
+        return f"{self._drive}\\" + str(relative).replace("/", "\\")
+
+    # ==================== CRLF 归一（保真，见模块文档第 4 条） ====================
+    # 单文件大小上限：超过就不动（避免为了归一去读一个几百 MB 的产物）
+    _MAX_NORMALIZE_BYTES = 2_000_000
+    # 单次命令最多归一多少个文件（防 Agent 造出成千上万个文件时把时间花在这里）
+    _MAX_NORMALIZE_FILES = 200
+
+    def _normalize_workspace_line_endings(self) -> List[str]:
+        """把工作区内**文本**文件的 CRLF 归一为 LF，返回被改动的逻辑路径。
+
+        判据与取舍：
+        - 只看工作区内部（绝不碰工作区外 —— 那里的东西本来就该被检测为逃逸）；
+        - 含 NUL 字节的按二进制跳过（数据库、zip、图片都不能动）；
+        - 只处理 `\r\n`，不动单独的 `\r`（后者可能是进度条等有含义的内容）；
+        - 超过大小上限的跳过。
+
+        为什么这不是"篡改产物"：目标环境 Ubuntu 本来就不产出 CRLF，
+        归一是在让本地产物与目标环境一致（与 `decode_command_output` 同一理由）。
+        """
+        changed: List[str] = []
+        for path in self._root.rglob("*"):
+            if len(changed) >= self._MAX_NORMALIZE_FILES:
+                break
+            try:
+                if not path.is_file():
+                    continue
+                if path.stat().st_size > self._MAX_NORMALIZE_BYTES:
+                    continue
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if b"\r\n" not in data or b"\x00" in data:
+                continue
+            try:
+                path.write_bytes(data.replace(b"\r\n", b"\n"))
+            except OSError:
+                continue
+            changed.append(self._to_logical(path))
+        return changed
+
     # ==================== 结果构造小工具 ====================
 
     @staticmethod
@@ -281,11 +571,16 @@ class LocalSandbox:
         self._root.mkdir(parents=True, exist_ok=True)
         (self._root / "home" / "ubuntu").mkdir(parents=True, exist_ok=True)
         (self._root / "tmp").mkdir(parents=True, exist_ok=True)
+        # 虚拟盘要在建好目录之后再挂：它映射的是工作区根，目录不存在时 subst 仍会成功，
+        # 但后续 `X:\home\ubuntu` 这种 cwd 会因为目录缺失而失败。
+        self._ensure_virtual_drive()
 
     async def destroy(self) -> bool:
         """销毁沙箱。**刻意不删除 workspace**：产物是评测证据，必须保留供人工检查。"""
         self._session_outputs.clear()
         self._session_returncodes.clear()
+        # 虚拟盘必须显式释放：它不随进程退出消失，会一直占着字母直到重启。
+        self._release_virtual_drive()
         return True
 
     async def get_browser(self):
@@ -556,9 +851,20 @@ class LocalSandbox:
         为什么必须做：模型会理所当然地使用提示词里教的绝对路径，
         而本地机器上并不存在 /home/ubuntu。
         限制：纯字符串替换，不解析 shell 语法 —— 见模块文档的"已知限制"。
+
+        ⚠️ 有虚拟盘时必须换成**虚拟盘上的绝对路径**（`Z:\\home\\ubuntu`），
+        不能继续用工作区的真实路径（`D:\\...\\home\\ubuntu`）：
+        子进程的当前盘是虚拟盘，而 cmd 的 `cd D:\\x` **不会切换盘符**（要 `cd /d`），
+        于是 `cd D:\\...\\docs && mv a.txt a.md` 里的 mv 仍跑在原目录 ——
+        实测：`bench validate` 里 syn_rename_files 的参考解就是这么挂的
+        （报错 `mv: cannot stat 'a.txt'`，看起来像任务坏了，其实是盘符不一致）。
         """
-        home_real = str(self._root / "home" / "ubuntu")
-        tmp_real = str(self._root / "tmp")
+        if self._drive:
+            home_real = f"{self._drive}\\home\\ubuntu"
+            tmp_real = f"{self._drive}\\tmp"
+        else:
+            home_real = str(self._root / "home" / "ubuntu")
+            tmp_real = str(self._root / "tmp")
         return command.replace(self.SANDBOX_HOME, home_real).replace(self.SANDBOX_TMP, tmp_real)
 
     def _build_child_env(self) -> Dict[str, str]:
@@ -585,10 +891,25 @@ class LocalSandbox:
             for key, value in os.environ.items()
             if key.upper() in self._ENV_ALLOWLIST
         }
+        # PATH **不能原样继承**：实测同一段命令从 Git Bash 启动能看到
+        # sqlite3/grep/od/tr，从 PowerShell 启动则全部看不到（连 python 都没有）——
+        # 也就是说"Agent 看到的世界"取决于评测是怎么被启动的。
+        # 改成"固定前缀 + 父 PATH 兜底"，详见 lab/infra/env.py 的模块文档。
+        env["PATH"] = deterministic_path(env.get("PATH"))
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
+        # extra_env 仍然放在最后：调用方显式传 PATH 时必须能覆盖（实验/对照用），
+        # 而指纹会如实反映覆盖后的结果。
         env.update(self._extra_env)
         return env
+
+    def env_fingerprint(self) -> Dict[str, Any]:
+        """本次运行 Agent 实际会看到的环境（工具面 + 可 GROUP BY 的短摘要）。
+
+        为什么要落库：噪声地板宽到 ±24% 时，"这次跑的时候 Agent 看到了什么"
+        必须能查 —— 否则换个 shell 启动就能让两次跑不可比，而报告里看不出来。
+        """
+        return environment_fingerprint(self._build_child_env().get("PATH", ""))
 
     # 工作区外快照的条目上限（防止 Agent 下载了一个大目录树时把内存吃光）
     _MAX_OUTSIDE_ENTRIES = 500
@@ -643,9 +964,12 @@ class LocalSandbox:
         2. **安全**：这意味着 fast mode 的"沙箱"可以被任意脚本逃出 ——
            它只能用于**可信的任务与内容**，绝不能跑外部输入。
 
-        这里只做**检测与告警**，不做阻断：
-        真要把绝对路径导向工作区需要盘根目录级别的 junction，
-        那是全局状态、并行任务会互相干扰，代价大于收益（已记录为已知限制）。
+        == 现在的处置（不再是"只告警"）==
+        脚本内容里的绝对路径由**虚拟盘符**导回工作区（见模块文档第 3 条）：
+        子进程的当前盘指向工作区，于是 `/home/ubuntu/x` 自动解析成
+        `<虚拟盘>:\\home\\ubuntu\\x`。所以正常情况下这里**不应该再告警**；
+        保留它是因为 subst 可能不可用（组策略/盘符占满），那时它仍是唯一的发现手段 ——
+        而"产物找不到"这类问题必须能一眼归因，而不是让人去怀疑判定器或模型能力。
         """
         if os.name == "nt":
             # Windows：无盘符的绝对路径按"当前盘"解析
@@ -655,6 +979,9 @@ class LocalSandbox:
 
     async def exec_command(self, session_id: str, exec_dir: str, command: str) -> ToolResult:
         """执行命令并等待结束（非交互式），返回 returncode 与合并后的输出。"""
+        # 懒加载虚拟盘：正常生命周期里 ensure_sandbox 已经挂好了，但验证器等其他
+        # 入口也可能直接跑命令 —— 挂盘是幂等的，这里再确认一次，代价只是一次属性判断。
+        self._ensure_virtual_drive()
         # 0.执行前先给"工作区外"拍个快照，用于检测脚本逃逸（见 _snapshot_outside）
         outside_before = self._snapshot_outside()
         # 1.解析工作目录（不存在就创建，避免因为目录问题浪费一次迭代）
@@ -669,6 +996,9 @@ class LocalSandbox:
             cwd.mkdir(parents=True, exist_ok=True)
 
         real_command = self._rewrite_paths(command)
+        # cwd 走"虚拟盘视图"：当前盘由 cwd 决定，而无盘符绝对路径按当前盘解析。
+        # 用真实路径当 cwd 的话，脚本里的 `/home/ubuntu/x` 会落回真实盘根。
+        cwd_virtual = self._to_virtual(cwd)
 
         # 2.启动子进程（shell=True：模型给的是 shell 命令，不是 argv 列表）
         #   POSIX 用 start_new_session / Windows 用 CREATE_NEW_PROCESS_GROUP，
@@ -681,7 +1011,7 @@ class LocalSandbox:
         try:
             process = await asyncio.create_subprocess_shell(
                 real_command,
-                cwd=str(cwd),
+                cwd=cwd_virtual,
                 env=self._build_child_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -742,6 +1072,13 @@ class LocalSandbox:
                 f"沙箱路径映射只作用于文件工具与命令行，管不到脚本内容。"
             )
 
+        # 归一工作区内文本文件的行尾（见模块文档第 4 条）。
+        # ⚠️ 只写进 data，**不能写进 message** —— message 是给模型看的，
+        # 一句"已归一 CRLF"就等于告诉它"你其实在 Windows 上"，反而制造新的失真。
+        normalized = self._normalize_workspace_line_endings() if self._normalize_crlf else []
+        if normalized:
+            logger.debug(f"已把 {len(normalized)} 个工作区文件的 CRLF 归一为 LF（目标环境 Ubuntu 不产出 CRLF）")
+
         return ToolResult(
             success=True,
             message=f"命令执行完成{hint}" + ("（检测到工作区外写入）" if escaped else ""),
@@ -752,6 +1089,7 @@ class LocalSandbox:
                 "returncode": process.returncode,
                 "output": output,
                 "escaped_paths": escaped,
+                "normalized_line_endings": normalized,
             },
         )
 

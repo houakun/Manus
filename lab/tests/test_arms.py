@@ -360,7 +360,8 @@ def test_legacy_suite_without_new_columns_still_loads(tmp_path):
     store.save_suite(suite)
 
     with sqlite3.connect(str(path)) as conn:
-        for column in ("guard_config", "fault_spec", "replay_mode", "arms", "interleaved"):
+        for column in ("guard_config", "fault_spec", "replay_mode", "arms", "interleaved",
+                       "env_digest", "env_fingerprint"):
             conn.execute(f"ALTER TABLE bench_suites DROP COLUMN {column}")
         for column in ("fault_spec", "arm", "replay_mode", "guard_config"):
             conn.execute(f"ALTER TABLE bench_runs DROP COLUMN {column}")
@@ -372,6 +373,8 @@ def test_legacy_suite_without_new_columns_still_loads(tmp_path):
     assert loaded is not None
     assert loaded.arms == [] and loaded.interleaved is False
     assert loaded.replay_mode == "off" and loaded.guard_config == ""
+    # 环境指纹（Step 8）同样要退化成空串，而不是让整个加载挂掉
+    assert loaded.env_digest == "" and loaded.env_fingerprint == ""
     # 运行级缺失的实验条件也得退化成默认值，而不是让整个加载挂掉
     assert loaded.outcomes[0].fault_spec == "" and loaded.outcomes[0].arm == ""
     assert loaded.outcomes[0].guard_config == "all"   # 旧数据的既有默认值
@@ -379,6 +382,14 @@ def test_legacy_suite_without_new_columns_still_loads(tmp_path):
 
     # 迁移后又可以正常写入（新列真的存在了）
     migrated.save_suite(suite)
+
+    # 环境指纹能落库并原样读回（GROUP BY 靠 env_digest，解释靠 env_fingerprint）
+    suite.env_digest = "deadbeef01"
+    suite.env_fingerprint = '{"digest": "deadbeef01", "tools": {}}'
+    migrated.save_suite(suite)
+    reloaded = migrated.load_suite(suite.suite_id)
+    assert reloaded.env_digest == "deadbeef01"
+    assert reloaded.env_fingerprint == suite.env_fingerprint
 
 
 # ==================== 7. 端到端：真跑一次交错双臂 ====================
