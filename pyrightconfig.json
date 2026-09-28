@@ -1,0 +1,16 @@
+{
+  "//": [
+    "静态检查器的路径配置 —— 这是**工具链配置**问题，不是代码问题。",
+    "",
+    "为什么需要它：`lab/` 里的模块会 `import app.*`（复用被测对象的纯 Python 部分），",
+    "而 `app` 包在运行期由 `lab/bootstrap.ensure_sut_on_path()` 加进 sys.path —— ",
+    "静态检查器看不到这一步，于是把每一处 `from app... import ...` 都报成\"无法解析\"。",
+    "实测一次检查就报了 10+ 条这种假阳性，会淹没真正的告警。",
+    "把 `api/`（app 包的根）与仓库根声明成本检查路径即可 —— 不改任何运行期行为。"
+  ],
+  "include": ["lab", "api"],
+  "extraPaths": [".", "api"],
+  "pythonVersion": "3.12",
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none"
+}

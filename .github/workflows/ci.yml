@@ -24,21 +24,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 刻意只装 lab 真正需要的那部分依赖。
-      # 为什么不用 api/requirements.txt：它带着 playwright / docker / alembic / cos-sdk，
-      # 那是 SUT 的运行期依赖，而 lab 的测试只需要 SUT 的**纯 Python 部分**能 import。
-      # 装全量会让 CI 慢十倍，而多出来的东西一个都用不到。
-      - name: Install minimal dependencies
+      # 依赖清单抽到 lab/requirements.txt：**本地与 CI 用同一份**，
+      # 避免"CI 里能过、本地装不上"（或反过来）的漂移。
+      # 刻意不含 SUT 的运行期依赖（playwright / docker / alembic / cos-sdk）：
+      # lab 的测试只需要 SUT 的**纯 Python 部分能 import**，装全量会让 CI 慢十倍。
+      - name: Install lab dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            "pydantic==2.11.9" \
-            "pyyaml==6.0.2" \
-            "json-repair==0.53.0" \
-            "httpx==0.28.1" \
-            "openai==1.107.2" \
-            "mcp==1.22.0" \
-            "pytest" "pytest-asyncio"
+          pip install -r lab/requirements.txt
+
+      # lint：与单测同源的真问题（未用导入 / 未定义名 / 语法问题 / 刻意 E402）。
+      # 曾经没有这一步，于是"刻意忽略"只能靠 `# noqa` 注释维持，
+      # 而那批注释被一次过宽的 `--fix` 删掉 109 处、没人发现（ruff.toml 有完整记录）。
+      # 现在规则集与 ruff 版本都钉在 ruff.toml / lab/requirements.txt 里。
+      - name: Lint (ruff)
+        run: python -m ruff check lab/
 
       # 全量单测：覆盖中间件 / 判定器 / 统计 / 任务集 / CLI / SUT 健壮性
       #              + 录制回放（含"不联网"与"成本口径"两个铁约束）

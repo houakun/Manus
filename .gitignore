@@ -1,6 +1,12 @@
 .env
 agent-engineering-handoff.md
 
+# 本地真实密钥的配置文件（api 侧用它保存 LLM key）。
+# 为什么必须忽略：api/config.yaml 是**被跟踪**的，把真密钥写进去就会被提交；
+# 所以真密钥只放 api/config.local.yaml（由 .env 的 APP_CONFIG_FILEPATH 指过去）。
+api/config.local.yaml
+*.local.yaml
+
 # docs/ 曾经被忽略，但它是**公开材料**的一部分：lab/README.md 的「相关文档」
 # 直接链接到 docs/step6-gap-audit.md、docs/noise-floor-measured.md 等 5 个文件，
 # 而审计里说「最强的地方要主动讲」的那几次自纠就在里面。

@@ -1,0 +1,18 @@
+# YAML 的 lint 基线（与 ruff.toml 同一个目的：把"工具的口味"与"项目的必要形状"分开）。
+#
+# 为什么放宽行长：
+# `lab/bench/tasks/**/*.yaml` 里的 `ci_log.txt` 是**逐字真跑捕获**的 CI 输出
+# （`bench validate` 的 fixture 真实性规则会逐行核对），
+# 而中文的 `description:` / `notes:` 也天然超过 80 字符。
+# 收窄行长会逼人把日志折行 —— 那就破坏了"日志必须与真实输出一致"这条硬约束。
+#
+# 实测：一次检查报了 12 条 line-length（全在生成的 ci 任务里），而项目既有的
+# `ci/01_window_boundary.yaml` 本来就超 80 —— 也就是说这条规则从来没被满足过。
+extends: default
+
+rules:
+  line-length:
+    max: 200
+    level: warning
+  document-start: disable
+  truthy: disable
