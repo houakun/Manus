@@ -5,9 +5,12 @@
 @Author  : thezehui@gmail.com
 @File    : openai_llm.py
 """
+
 import logging
+import os
 import time
-from typing import List, Dict, Any
+import uuid
+from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
@@ -24,9 +27,24 @@ class OpenAILLM(LLM):
     def __init__(self, llm_config: LLMConfig, **kwargs) -> None:
         """构造函数，完成异步OpenAI客户端的创建和参数初始化"""
         # 1.初始化异步客户端
+        # [lab/opencode] OpenCode Go（$10/月订阅）自 09/05 起**强制**要求
+        #   `x-opencode-session`：一个稳定的“每会话”不透明 ID（官方用于路由与 prompt 缓存），
+        #   缺它时 /chat/completions 直接 400（实测 MissingSessionID），
+        #   而 GET /models 却正常 —— 所以只看“能列出模型”会误判为已接通。
+        #   同时按官方建议用**自己的** User-Agent，而不是 SDK 的默认名。
+        #   只在 base_url 指向 opencode 时附加，避免给其它 provider 发无关头。
+        default_headers = dict(kwargs.pop("default_headers", None) or {})
+        if "opencode" in str(llm_config.base_url).lower():
+            # 会话 ID 可被环境变量钉住（评测里便于把同一会话的请求归到一起）
+            default_headers.setdefault(
+                "x-opencode-session",
+                os.environ.get("OPENCODE_SESSION_ID") or uuid.uuid4().hex,
+            )
+            default_headers.setdefault("User-Agent", "mooc-manus-agent/1.0")
         self._client = AsyncOpenAI(
             base_url=str(llm_config.base_url),
             api_key=llm_config.api_key,
+            default_headers=default_headers or None,
             **kwargs,
         )
 
@@ -49,11 +67,11 @@ class OpenAILLM(LLM):
         return self._max_tokens
 
     async def invoke(
-            self,
-            messages: List[Dict[str, Any]],
-            tools: List[Dict[str, Any]] = None,
-            response_format: Dict[str, Any] = None,
-            tool_choice: str = None,
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         """使用异步OpenAI客户端发起块响应（该步骤可以切换成流式响应）"""
         # [lab/S2] 记录起始时间，用于计算本次调用的真实时延
@@ -101,7 +119,7 @@ class OpenAILLM(LLM):
             message["_model"] = self._model_name
             return message
         except Exception as e:
-            logger.error(f"调用OpenAI客户端发生错误: {str(e)}")
+            logger.error(f"调用OpenAI客户端发生错误: {e!s}")
             # [lab/D3-bugfix] 补上 `from e`（异常链）。
             #   改造前这里丢掉了原始异常，日志里只剩下"调用OpenAI客户端向LLM发起请求出错"，
             #   无法区分 401/429/超时/网络不通，排障时只能靠猜。
@@ -111,15 +129,15 @@ class OpenAILLM(LLM):
 if __name__ == "__main__":
     import asyncio
 
-
     async def main():
-        llm = OpenAILLM(LLMConfig(
-            base_url="https://api.deepseek.com",
-            api_key="",
-            model_name="deepseek-chat",
-        ))
+        llm = OpenAILLM(
+            LLMConfig(
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key="",
+                model_name="deepseek-v4.1-flash",
+            )
+        )
         response = await llm.invoke([{"role": "user", "content": "Hi"}])
         print(response)
-
 
     asyncio.run(main())

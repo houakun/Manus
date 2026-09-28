@@ -5,18 +5,19 @@
 @Author  : thezehui@gmail.com
 @File    : llm.py
 """
-from typing import Protocol, List, Dict, Any
+
+from typing import Any, Dict, List, Optional, Protocol
 
 
 class LLM(Protocol):
     """用于Agent应用与LLM进行交互的接口协议"""
 
     async def invoke(
-            self,
-            messages: List[Dict[str, Any]],
-            tools: List[Dict[str, Any]] = None,
-            response_format: Dict[str, Any] = None,
-            tool_choice: str = None,
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         """传递消息列表、工具列表、响应格式、工具选择策略调用LLM接口"""
         ...
