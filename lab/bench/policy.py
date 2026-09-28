@@ -27,7 +27,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from lab.bench.task import BenchTask
 from lab.guard.budget import BudgetPolicy
@@ -62,12 +62,12 @@ def _metrics_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, List[float]]:
 
 
 def policies_from_history(
-        store: Any,
-        tasks: List[BenchTask],
-        *,
-        soft_percentile: float = 0.95,
-        hard_percentile: float = 0.99,
-        min_samples: int = MIN_SAMPLES,
+    store: Any,
+    tasks: List[BenchTask],
+    *,
+    soft_percentile: float = 0.95,
+    hard_percentile: float = 0.99,
+    min_samples: int = MIN_SAMPLES,
 ) -> Dict[str, BudgetPolicy]:
     """为每个任务推导一个预算策略（只包含能推导出来的任务）。
 
@@ -103,8 +103,10 @@ def policies_from_history(
 
 def describe_policies(policies: Dict[str, BudgetPolicy], tasks: List[BenchTask]) -> str:
     """把推导结果渲染成可读的表（跑之前打印，让人知道阈值是从哪来的）。"""
-    lines = ["| 任务 | 来源 | 样本 | 软线 tokens | 硬线 tokens | 软线工具 | 硬线工具 |",
-             "|---|---|---|---|---|---|---|"]
+    lines = [
+        "| 任务 | 来源 | 样本 | 软线 tokens | 硬线 tokens | 软线工具 | 硬线工具 |",
+        "|---|---|---|---|---|---|---|",
+    ]
     for task in tasks:
         policy = policies.get(task.key)
         if policy is None:

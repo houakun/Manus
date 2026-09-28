@@ -41,6 +41,10 @@ from lab.bench.verifier import CheckResult, evaluate_process, run_checks
 from lab.infra.env import environment_fingerprint
 from lab.infra.local_sandbox import LocalSandbox
 
+# 与 `lab/trace/store.py` 共用同一套"坏值不得让报告崩"的约定（`as_int`/`as_float`）。
+# 不自己再写一份：同一个 `guard` dict 在两个模块里被两种语义处理会静默分叉。
+from lab.trace.store import as_float, as_int
+
 
 class ArmConfig(BaseModel):
     """交错 A/B 的一"臂"：一套完整的实验条件。
@@ -265,9 +269,7 @@ class SuiteResult(BaseModel):
         for uid in tasks:
             key = next(o.task_key for o in outcomes if o.task_uid == uid)
             group = next(o.group for o in outcomes if o.task_uid == uid)
-            summaries.append(_summarize_by_fields(
-                uid, key, group, [o for o in outcomes if o.task_uid == uid]
-            ))
+            summaries.append(_summarize_by_fields(uid, key, group, [o for o in outcomes if o.task_uid == uid]))
         import copy as _copy
 
         clone = _copy.deepcopy(self)
@@ -373,7 +375,7 @@ class SuiteResult(BaseModel):
         return wilson_interval(self.successes, self.total_runs)
 
     def _values(self, field: str) -> List[float]:
-        return [float(getattr(o, field) or 0) for o in self.outcomes]
+        return [as_float(getattr(o, field) or 0) for o in self.outcomes]
 
     @property
     def tokens(self) -> Interval:
@@ -409,9 +411,9 @@ class SuiteResult(BaseModel):
                 "runs": len(items),
                 "successes": successes,
                 "success_rate": wilson_interval(successes, len(items)),
-                "tokens": mean_ci([float(o.tokens) for o in items]),
-                "cost": mean_ci([float(o.cost_usd) for o in items]),
-                "elapsed": mean_ci([float(o.elapsed_ms) for o in items]),
+                "tokens": mean_ci([as_float(o.tokens) for o in items]),
+                "cost": mean_ci([as_float(o.cost_usd) for o in items]),
+                "elapsed": mean_ci([as_float(o.elapsed_ms) for o in items]),
             }
         return result
 
@@ -495,11 +497,11 @@ def _group_outcomes_by_task(outcomes: List[RunOutcome]) -> Dict[str, List[bool]]
 
 
 def _summarize_by_fields(
-        task_uid: str,
-        task_key: str,
-        group: str,
-        outcomes: List[RunOutcome],
-        title: str = "",
+    task_uid: str,
+    task_key: str,
+    group: str,
+    outcomes: List[RunOutcome],
+    title: str = "",
 ) -> TaskSummary:
     """按字段汇总（不依赖 BenchTask 对象）。
 
@@ -522,10 +524,10 @@ def _summarize_by_fields(
         runs=len(outcomes),
         successes=successes,
         success_rate=wilson_interval(successes, len(outcomes)),
-        tokens=mean_ci([float(o.tokens) for o in outcomes]),
-        cost_usd=mean_ci([float(o.cost_usd) for o in outcomes]),
-        elapsed_ms=mean_ci([float(o.elapsed_ms) for o in outcomes]),
-        tool_calls=mean_ci([float(o.tool_calls) for o in outcomes]),
+        tokens=mean_ci([as_float(o.tokens) for o in outcomes]),
+        cost_usd=mean_ci([as_float(o.cost_usd) for o in outcomes]),
+        elapsed_ms=mean_ci([as_float(o.elapsed_ms) for o in outcomes]),
+        tool_calls=mean_ci([as_float(o.tool_calls) for o in outcomes]),
         flag_counts=flags,
     )
 
@@ -565,22 +567,24 @@ def _reset_workspace(workspace: Path) -> None:
 
 
 async def run_once(
-        task: BenchTask,
-        *,
-        suite_id: str,
-        run_index: int,
-        bench_root: Path,
-        model_name: str = "",
-        temperature: Optional[float] = None,
-        budget_policy: Any = None,
-        fault_rules: Any = None,
-        max_seconds: Optional[float] = None,
-        guard_config: Any = None,
-        arm: Optional[ArmConfig] = None,
-        arm_in_workspace: bool = False,
-        replay: Optional[str] = None,
-        replay_ignore_volatile: Optional[bool] = None,
-        replay_cache: Any = None,
+    task: BenchTask,
+    *,
+    suite_id: str,
+    run_index: int,
+    bench_root: Path,
+    model_name: str = "",
+    # 选哪个 SUT（T10）：默认课程版；`minimal-react` 是自研最小 loop
+    sut_kind: str = "manus",
+    temperature: Optional[float] = None,
+    budget_policy: Any = None,
+    fault_rules: Any = None,
+    max_seconds: Optional[float] = None,
+    guard_config: Any = None,
+    arm: Optional[ArmConfig] = None,
+    arm_in_workspace: bool = False,
+    replay: Optional[str] = None,
+    replay_ignore_volatile: Optional[bool] = None,
+    replay_cache: Any = None,
 ) -> RunOutcome:
     """跑一次任务：铺输入 → 真跑 SUT → 判定 → 评估过程。
 
@@ -597,8 +601,13 @@ async def run_once(
     _reset_workspace(workspace)
 
     outcome = RunOutcome(
-        run_id=run_id, suite_id=suite_id, task_uid=task.uid, task_key=task.key,
-        group=task.group, run_index=run_index, workspace=str(workspace),
+        run_id=run_id,
+        suite_id=suite_id,
+        task_uid=task.uid,
+        task_key=task.key,
+        group=task.group,
+        run_index=run_index,
+        workspace=str(workspace),
     )
 
     # 1.铺 fixtures（用沙箱写入，保证与 Agent 看到的路径一致）
@@ -614,6 +623,7 @@ async def run_once(
     result = await run_task(
         task.goal,
         workspace=workspace,
+        sut_kind=sut_kind,
         max_seconds=max_seconds or task.max_seconds,
         temperature=temperature,
         budget_policy=budget_policy,
@@ -654,7 +664,7 @@ async def run_once(
     # 为什么：`loop_guard` 是可以被 `--guard none` 关掉的能力 —— 一旦用它计数，
     # "关掉加固"的对照组就会显示 0 次工具调用，**指标被开关污染了**。
     # （实测踩过：对照组的运行全部显示 tools=0，看起来像"agent 没调工具"。）
-    outcome.tool_calls = float(len(result.tool_sequence) or loop.get("tool_calls") or 0)
+    outcome.tool_calls = as_float(len(result.tool_sequence) or loop.get("tool_calls") or 0)
     outcome.steps_done = result.steps.done
     outcome.error_type = result.error_type
     outcome.error = result.error
@@ -662,13 +672,13 @@ async def run_once(
     outcome.budget_would_stop = bool(budget.get("would_stop"))
     outcome.action_diversity = loop.get("action_diversity")
     outcome.postcondition_warnings = len((guard.get("postconditions") or {}).get("warnings") or [])
-    outcome.faults_injected = int((guard.get("faults") or {}).get("injections") or 0)
+    outcome.faults_injected = as_int((guard.get("faults") or {}).get("injections") or 0)
     outcome.error_types = dict(guard.get("error_types") or {})
     # ---- 实验条件的运行级元数据（没有它们，矩阵做出来也归档不了）----
     outcome.fault_spec = fault_spec_of(fault_rules)
     outcome.arm = arm.label if arm is not None else ""
     outcome.replay_mode = str((result.replay or {}).get("mode") or (replay or "off"))
-    outcome.replay_misses = int((result.replay or {}).get("misses") or 0)
+    outcome.replay_misses = as_int((result.replay or {}).get("misses") or 0)
     if outcome.replay_degraded:
         # 把"回放不完整"变成一个**过程 flag**，而不是只埋在 replay 字典里。
         # 原因：实测过未命中 6 次仍然判定 OK 的情况（SUT 降级继续跑完了活）。
@@ -678,11 +688,11 @@ async def run_once(
 
 
 def build_schedule(
-        tasks: Sequence[Any],
-        runs_per_task: int,
-        arms: Sequence[ArmConfig],
-        *,
-        interleave: bool,
+    tasks: Sequence[Any],
+    runs_per_task: int,
+    arms: Sequence[ArmConfig],
+    *,
+    interleave: bool,
 ) -> List[tuple]:
     """建调度表：返回 [(task, run_index, arm), ...] 的执行顺序。
 
@@ -727,30 +737,32 @@ def _common_or_mixed(values: Sequence[str], *, empty: str = "mixed") -> str:
 
 
 async def run_suite(
-        *,
-        runs_per_task: int = 1,
-        group: Optional[str] = None,
-        limit: Optional[int] = None,
-        keys: Optional[List[str]] = None,
-        label: str = "",
-        bench_root: Path,
-        concurrency: int = 1,
-        temperature: Optional[float] = None,
-        budget_policy: Any = None,
-        budget_policy_by_task: Optional[Dict[str, Any]] = None,
-        guard_config: Any = None,
-        purpose: Optional[str] = None,
-        fault_rules: Any = None,
-        max_seconds: Optional[float] = None,
-        arms: Optional[Sequence[ArmConfig]] = None,
-        interleave: bool = True,
-        replay: Optional[str] = None,
-        replay_ignore_volatile: Optional[bool] = None,
-        replay_cache: Any = None,
-        progress: bool = True,
-        on_start: Optional[Any] = None,
-        on_outcome: Optional[Any] = None,
-        on_finish: Optional[Any] = None,
+    *,
+    runs_per_task: int = 1,
+    group: Optional[str] = None,
+    limit: Optional[int] = None,
+    keys: Optional[List[str]] = None,
+    label: str = "",
+    bench_root: Path,
+    concurrency: int = 1,
+    temperature: Optional[float] = None,
+    # 被测对象选择（T10）：`manus`（默认）/ `minimal-react`（自研最小 loop）
+    sut_kind: str = "manus",
+    budget_policy: Any = None,
+    budget_policy_by_task: Optional[Dict[str, Any]] = None,
+    guard_config: Any = None,
+    purpose: Optional[str] = None,
+    fault_rules: Any = None,
+    max_seconds: Optional[float] = None,
+    arms: Optional[Sequence[ArmConfig]] = None,
+    interleave: bool = True,
+    replay: Optional[str] = None,
+    replay_ignore_volatile: Optional[bool] = None,
+    replay_cache: Any = None,
+    progress: bool = True,
+    on_start: Optional[Any] = None,
+    on_outcome: Optional[Any] = None,
+    on_finish: Optional[Any] = None,
 ) -> SuiteResult:
     """跑一个完整 suite（任务集 × n 次重复）。
 
@@ -794,21 +806,25 @@ async def run_suite(
         tasks = tasks[:limit]
 
     # ---- 臂：不传就是"单臂"，行为与改造前逐字节一致（向后兼容）----
-    effective_arms: List[ArmConfig] = list(arms) if arms else [ArmConfig(
-        label=label or "run",
-        guard_label=getattr(guard_config, "label", "all"),
-        guard_config=guard_config,
-        fault_rules=fault_rules,
-        fault_spec=fault_spec_of(fault_rules),
-        replay=replay,
-    )]
+    effective_arms: List[ArmConfig] = (
+        list(arms)
+        if arms
+        else [
+            ArmConfig(
+                label=label or "run",
+                guard_label=getattr(guard_config, "label", "all"),
+                guard_config=guard_config,
+                fault_rules=fault_rules,
+                fault_spec=fault_spec_of(fault_rules),
+                replay=replay,
+            )
+        ]
+    )
     if len(effective_arms) < 2:
         interleave = False
     slugs = [arm.slug() for arm in effective_arms]
     if len(set(slugs)) != len(slugs):
-        raise ValueError(
-            f"臂的名字必须互不相同（工作区按它分目录）：{[a.label for a in effective_arms]}"
-        )
+        raise ValueError(f"臂的名字必须互不相同（工作区按它分目录）：{[a.label for a in effective_arms]}")
 
     suite_id = str(uuid.uuid4())
     # 环境指纹：本机工具面的固定函数（不依赖启动上下文，见 lab/infra/env.py）
@@ -828,9 +844,7 @@ async def run_suite(
         # 噪声地板实验正好就是这种情况（两个臂的 guard 一模一样），
         # 写成 mixed 会让后来读 `noise_floor.json` 的人完全误判这个实验在测什么。
         guard_config=_common_or_mixed([arm.guard_label for arm in effective_arms]),
-        fault_spec=_common_or_mixed(
-            [arm.fault_spec for arm in effective_arms], empty=""
-        ),
+        fault_spec=_common_or_mixed([arm.fault_spec for arm in effective_arms], empty=""),
         replay_mode=str(replay or "off"),
         arms=[arm.to_metadata() for arm in effective_arms],
         interleaved=interleave,
@@ -853,11 +867,20 @@ async def run_suite(
             # （任务之间的成本差异远大于任务内方差，一个全局数字必然对部分任务是错的）
             task_policy = (budget_policy_by_task or {}).get(task.key, budget_policy)
             return await run_once(
-                task, suite_id=suite_id, run_index=index, bench_root=bench_root,
-                model_name=llm_config.model_name, temperature=temperature,
-                budget_policy=task_policy, fault_rules=arm.fault_rules,
-                max_seconds=max_seconds, guard_config=arm.guard_config,
-                arm=arm, arm_in_workspace=interleave, replay=arm.replay,
+                task,
+                suite_id=suite_id,
+                run_index=index,
+                bench_root=bench_root,
+                model_name=llm_config.model_name,
+                sut_kind=sut_kind,
+                temperature=temperature,
+                budget_policy=task_policy,
+                fault_rules=arm.fault_rules,
+                max_seconds=max_seconds,
+                guard_config=arm.guard_config,
+                arm=arm,
+                arm_in_workspace=interleave,
+                replay=arm.replay,
                 replay_ignore_volatile=replay_ignore_volatile,
                 replay_cache=replay_cache,
             )
@@ -888,14 +911,9 @@ async def run_suite(
             on_outcome(outcome)
 
     suite.outcomes = collected
-    suite.task_summaries = [
-        summarize_task(task, [o for o in collected if o.task_uid == task.uid])
-        for task in tasks
-    ]
+    suite.task_summaries = [summarize_task(task, [o for o in collected if o.task_uid == task.uid]) for task in tasks]
     suite.elapsed_s = round(time.monotonic() - started, 1)
-    suite.notes.append(
-        f"预算阈值来源：{_budget_source_note(budget_policy, budget_policy_by_task)}"
-    )
+    suite.notes.append(f"预算阈值来源：{_budget_source_note(budget_policy, budget_policy_by_task)}")
     if interleave:
         arm_desc = " / ".join(arm.describe() for arm in effective_arms)
         suite.notes.append(
@@ -911,9 +929,7 @@ async def run_suite(
             "真正影响成败的是 `retry` 与 `postconditions`。"
         )
     if effective_arms[0].fault_spec:
-        suite.notes.append(
-            f"故障注入：`{suite.fault_spec}`（写在**运行级** `fault_spec` 列，可 SQL 分组）。"
-        )
+        suite.notes.append(f"故障注入：`{suite.fault_spec}`（写在**运行级** `fault_spec` 列，可 SQL 分组）。")
     if str(replay or "off") != "off":
         suite.notes.append(
             f"⚠️ LLM 回放模式：**{replay}**。此时 `cost_usd` / 耗时是**等价量**，"
@@ -929,8 +945,7 @@ async def run_suite(
             )
     if concurrency > 1:
         suite.notes.append(
-            f"本次以并发 {concurrency} 运行：**耗时指标不可横向比较**"
-            "（并行会互相竞争模型配额与本机资源）。"
+            f"本次以并发 {concurrency} 运行：**耗时指标不可横向比较**（并行会互相竞争模型配额与本机资源）。"
         )
     if suite.fixture_failures:
         suite.notes.append(

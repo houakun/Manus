@@ -1,0 +1,213 @@
+key: ci_regex_escape
+group: ci
+# capability：新任务类，方差未知（见 test_ci_tasks_are_capability_not_regression）。
+purpose: capability
+title: CI 归因：正则未转义（含元字符的字面量匹配错）
+tags: [ci-attribution, code-fix, regex, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}, ...]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数名。
+  注意：needle 是 **用户输入的字面量**，不是正则。
+selfcheck:
+  # 这份日志**必须**是真跑出来的：validate 会执行它并逐行比对（手编的会被抓住）。
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_plain_needle_matches ... PASSED
+      test_dot_is_literal ... PASSED
+      test_dot_does_not_match_other_char ... FAILED
+          expected False，actual True
+      test_bracket_needle_does_not_crash ... PASSED
+      test_filter_uses_literal ... FAILED
+          expected ['a.b']，actual ['a.b', 'axb']
+      ---------------------------------------------
+      5 项：3 通过 / 2 失败
+  - path: /home/ubuntu/repo/search.py
+    content: |
+      """字面量查找（把用户输入当**字面量**，不是正则）。"""
+      import re
+
+
+      def contains_literal(text, needle):
+          """text 里是否包含 needle 这个**字面量**。"""
+          # BUG: 直接把用户输入当正则模式。
+          # `a.b` 会匹配到 `axb`（多匹配了），`[` 会直接抛 re.error（少匹配/报错）。
+          # 注意它不是每次都错：纯字母数字的 needle 会通过。
+          return re.search(needle, text) is not None
+  - path: /home/ubuntu/repo/logfilter.py
+    content: |
+      """日志过滤（模块名不叫 filter：避免遮蔽内置函数）。"""
+      from search import contains_literal
+
+
+      def pick(lines, needle):
+          """挑出包含该字面量的行。"""
+          return [line for line in lines if contains_literal(line, needle)]
+  - path: /home/ubuntu/repo/audit_log.py
+    content: |
+      """审计。"""
+      from search import contains_literal
+
+
+      def count_hits(entries, needle):
+          """统计命中条数。"""
+          return sum(1 for entry in entries if contains_literal(entry, needle))
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      import audit_log
+      import logfilter
+      import search
+
+
+      def test_plain_needle_matches():
+          actual = search.contains_literal('hello world', 'world')
+          return actual == True, actual, True
+
+      def test_dot_is_literal():
+          actual = search.contains_literal('a.b', 'a.b')
+          return actual == True, actual, True
+
+      def test_dot_does_not_match_other_char():
+          actual = search.contains_literal('axb', 'a.b')
+          return actual == False, actual, False
+
+      def test_bracket_needle_does_not_crash():
+          actual = search.contains_literal('x[1]y', '[1]')
+          return actual == True, actual, True
+
+      def test_filter_uses_literal():
+          actual = logfilter.pick(['a.b', 'axb'], 'a.b')
+          return actual == ['a.b'], actual, ['a.b']
+
+
+      CASES = [
+          ("test_plain_needle_matches", test_plain_needle_matches),
+          ("test_dot_is_literal", test_dot_is_literal),
+          ("test_dot_does_not_match_other_char", test_dot_does_not_match_other_char),
+          ("test_bracket_needle_does_not_crash", test_bracket_needle_does_not_crash),
+          ("test_filter_uses_literal", test_filter_uses_literal),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # 执行型检查（最强）：脚本来自**任务定义**（不在工作区），Agent 改不了断言，
+  # 而且它真的跑一遍修完的代码 —— 症状级修复会在这里挂掉。
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 正则未转义（含元字符的字面量匹配错）
+    script: |
+      from audit_log import count_hits
+      from logfilter import pick
+      from search import contains_literal
+
+      problems = []
+      if contains_literal("hello world", "world") is not True:
+          problems.append("普通字面量匹配失败")
+      if contains_literal("a.b", "a.b") is not True:
+          problems.append("包含点号的字面量匹配失败")
+      if contains_literal("axb", "a.b") is not False:
+          problems.append("点号被当成通配符（多匹配了）")
+      try:
+          if contains_literal("x[1]y", "[1]") is not True:
+              problems.append("含方括号的字面量匹配失败")
+      except Exception as exc:  # noqa: BLE001
+          problems.append(f"含方括号的 needle 抛 {type(exc).__name__}")
+      if pick(["a.b", "axb"], "a.b") != ["a.b"]:
+          problems.append(f"pick={pick(['a.b', 'axb'], 'a.b')!r}")
+      if count_hits(["a+b", "aab"], "a+b") != 1:
+          problems.append(f"count_hits={count_hits(['a+b', 'aab'], 'a+b')!r}")
+      if problems:
+          print("FAIL:", problems)
+          raise SystemExit(1)
+      print("OK: 用户输入被当字面量处理，两个调用方都正确")
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "search.py"
+    description: 归因里点名了真正有 bug 的模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "contains_literal"
+    description: 归因里点名了出问题的符号
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/search.py
+    content: |
+      """字面量查找（把用户输入当字面量，不是正则）。"""
+      import re
+
+
+      def contains_literal(text, needle):
+          """text 里是否包含 needle 这个字面量。"""
+          # 用户输入里可能有 . [ ] ( ) * + ? 等元字符 —— 必须转义
+          return re.search(re.escape(needle), text) is not None
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "search.py", "symbol": "contains_literal", "why": "用户输入被当成正则模式：`a.b` 会匹配 `axb`，`[` 直接抛 re.error；字面量查找必须 re.escape"}]}
+wrong:
+  # 症状级错解：只在**调用点**打补丁，共享模块仍然是坏的 —— 必须被拒绝。
+  - kind: write_file
+    path: /home/ubuntu/repo/logfilter.py
+    content: |
+      """日志过滤（模块名不叫 filter：避免遮蔽内置函数）。"""
+      from search import contains_literal
+
+
+      def pick(lines, needle):
+          """挑出包含该字面量的行。"""
+          # 症状级修复：只在 logfilter 里把元字符替换掉（只在调用点绕过），
+          # audit_log 与 search.contains_literal 本身仍然是错的
+          safe = needle.replace(".", chr(92) + ".")
+          return [line for line in lines if contains_literal(line, safe)]
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "logfilter.py", "symbol": "?", "why": "只在调用点补回来的症状级修复"}]}
+notes: >-
+  **自动生成**（`lab/bench/tasks/ci/_capture_logs.py`）：`ci_log.txt` 是真跑 buggy 代码捕获的输出，所以 `selfcheck` 的真实性规则必然通过；手编日志会被 validate 抓住。
+  设计要点：同一处共享模块被**两个调用方**使用（audit_log.py、logfilter.py、search.py），
+  所以只在调用点打补丁的"症状级修复"会在另一个调用方上暴露；
+  另外还有一条日志里**没有**的边界用例（count_hits(['a+b','aab'], 'a+b') 必须只命中 1 条）挡住过拟合。

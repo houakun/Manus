@@ -32,7 +32,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -66,10 +66,39 @@ class TaskValidation(BaseModel):
     # 它是"验证强度弱"而不是"任务不可用"，不应该阻断评测；
     # 但它必须**显式可见**，否则就会重演那次事故（见下面 _tautology_flags 的注释）。
     tautology_flags: List[str] = Field(default_factory=list)
+    # 歧义 lint（T4 / 审计 §4.10）：判定器要检查的路径，在 goal 里说清楚了吗。
+    # 同样单独成字段而不进 problems：它不表示"任务不可用"，但必须**显式可见** ——
+    # 否则就会重演那次事故（一个题面歧义被当成"模型能力问题"）。
+    ambiguity_flags: List[str] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return all(step.ok for step in self.steps) and not self.problems
+
+
+def _ambiguity_flags(task: BenchTask) -> List[str]:
+    """歧义 lint：判定器要检查的路径，在 `goal` 里提到过吗（T4 / 审计 §4.10）。
+
+    为什么值得一条 lint：`sem_markdown_toc` 曾因"判定器要求保留 H1，而 goal 没说清"
+    污染过两次 A/B 实验 —— 而那种失败看起来像**模型能力问题**，其实是题面歧义。
+
+    只出 warning，**不改变通过/失败**：有些路径本来就不必写进 goal
+    （例如 CI 归因任务要求的 `diagnosis.json` 是格式约定，不是"产物位置"）。
+    这条 lint 的价值在于"让人看一眼"，而不是替人下结论。
+    """
+    goal = task.goal or ""
+    flags: List[str] = []
+    seen = set()
+    for check in task.verify:
+        path = check.path
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        # 只比对最后一段文件名：goal 里通常写完整路径，但写 `TOC.md` 也算说清楚了
+        name = path.rsplit("/", 1)[-1]
+        if path not in goal and name not in goal:
+            flags.append(f"判定器检查 `{path}`，但 goal 里没提到它（`{name}`）—— 题面可能歧义")
+    return flags
 
 
 def _tautology_flags(task: BenchTask) -> List[str]:
@@ -94,11 +123,7 @@ def _tautology_flags(task: BenchTask) -> List[str]:
     这样期望值写错时参考解就对不上，自检会失败 —— 自检才真正有意义。
     """
     flags: List[str] = []
-    written = {
-        step.path: (step.content or "")
-        for step in task.solution
-        if step.kind == "write_file" and step.path
-    }
+    written = {step.path: (step.content or "") for step in task.solution if step.kind == "write_file" and step.path}
     if not written:
         return flags  # 纯 exec 型参考解：拿不到静态内容，无法判定
 
@@ -106,14 +131,15 @@ def _tautology_flags(task: BenchTask) -> List[str]:
         return text.strip() if mode != "none" else text
 
     for check in task.verify:
+        if check.path is None:
+            # 没有 `path` 的检查本来就不是文件内容校验，不参与"同义反复"比较。
+            continue
         content = written.get(check.path)
         if content is None:
             continue
         if check.kind == "file_content" and check.equals is not None:
             if _norm(content, check.normalize) == _norm(check.equals, check.normalize):
-                flags.append(
-                    f"{check.path}: 参考解直接写出了期望内容 → 验证是同义反复"
-                )
+                flags.append(f"{check.path}: 参考解直接写出了期望内容 → 验证是同义反复")
         elif check.kind == "numeric" and check.value is not None:
             try:
                 if abs(float(content.strip().split()[0]) - float(check.value)) <= check.tolerance:
@@ -156,6 +182,10 @@ async def _apply_steps(sandbox: LocalSandbox, steps: List[SolutionStep], step_na
     """
     for index, step in enumerate(steps):
         if step.kind == "write_file":
+            if step.path is None:
+                # YAML 里写了 `kind: write_file` 却没写 `path` —— 这是**任务定义的缺陷**。
+                # 显式报错，而不是让 None 流进沙箱去拼出一个诡异的路径。
+                raise RuntimeError(f"[{step_name}] 第 {index + 1} 步 write_file 缺少 path")
             result = await sandbox.write_file(step.path, step.content or "")
         elif step.kind == "exec":
             result = await sandbox.exec_command(f"validate-{step_name}-{index}", "/home/ubuntu", step.command or "")
@@ -210,7 +240,7 @@ async def _fixture_truth_problems(task: BenchTask, workspace: Path) -> List[str]
     result = await sandbox.exec_command("selfcheck", "/home/ubuntu", rule.command)
     data = result.data if isinstance(result.data, dict) else {}
     returncode = data.get("returncode")
-    output = (data.get("output") or "")
+    output = data.get("output") or ""
 
     problems: List[str] = []
     if returncode != rule.expect_exit:
@@ -224,10 +254,7 @@ async def _fixture_truth_problems(task: BenchTask, workspace: Path) -> List[str]
         problems.append(f"fixture 真实性：找不到声明的日志文件 {rule.output_recorded_in}")
         return problems
 
-    missing = [
-        line for line in (l.strip() for l in output.splitlines())
-        if line and line not in recorded
-    ]
+    missing = [line for line in (raw.strip() for raw in output.splitlines()) if line and line not in recorded]
     if missing:
         problems.append(
             f"fixture 真实性：`{rule.command}` 的**实际输出**里有 {len(missing)} 行"
@@ -260,6 +287,7 @@ async def validate_task(task: BenchTask, root: Path) -> TaskValidation:
     base = root / task.group / task.key
 
     result.tautology_flags = _tautology_flags(task)
+    result.ambiguity_flags = _ambiguity_flags(task)
 
     result.steps.append(await _evaluate(task, base / "empty", None, "fixtures_only"))
     if task.solution:
@@ -291,12 +319,17 @@ def render_validations(validations: List[TaskValidation]) -> str:
     lines: List[str] = []
     passed = sum(1 for item in validations if item.ok)
     tautological = [item for item in validations if item.tautology_flags]
+    ambiguous = [item for item in validations if item.ambiguity_flags]
     lines.append("=" * 78)
     lines.append(f"任务集自检：{passed}/{len(validations)} 通过")
     if tautological:
         lines.append(
-            f"⚠️  {len(tautological)} 个任务的参考解直接写出了期望值："
-            f"自检无法发现它们期望值写错（历史上真出过两次事故）"
+            f"⚠️  {len(tautological)} 个任务的参考解直接写出了期望值：自检无法发现它们期望值写错（历史上真出过两次事故）"
+        )
+    if ambiguous:
+        lines.append(
+            f"⚠️  {len(ambiguous)} 个任务的判定路径没在 goal 里说清（题面歧义）："
+            f"这类失败看起来像模型能力问题，其实是题目没说清"
         )
     lines.append("=" * 78)
     for item in validations:
@@ -306,14 +339,15 @@ def render_validations(validations: List[TaskValidation]) -> str:
             step_mark = "✓" if step.ok else "✗"
             verdict = "通过" if step.actual_pass else "失败"
             lines.append(
-                f"    {step_mark} {step.name:20} 判定器={verdict}"
-                f"（期望={'通过' if step.expected_pass else '失败'}）"
+                f"    {step_mark} {step.name:20} 判定器={verdict}（期望={'通过' if step.expected_pass else '失败'}）"
             )
             if not step.ok:
                 for detail in step.details:
                     lines.append(f"        {detail}")
         for flag in item.tautology_flags:
             lines.append(f"    ⚠ 同义反复: {flag}")
+        for flag in item.ambiguity_flags:
+            lines.append(f"    ⚠ 歧义: {flag}")
         for problem in item.problems:
             lines.append(f"    ⚠ {problem}")
     return "\n".join(lines)

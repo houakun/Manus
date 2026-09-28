@@ -221,6 +221,44 @@ def _json_items(raw: Any) -> List[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _json_dict(raw: Any) -> Dict[str, Any]:
+    """把 TEXT 列里的 JSON 对象读回来（坏数据返回空字典，不抛）。
+
+    为什么需要它：这些列是**历史数据**（旧版本写过什么不由现在决定），
+    而一条坏行不该让成本归因/报告整个挂掉 —— 那正是最需要它的时候。
+    """
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    """安全取整（库里的历史行 / 上游 report 的字段可能是 None / 字符串 / 浮点）。
+
+    为什么不用裸 `int()`：这些值来自**不由本函数决定**的来源（历史数据、
+    `injector.report()` 这类 dict），一条坏行不该让读取/报告整个挂掉。
+
+    公开名（不帯下划线）：`lab/bench/runner.py` 的统计聚合要用**同一套**约定 ——
+    否则同一个 `guard` dict 在两个模块里会被两种语义处理。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    """安全转浮点（同上：坏行不该让读取崩掉）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _replay_misses_from_flags(flags: List[str]) -> int:
     """从过程 flag 里读回回放未命中次数。
 
@@ -245,13 +283,52 @@ def _tool_calls_from_row(row: Any) -> float:
     于是"无加固 vs 加固"会显示出完全虚假的差异（实测：假的 +31 次调用）。
     **指标不能依赖可以被开关关掉的能力。**
     """
-    sequence = row["task_tool_sequence"] if "task_tool_sequence" in row.keys() else None
+    sequence = row["task_tool_sequence"] if "task_tool_sequence" in row else None
     if sequence:
         try:
             return float(len(json.loads(sequence)))
         except (TypeError, ValueError):
             pass
-    return float(row["tool_calls"] or 0)
+    # 兜底列也可能是坏数据 → 走 as_float（带 try/except）
+    return as_float(row["tool_calls"])
+
+
+# tasks 表的写入列。
+# 为什么单独列成常量：`save_run` 的 INSERT 现在是**静态 SQL**（不留动态拼接），
+# 而 sqlite3 对多余的字典键是**宽容**的 —— “加了字段忘了改 SQL”会安静地丢数据。
+# 所以用这个元组做一次集合对账，不一致就抛异常（把静默丢数据变成响亮失败）。
+_TASK_INSERT_COLUMNS = (
+    "task_id",
+    "sut_name",
+    "goal",
+    "ok",
+    "error",
+    "error_type",
+    "answer",
+    "plan_title",
+    "steps_total",
+    "steps_done",
+    "steps_succeeded",
+    "steps_failed",
+    "llm_calls",
+    "llm_errors",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "tool_calls",
+    "cost_usd",
+    "elapsed_ms",
+    "started_at",
+    "workspace",
+    "tool_sequence",
+    "budget_violated_metrics",
+    "budget_would_stop",
+    "action_diversity",
+    "postcondition_warnings",
+    "faults_injected",
+    "replay_mode",
+    "replay_stats",
+)
 
 
 class SpanStore:
@@ -278,9 +355,9 @@ class SpanStore:
     def _migrate(conn: sqlite3.Connection) -> None:
         """给已存在的表补新列（幂等）。"""
         for table, columns in (
-                ("tasks", _TASKS_GUARD_COLUMNS),
-                ("bench_runs", _BENCH_RUN_COLUMNS),
-                ("bench_suites", _BENCH_SUITE_COLUMNS),
+            ("tasks", _TASKS_GUARD_COLUMNS),
+            ("bench_runs", _BENCH_RUN_COLUMNS),
+            ("bench_suites", _BENCH_SUITE_COLUMNS),
         ):
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, ddl in columns.items():
@@ -315,10 +392,11 @@ class SpanStore:
             "prompt_tokens": result.llm_usage.prompt_tokens,
             "completion_tokens": result.llm_usage.completion_tokens,
             "total_tokens": result.llm_usage.total_tokens,
-            "tool_calls": int(loop.get("tool_calls") or result.llm_usage.tool_calls),
+            "tool_calls": as_int(loop.get("tool_calls") or result.llm_usage.tool_calls),
             "cost_usd": result.cost_usd,
             "elapsed_ms": result.elapsed_ms,
-            "started_at": datetime.now().isoformat(timespec="seconds"),
+            # 时间戳刻意用**本地 naive**：库里已有数据都是这个语义，改成 UTC 会让新旧数据不同源。
+            "started_at": datetime.now().isoformat(timespec="seconds"),  # noqa: DTZ005
             "workspace": result.workspace,
             "tool_sequence": json.dumps(result.tool_sequence, ensure_ascii=False),
             # ---- Step 3 加固层字段 ----
@@ -326,7 +404,7 @@ class SpanStore:
             "budget_would_stop": 1 if budget.get("would_stop") else 0,
             "action_diversity": loop.get("action_diversity"),
             "postcondition_warnings": len((guard.get("postconditions") or {}).get("warnings") or []),
-            "faults_injected": int((guard.get("faults") or {}).get("injections") or 0),
+            "faults_injected": as_int((guard.get("faults") or {}).get("injections")),
             # ---- Step 6 回放 ----
             # 写入时用 `result.replay`；旧调用点没有这个字段 → 退化成空 dict，
             # 于是模式落成 "off"（而不是 NULL）—— NULL 会被读成"未知"，
@@ -334,15 +412,33 @@ class SpanStore:
             "replay_mode": (result.replay or {}).get("mode") or "off",
             "replay_stats": json.dumps(result.replay or {}, ensure_ascii=False),
         }
-        placeholders = ",".join("?" for _ in columns)
-        column_names = ",".join(columns)
-
         with self._connect() as conn:
+            # 列集对账：静态 SQL 无法自动适配新增字段，所以这里显式守住一致性。
+            mismatched = set(columns) ^ set(_TASK_INSERT_COLUMNS)
+            if mismatched:
+                raise ValueError(
+                    f"save_run 的列与 INSERT 语句不一致（多了或漏了）：{sorted(mismatched)}。"
+                    "新增字段时必须同时改 _TASK_INSERT_COLUMNS 与下面这条静态 SQL。"
+                )
             conn.execute("DELETE FROM spans WHERE task_id = ?", (result.task_id,))
             conn.execute("DELETE FROM tasks WHERE task_id = ?", (result.task_id,))
             conn.execute(
-                f"INSERT INTO tasks ({column_names}) VALUES ({placeholders})",
-                tuple(columns.values()),
+                # 静态 SQL + 命名参数（不再拼列名）
+                """INSERT INTO tasks (
+                       task_id, sut_name, goal, ok, error, error_type, answer, plan_title,
+                       steps_total, steps_done, steps_succeeded, steps_failed,
+                       llm_calls, llm_errors, prompt_tokens, completion_tokens, total_tokens,
+                       tool_calls, cost_usd, elapsed_ms, started_at, workspace, tool_sequence,
+                       budget_violated_metrics, budget_would_stop, action_diversity,
+                       postcondition_warnings, faults_injected, replay_mode, replay_stats)
+                   VALUES (
+                       :task_id, :sut_name, :goal, :ok, :error, :error_type, :answer, :plan_title,
+                       :steps_total, :steps_done, :steps_succeeded, :steps_failed,
+                       :llm_calls, :llm_errors, :prompt_tokens, :completion_tokens, :total_tokens,
+                       :tool_calls, :cost_usd, :elapsed_ms, :started_at, :workspace, :tool_sequence,
+                       :budget_violated_metrics, :budget_would_stop, :action_diversity,
+                       :postcondition_warnings, :faults_injected, :replay_mode, :replay_stats)""",
+                columns,
             )
             conn.executemany(
                 """INSERT INTO spans
@@ -388,7 +484,7 @@ class SpanStore:
                 start_ms=r["start_ms"] or 0,
                 end_ms=r["end_ms"],
                 duration_ms=r["duration_ms"],
-                attrs=json.loads(r["attrs"]) if r["attrs"] else {},
+                attrs=_json_dict(r["attrs"]),
                 error=r["error"],
             )
             for r in rows
@@ -402,9 +498,7 @@ class SpanStore:
     def latest_task_id(self) -> Optional[str]:
         """取最近一次运行（CLI 便利功能：不用手敲 uuid）。"""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT task_id FROM tasks ORDER BY started_at DESC, rowid DESC LIMIT 1"
-            ).fetchone()
+            row = conn.execute("SELECT task_id FROM tasks ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
         return row["task_id"] if row else None
 
     def resolve_task_id(self, prefix: str) -> Optional[str]:
@@ -415,9 +509,7 @@ class SpanStore:
         0 个或多个都返回 None（让调用方报错），绝不猜。
         """
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT task_id FROM tasks WHERE task_id LIKE ? LIMIT 2", (f"{prefix}%",)
-            ).fetchall()
+            rows = conn.execute("SELECT task_id FROM tasks WHERE task_id LIKE ? LIMIT 2", (f"{prefix}%",)).fetchall()
         return rows[0]["task_id"] if len(rows) == 1 else None
 
     def list_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -458,9 +550,18 @@ class SpanStore:
                     env_digest, env_fingerprint)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    suite.suite_id, suite.label, suite.model_name, suite.temperature,
-                    suite.runs_per_task, suite.concurrency, suite.budget_mode, suite.started_at,
-                    suite.elapsed_s, suite.total_runs, suite.successes, len(suite.task_summaries),
+                    suite.suite_id,
+                    suite.label,
+                    suite.model_name,
+                    suite.temperature,
+                    suite.runs_per_task,
+                    suite.concurrency,
+                    suite.budget_mode,
+                    suite.started_at,
+                    suite.elapsed_s,
+                    suite.total_runs,
+                    suite.successes,
+                    len(suite.task_summaries),
                     json.dumps(suite.notes, ensure_ascii=False),
                     getattr(suite, "guard_config", "") or "",
                     getattr(suite, "fault_spec", "") or "",
@@ -486,16 +587,21 @@ class SpanStore:
                        guard_config = ?, fault_spec = ?, replay_mode = ?, arms = ?, interleaved = ?,
                        env_digest = ?, env_fingerprint = ?
                    WHERE suite_id = ?""",
-                (suite.elapsed_s, suite.total_runs, suite.successes,
-                 len(suite.task_summaries), json.dumps(suite.notes, ensure_ascii=False),
-                 getattr(suite, "guard_config", "") or "",
-                 getattr(suite, "fault_spec", "") or "",
-                 getattr(suite, "replay_mode", "off") or "off",
-                 json.dumps(getattr(suite, "arms", []) or [], ensure_ascii=False),
-                 1 if getattr(suite, "interleaved", False) else 0,
-                 getattr(suite, "env_digest", "") or "",
-                 getattr(suite, "env_fingerprint", "") or "",
-                 suite.suite_id),
+                (
+                    suite.elapsed_s,
+                    suite.total_runs,
+                    suite.successes,
+                    len(suite.task_summaries),
+                    json.dumps(suite.notes, ensure_ascii=False),
+                    getattr(suite, "guard_config", "") or "",
+                    getattr(suite, "fault_spec", "") or "",
+                    getattr(suite, "replay_mode", "off") or "off",
+                    json.dumps(getattr(suite, "arms", []) or [], ensure_ascii=False),
+                    1 if getattr(suite, "interleaved", False) else 0,
+                    getattr(suite, "env_digest", "") or "",
+                    getattr(suite, "env_fingerprint", "") or "",
+                    suite.suite_id,
+                ),
             )
 
     def save_outcome(self, outcome: Any) -> None:
@@ -511,22 +617,37 @@ class SpanStore:
                     fault_spec, arm, replay_mode, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    outcome.run_id, outcome.suite_id, outcome.task_uid, outcome.task_key,
-                    outcome.group, outcome.run_index,
+                    outcome.run_id,
+                    outcome.suite_id,
+                    outcome.task_uid,
+                    outcome.task_key,
+                    outcome.group,
+                    outcome.run_index,
                     1 if outcome.ok else 0,
                     1 if outcome.self_reported_ok else 0,
                     json.dumps(outcome.failed_checks, ensure_ascii=False),
                     json.dumps(outcome.process_flags, ensure_ascii=False),
-                    outcome.task_id, outcome.sut_name, outcome.tokens, outcome.cost_usd,
-                    outcome.elapsed_ms, outcome.llm_calls, outcome.tool_calls, outcome.steps_done,
-                    outcome.error_type, outcome.error, outcome.guard_config,
+                    outcome.task_id,
+                    outcome.sut_name,
+                    outcome.tokens,
+                    outcome.cost_usd,
+                    outcome.elapsed_ms,
+                    outcome.llm_calls,
+                    outcome.tool_calls,
+                    outcome.steps_done,
+                    outcome.error_type,
+                    outcome.error,
+                    outcome.guard_config,
                     json.dumps(outcome.budget_violated, ensure_ascii=False),
-                    1 if outcome.budget_would_stop else 0, outcome.action_diversity,
-                    outcome.postcondition_warnings, outcome.faults_injected,
+                    1 if outcome.budget_would_stop else 0,
+                    outcome.action_diversity,
+                    outcome.postcondition_warnings,
+                    outcome.faults_injected,
                     getattr(outcome, "fault_spec", "") or "",
                     getattr(outcome, "arm", "") or "",
                     getattr(outcome, "replay_mode", "off") or "off",
-                    datetime.now().isoformat(timespec="seconds"),
+                    # 同上：本地 naive，与既有数据保持一致
+                    datetime.now().isoformat(timespec="seconds"),  # noqa: DTZ005
                 ),
             )
 
@@ -571,9 +692,7 @@ class SpanStore:
         from lab.bench.task import load_all_tasks
 
         with self._connect() as conn:
-            suite_row = conn.execute(
-                "SELECT * FROM bench_suites WHERE suite_id = ?", (suite_id,)
-            ).fetchone()
+            suite_row = conn.execute("SELECT * FROM bench_suites WHERE suite_id = ?", (suite_id,)).fetchone()
             if not suite_row:
                 return None
             run_rows = conn.execute(
@@ -597,8 +716,8 @@ class SpanStore:
                 run_index=row["run_index"] or 0,
                 ok=bool(row["ok"]),
                 self_reported_ok=bool(row["self_reported_ok"]),
-                failed_checks=json.loads(row["failed_checks"] or "[]"),
-                process_flags=json.loads(row["process_flags"] or "[]"),
+                failed_checks=_json_list(row["failed_checks"]),
+                process_flags=_json_list(row["process_flags"]),
                 task_id=row["task_id"] or "",
                 sut_name=row["sut_name"] or "",
                 tokens=row["tokens"] or 0,
@@ -610,7 +729,7 @@ class SpanStore:
                 error_type=row["error_type"],
                 error=row["error"],
                 guard_config=row["guard_config"] or "all",
-                budget_violated=json.loads(row["budget_violated"] or "[]"),
+                budget_violated=_json_list(row["budget_violated"]),
                 budget_would_stop=bool(row["budget_would_stop"]),
                 action_diversity=row["action_diversity"],
                 postcondition_warnings=row["postcondition_warnings"] or 0,
@@ -618,9 +737,7 @@ class SpanStore:
                 fault_spec=_column(row, "fault_spec") or "",
                 arm=_column(row, "arm") or "",
                 replay_mode=_column(row, "replay_mode") or "off",
-                replay_misses=_replay_misses_from_flags(
-                    json.loads(row["process_flags"] or "[]")
-                ),
+                replay_misses=_replay_misses_from_flags(_json_list(row["process_flags"])),
             )
             for row in run_rows
         ]
@@ -636,7 +753,7 @@ class SpanStore:
             budget_mode=suite_row["budget_mode"] or "observe",
             started_at=suite_row["started_at"] or "",
             elapsed_s=suite_row["elapsed_s"] or 0.0,
-            notes=json.loads(suite_row["notes"] or "[]"),
+            notes=_json_list(suite_row["notes"]),
             self_report_available=all(row["self_reported_ok"] is not None for row in run_rows),
             guard_config=_column(suite_row, "guard_config") or "",
             fault_spec=_column(suite_row, "fault_spec") or "",
@@ -652,6 +769,219 @@ class SpanStore:
                 if uid in suites
             ],
         )
+
+    def cost_by(self, *, suite_id: Optional[str] = None, kind: str = "tool", limit: int = 12) -> Dict[str, Any]:
+        """按 span 归属聚合成本：**钱花在哪一步 / 哪个工具**（T3 / 审计 §4.12）。
+
+        为什么必须靠 span 树：成本只在 **LLM 调用**那一层可观测
+        （span 的 attrs 里有 prompt/completion tokens，但**没有 cost 列**），
+        而人想知道的是"钱花在哪一步"。所以把每次 LLM 调用的成本
+        向上归给**最近的 `kind` 祖先** —— 这正是 span 父子关系的用途。
+
+        实测价值：最贵的那次运行是"20 步里 10 步在探环境/看字节"，
+        而这种结论只有归因才看得出来（task 级成本只能说"它贵"，
+        说不出"贵在哪个动作"）。
+
+        :param suite_id: 只统计这个 suite 的运行；None = 全库
+        :param kind: `tool`（按工具名，**按时间归给紧随其后的工具调用**）或
+                     `step`（按计划步骤名，按 span 树归给最近的 step 祖先）
+        :return: {"rows", "total_cost", "attributed_cost", "unattributed_cost", "kind"}
+        """
+        from lab.usage import price_of  # 函数内导入：与 usage 保持低耦合
+
+        if kind not in ("tool", "step"):
+            raise ValueError("kind 只能是 tool 或 step")
+
+        pattern = f"{suite_id}%" if suite_id else None
+        with self._connect() as conn:
+            rows = conn.execute(
+                # 静态 SQL + 命名参数（不拼接）
+                """
+                SELECT span_id, task_id, parent_id, name, kind, start_ms, end_ms, attrs
+                FROM spans
+                WHERE (:pattern IS NULL
+                       OR task_id IN (SELECT task_id FROM bench_runs WHERE suite_id LIKE :pattern))
+                """,
+                {"pattern": pattern},
+            ).fetchall()
+
+        by_id = {row["span_id"]: row for row in rows}
+        # ⚠️ 工具归因**不能用 span 树**：实测 LLM span 与 tool span 是**同一个 step 下的兄弟**
+        # （recorder 里 llm 不 push，所以它不会成为 tool 的子节点）。
+        # 按树找"工具祖先"会得到 100% 任务级 —— 实测就是这样的（报告里
+        # "可归因成本 $0.0000" 把这个问题直接暴露了出来）。
+        # 改用**时间顺序**：把一次 LLM 调用的成本归给**紧随其后的那次工具调用**
+        # （即这次调用产出的动作）；最后一次调用（通常是收尾）落在任务级。
+        tools_by_task: Dict[str, List[tuple]] = {}
+        for row in rows:
+            if row["kind"] == "tool":
+                tools_by_task.setdefault(row["task_id"], []).append(
+                    (row["start_ms"] or 0, row["name"] or "（未命名 tool）")
+                )
+        for items in tools_by_task.values():
+            items.sort()
+
+        buckets: Dict[str, Dict[str, float]] = {}
+        total_cost = 0.0
+        attributed_cost = 0.0
+        root_label = "（任务级：没有归属的工具/步骤）"
+
+        for row in rows:
+            if row["kind"] != "llm":
+                continue
+            attrs = _json_dict(row["attrs"])
+            prompt = attrs.get("prompt_tokens") or 0
+            completion = attrs.get("completion_tokens") or 0
+            if not prompt and not completion:
+                continue
+            price = price_of(attrs.get("model") or "")
+            cost = prompt / 1_000_000 * price[0] + completion / 1_000_000 * price[1] if price else 0.0
+            total_cost += cost
+
+            # 归属：tool → 按时间找紧随其后的工具调用；step → 按 span 树找最近祖先
+            label = root_label
+            if kind == "tool":
+                moment = row["end_ms"] or row["start_ms"] or 0
+                following = [name for start, name in tools_by_task.get(row["task_id"], []) if start >= moment]
+                if following:
+                    label = following[0]
+                    attributed_cost += cost
+            else:
+                cursor = row["parent_id"]
+                for _ in range(64):  # 防御环（脏数据不应该让命令挂死）
+                    if not cursor:
+                        break
+                    parent = by_id.get(cursor)
+                    if parent is None:
+                        break
+                    if parent["kind"] == kind:
+                        label = parent["name"] or f"（未命名 {kind}）"
+                        attributed_cost += cost
+                        break
+                    cursor = parent["parent_id"]
+
+            bucket = buckets.setdefault(label, {"cost_usd": 0.0, "tokens": 0.0, "llm_calls": 0})
+            bucket["cost_usd"] += cost
+            bucket["tokens"] += prompt + completion
+            bucket["llm_calls"] += 1
+
+        ordered = sorted(buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True)
+        out_rows = [
+            {
+                "name": name,
+                "cost_usd": round(value["cost_usd"], 6),
+                # 用 round() 而不是 int()：它本身就是取整（无 ndigits 时返回 int），
+                # 少一次可能抛异常的转换调用。
+                "tokens": round(value["tokens"]),
+                "llm_calls": round(value["llm_calls"]),
+                "share": (value["cost_usd"] / total_cost) if total_cost else 0.0,
+            }
+            for name, value in ordered
+        ]
+        if len(out_rows) > limit:
+            rest = out_rows[limit:]
+            out_rows = out_rows[:limit] + [
+                {
+                    "name": f"（其他 {len(rest)} 项）",
+                    "cost_usd": round(sum(r["cost_usd"] for r in rest), 6),
+                    "tokens": sum(r["tokens"] for r in rest),
+                    "llm_calls": sum(r["llm_calls"] for r in rest),
+                    "share": sum(r["share"] for r in rest),
+                }
+            ]
+        return {
+            "rows": out_rows,
+            "total_cost": round(total_cost, 6),
+            "attributed_cost": round(attributed_cost, 6),
+            "unattributed_cost": round(total_cost - attributed_cost, 6),
+            "kind": kind,
+        }
+
+    def task_success_audit(self) -> List[Dict[str, Any]]:
+        """每个任务的**干净运行**成功率（供 `bench purpose-audit`，T5）。
+
+        为什么只算干净运行：故障注入会**人为压低**成功率（实测故障格成本 +109%、
+        Agent 在额外重试），把它算进"任务稳不稳定"会把装置噪声当成能力边界。
+
+        另带最近一次干净失败的 suite/run：告警要能直接接一条 `bench show` 命令，
+        否则人拿到告警还得自己去库里翻（诊断信息本身是产品）。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                # 静态 SQL（不拼接、也不需要参数）
+                """
+                SELECT task_key,
+                       SUM(CASE WHEN COALESCE(faults_injected, 0) = 0 THEN 1 ELSE 0 END) AS clean_n,
+                       SUM(CASE WHEN COALESCE(faults_injected, 0) = 0 AND ok = 1
+                                THEN 1 ELSE 0 END) AS clean_ok,
+                       SUM(CASE WHEN COALESCE(faults_injected, 0) > 0 THEN 1 ELSE 0 END) AS fault_n,
+                       SUM(CASE WHEN COALESCE(faults_injected, 0) > 0 AND ok = 1
+                                THEN 1 ELSE 0 END) AS fault_ok,
+                       (SELECT b2.suite_id FROM bench_runs b2
+                         WHERE b2.task_key = bench_runs.task_key
+                           AND COALESCE(b2.faults_injected, 0) = 0 AND b2.ok = 0
+                         ORDER BY b2.created_at DESC LIMIT 1) AS last_clean_fail_suite,
+                       (SELECT b2.run_index FROM bench_runs b2
+                         WHERE b2.task_key = bench_runs.task_key
+                           AND COALESCE(b2.faults_injected, 0) = 0 AND b2.ok = 0
+                         ORDER BY b2.created_at DESC LIMIT 1) AS last_clean_fail_run
+                FROM bench_runs
+                GROUP BY task_key
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def sample_runs_for_judging(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """挑用于人工标注的运行：**失败优先，再补成功**（T14）。
+
+        为什么要混正负样本：只拿失败样本时金标分布会偏斜（同一维度几乎全是 false），
+        κ 的期望一致率随之失真（极端情况直接退化成"无法计算"）。
+        抽样就是为了让分布可读 —— 这是校准能不能得出可信 κ 的前提。
+        """
+        sql = """
+            SELECT b.suite_id, b.task_key, b.group_name AS group_name, b.run_index, b.arm,
+                   b.self_reported_ok, b.ok, t.workspace AS workspace, t.goal AS goal
+            FROM bench_runs b LEFT JOIN tasks t ON b.task_id = t.task_id
+            WHERE b.ok = :ok
+            ORDER BY b.created_at DESC
+            LIMIT :limit
+        """
+        out: List[Dict[str, Any]] = []
+        with self._connect() as conn:
+            for ok in (0, 1):  # 0 = 失败优先
+                if len(out) >= limit:
+                    break
+                rows = conn.execute(sql, {"ok": ok, "limit": limit - len(out)}).fetchall()
+                out.extend(dict(row) for row in rows)
+        return out[:limit]
+
+    def list_failed_runs(self, *, limit: int = 10, suite_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """挑出**失败的**运行（供 `bench sample-failures` 读轨迹）。
+
+        为什么用 SQL 而不是遍历 suite：`bench_runs.ok` 本来就是一列，
+        一条 SQL 就能筛；评测跑多以后把几万行读进内存再过滤会变成瓶颈。
+
+        返回**行的字典**而不是 RunOutcome：这里要的是"去哪读轨迹"
+        （task_id / workspace / 失败检查 / 工具序列），不是重建整个 suite 的统计口径。
+        workspace 与 tool_sequence 来自 `tasks` 表（`bench_runs` 里没有它们）。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                # 静态 SQL + 命名参数（`:pattern IS NULL` 让"全库"与"单个 suite"共用一条）
+                """
+                SELECT b.suite_id, b.task_key, b.task_uid, b.run_index, b.arm, b.task_id,
+                       b.error_type, b.error, b.failed_checks, b.process_flags, b.cost_usd,
+                       b.created_at, b.self_reported_ok, b.tool_calls,
+                       t.workspace AS workspace, t.tool_sequence AS tool_sequence
+                FROM bench_runs b LEFT JOIN tasks t ON b.task_id = t.task_id
+                WHERE b.ok = 0
+                  AND (:pattern IS NULL OR b.suite_id LIKE :pattern)
+                ORDER BY b.created_at DESC
+                LIMIT :limit
+                """,
+                {"pattern": f"{suite_id}%" if suite_id else None, "limit": limit},
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def load_runs_grouped_by_task(self, limit_per_task: int = 500) -> Dict[str, List[Dict[str, Any]]]:
         """把历史运行按 task_key 分组（用于按分位数推导预算阈值）。
@@ -686,21 +1016,22 @@ class SpanStore:
             2~3 倍（Agent 会因为产物被截断而反复重试），
             用无故障均值去估故障实验会低估一半以上。
         """
-        clause = ""
-        params: List[Any] = [group]
-        if faulted is True:
-            clause = " AND faults_injected > 0"
-        elif faulted is False:
-            clause = " AND COALESCE(faults_injected, 0) = 0"
         with self._connect() as conn:
             row = conn.execute(
-                f"SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n FROM bench_runs "
-                f"WHERE group_name = ?{clause}",
-                params,
+                # 静态 SQL + 命名参数（用 NULL/1/0 表达"不筛/只看故障/只看无故障"）
+                """
+                SELECT AVG(cost_usd) AS avg_cost, COUNT(*) AS n
+                FROM bench_runs
+                WHERE group_name = :group
+                  AND (:faulted IS NULL
+                       OR (:faulted = 1 AND COALESCE(faults_injected, 0) > 0)
+                       OR (:faulted = 0 AND COALESCE(faults_injected, 0) = 0))
+                """,
+                {"group": group, "faulted": None if faulted is None else (1 if faulted else 0)},
             ).fetchone()
         if not row or not row["n"]:
             return None
-        return float(row["avg_cost"] or 0.0)
+        return as_float(row["avg_cost"])
 
     def stats(self, sut_name: Optional[str] = None) -> Dict[str, Any]:
         """跨运行聚合：成功率、tokens/任务、成本/任务、P95 耗时。

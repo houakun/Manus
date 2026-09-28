@@ -75,6 +75,17 @@ class FaultRule(BaseModel):
     max_injections: Optional[int] = None  # 最多注入几次（None = 不限）
     fail_times: Optional[int] = None  # transient_error 专用：前 N 次失败
     latency_s: float = 2.0  # latency_spike 专用：注入的额外延迟
+    # `stable=True`：把决策粒度从**调用序号**换成**目标**（如文件路径）。
+    #
+    # 为什么需要它（T6/T7 两次负结果的根因）：默认按调用序号抛硬币，
+    # 于是同一份文件被读两次时可能一次被损坏、一次没损坏 —— Agent 一重读就
+    # 发现自相矛盾，故障失效（实测 `silent_wrong_result@read_file(rate=0.5)`
+    # 的注入次数与 read_file 次数一一对应：inj=1/2/3/5 → read=2/3/4/9）。
+    # `stable=True` 后，**同一个目标一旦被判为损坏，此后每次读到的都是同一个错值**
+    # （`_corrupt_data` 本身是确定性的），于是 Agent 与 guard **共用**的那条防线
+    # （重读比对）同时失效 —— 这是目前唯一剩下的可证伪方向。
+    stable: bool = False
 
     def describe(self) -> str:
-        return f"{self.kind.value}@{self.tool}(rate={self.rate})"
+        flags = ",stable" if self.stable else ""
+        return f"{self.kind.value}@{self.tool}(rate={self.rate}{flags})"

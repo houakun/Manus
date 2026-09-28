@@ -60,10 +60,39 @@ def _workspace_layout(bench_root: Path, group: Optional[str] = None) -> List[tup
         match = pattern.match(run_dir)
         if match is None:
             continue
-        run_index = int(match.group(1))
+        run_index = _safe_int(match.group(1), default=-1)
+        if run_index < 0:
+            # 正则已保证 group(1) 是 `\d+`，走到这里说明目录名形态被改过。
+            # **不能当成 run0 静默继续**：那会让两次不同的运行互相覆盖，
+            # 数字看起来正常、样本却是错的 —— 与 `_workspace_layout` 上面说的
+            # "静默跳过"是同一类坑，所以这里宁可丢这一条。
+            continue
         arm = match.group(2) or ""
         found.append((f"{group_name}/{key}", run_index, arm, workspace))
     return found
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """数据库列 → int，**解析不了就用默认值**。
+
+    为什么必须容错：`recover` 读的是**历史数据** —— 那些列由旧版本写入，
+    现在无从保证类型（实测这类列可能是 `""` / `"n/a"` / `"3.5"`，
+    `int()` 会当场抛）。而这条命令的整个卖点就是"一条坏行不该让整条命令挂掉"
+    （与 `_json_list` 同一条理由）：抛一次 = 丢掉整次评测的重建 ——
+    偏偏是在最需要它的时候。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """同 `_safe_int`，用于成本/工具调用次数这类浮点列。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _task_result_from_row(row: Dict[str, Any], workspace: Path) -> TaskResult:
@@ -73,21 +102,21 @@ def _task_result_from_row(row: Dict[str, Any], workspace: Path) -> TaskResult:
     避免读者以为这是"完整还原了一次运行"。
     """
     usage = Usage()
-    usage.llm_calls = int(row.get("llm_calls") or 0)
-    usage.llm_errors = int(row.get("llm_errors") or 0)
-    usage.total_tokens = int(row.get("total_tokens") or 0)
-    usage.tool_calls = int(row.get("tool_calls") or 0)
+    usage.llm_calls = _safe_int(row.get("llm_calls"))
+    usage.llm_errors = _safe_int(row.get("llm_errors"))
+    usage.total_tokens = _safe_int(row.get("total_tokens"))
+    usage.tool_calls = _safe_int(row.get("tool_calls"))
 
     guard: Dict[str, Any] = {
         "loop": {
-            "tool_calls": float(row.get("tool_calls") or 0),
+            "tool_calls": _safe_float(row.get("tool_calls")),
             "action_diversity": row.get("action_diversity"),
         },
         "budget": {
             "violated_metrics": _json_list(row.get("budget_violated_metrics")),
             "would_stop": bool(row.get("budget_would_stop")),
         },
-        "postconditions": {"warnings": [""] * int(row.get("postcondition_warnings") or 0)},
+        "postconditions": {"warnings": [""] * _safe_int(row.get("postcondition_warnings"))},
     }
     return TaskResult(
         task_id=row.get("task_id") or "",
@@ -96,10 +125,10 @@ def _task_result_from_row(row: Dict[str, Any], workspace: Path) -> TaskResult:
         error=row.get("error"),
         error_type=row.get("error_type"),
         plan_title=row.get("plan_title") or "",
-        steps=StepStats(total=int(row.get("steps_total") or 0), done=int(row.get("steps_done") or 0)),
+        steps=StepStats(total=_safe_int(row.get("steps_total")), done=_safe_int(row.get("steps_done"))),
         llm_usage=usage,
-        cost_usd=float(row.get("cost_usd") or 0.0),
-        elapsed_ms=int(row.get("elapsed_ms") or 0),
+        cost_usd=_safe_float(row.get("cost_usd")),
+        elapsed_ms=_safe_int(row.get("elapsed_ms")),
         workspace=str(workspace),
         guard=guard,
     )
@@ -118,14 +147,14 @@ def _json_list(raw: Optional[str]) -> List[str]:
 
 
 async def recover_suite(
-        *,
-        bench_root: Path,
-        store: Any,
-        suite_id: str,
-        label: str = "",
-        runs_per_task: Optional[int] = None,
-        note: str = "",
-        group: Optional[str] = None,
+    *,
+    bench_root: Path,
+    store: Any,
+    suite_id: str,
+    label: str = "",
+    runs_per_task: Optional[int] = None,
+    note: str = "",
+    group: Optional[str] = None,
 ) -> SuiteResult:
     """从工作区 + 轨迹库重建一次评测，并写入 store。"""
     tasks_by_uid: Dict[str, BenchTask] = {task.uid: task for task in load_all_tasks()}
@@ -154,41 +183,41 @@ async def recover_suite(
         # 3.重新评过程规则
         result = _task_result_from_row(row, workspace)
         flags = evaluate_process(task, result)
-        guard = result.guard or {}
 
-        outcomes.append(RunOutcome(
-            run_id=f"recovered-{task_uid.replace('/', '-')}-run{run_index}"
-                   + (f"-{arm}" if arm else ""),
-            suite_id=suite_id,
-            task_uid=task_uid,
-            task_key=task.key,
-            group=task.group,
-            run_index=run_index,
-            ok=ok,
-            # 旧数据没记录自述字段 → 标为未知（不能当成"没虚报"）
-            self_reported_ok=bool(row.get("ok")),
-            failed_checks=[c.line() for c in checks if not c.ok],
-            process_flags=flags,
-            task_id=row.get("task_id") or "",
-            sut_name=row.get("sut_name") or "",
-            tokens=int(row.get("total_tokens") or 0),
-            cost_usd=float(row.get("cost_usd") or 0.0),
-            elapsed_ms=int(row.get("elapsed_ms") or 0),
-            llm_calls=int(row.get("llm_calls") or 0),
-            tool_calls=float(row.get("tool_calls") or 0),
-            steps_done=int(row.get("steps_done") or 0),
-            error_type=row.get("error_type"),
-            error=row.get("error"),
-            budget_violated=_json_list(row.get("budget_violated_metrics")),
-            budget_would_stop=bool(row.get("budget_would_stop")),
-            action_diversity=row.get("action_diversity"),
-            postcondition_warnings=int(row.get("postcondition_warnings") or 0),
-            faults_injected=int(row.get("faults_injected") or 0),
-            workspace=str(workspace),
-            # 臂名从**目录名**恢复（它已被规范化成 slug）。
-            # `for_arm()` 两边都过同一个 slug 函数，所以按原始 label 也能筛到。
-            arm=arm,
-        ))
+        outcomes.append(
+            RunOutcome(
+                run_id=f"recovered-{task_uid.replace('/', '-')}-run{run_index}" + (f"-{arm}" if arm else ""),
+                suite_id=suite_id,
+                task_uid=task_uid,
+                task_key=task.key,
+                group=task.group,
+                run_index=run_index,
+                ok=ok,
+                # 旧数据没记录自述字段 → 标为未知（不能当成"没虚报"）
+                self_reported_ok=bool(row.get("ok")),
+                failed_checks=[c.line() for c in checks if not c.ok],
+                process_flags=flags,
+                task_id=row.get("task_id") or "",
+                sut_name=row.get("sut_name") or "",
+                tokens=_safe_int(row.get("total_tokens")),
+                cost_usd=_safe_float(row.get("cost_usd")),
+                elapsed_ms=_safe_int(row.get("elapsed_ms")),
+                llm_calls=_safe_int(row.get("llm_calls")),
+                tool_calls=_safe_float(row.get("tool_calls")),
+                steps_done=_safe_int(row.get("steps_done")),
+                error_type=row.get("error_type"),
+                error=row.get("error"),
+                budget_violated=_json_list(row.get("budget_violated_metrics")),
+                budget_would_stop=bool(row.get("budget_would_stop")),
+                action_diversity=row.get("action_diversity"),
+                postcondition_warnings=_safe_int(row.get("postcondition_warnings")),
+                faults_injected=_safe_int(row.get("faults_injected")),
+                workspace=str(workspace),
+                # 臂名从**目录名**恢复（它已被规范化成 slug）。
+                # `for_arm()` 两边都过同一个 slug 函数，所以按原始 label 也能筛到。
+                arm=arm,
+            )
+        )
 
     suite = SuiteResult(
         suite_id=suite_id,
@@ -203,15 +232,12 @@ async def recover_suite(
         ],
     )
     suite.notes.append(
-        "本次数据由 `lab bench recover` 从工作区 + 轨迹库**重建**："
-        "判定器是纯函数，所以重新判定的结论与当时一致。"
+        "本次数据由 `lab bench recover` 从工作区 + 轨迹库**重建**：判定器是纯函数，所以重新判定的结论与当时一致。"
     )
     if note:
         suite.notes.append(note)
     if skipped:
-        suite.notes.append(
-            f"有 {len(skipped)} 个工作区无法恢复（未计入成功率）：{skipped[:5]}"
-        )
+        suite.notes.append(f"有 {len(skipped)} 个工作区无法恢复（未计入成功率）：{skipped[:5]}")
 
     # 4.落库（走增量接口，与正常评测同一套表结构）
     store.save_suite_header(suite)

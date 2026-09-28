@@ -15,8 +15,8 @@ from lab.trace.store import SpanStore
 from lab.trace.view import render_summary, render_tree, summarize
 from lab.usage import Usage
 
-
 # ==================== recorder：span 树结构 ====================
+
 
 def test_task_span_is_root_and_open():
     """recorder 创建后应立即有一个 task 根 span，且处于打开状态。"""
@@ -133,6 +133,7 @@ def test_tool_args_are_truncated():
 
 # ==================== LLM 代理：span + 用量采集 ====================
 
+
 async def test_counting_llm_reports_usage_and_span():
     """代理要同时做三件事：转发、累计用量、产出 llm span。"""
     recorder = TraceRecorder("t1")
@@ -217,6 +218,7 @@ async def test_failed_llm_call_marks_span_error_and_counts():
 
 # ==================== store：落盘与统计 ====================
 
+
 def _fake_result(task_id: str, spans):
     """构造一个最小可用的 TaskResult（store 只读属性，不依赖 SUT）。"""
     from lab.sut.base import StepStats, TaskResult
@@ -236,6 +238,103 @@ def _fake_result(task_id: str, spans):
         elapsed_ms=123,
         workspace="/tmp/ws",
     )
+
+
+# ==================== 成本归因（T3 / 审计 §4.12） ====================
+
+
+def test_cost_by_attributes_llm_cost_to_the_action_it_produced(tmp_path):
+    """成本归因：一次 LLM 调用的成本要归给**紧随其后的那次工具调用**（＝它产出的动作）。
+
+    为什么是时间规则而不是 span 树：实测 LLM span 与 tool span 是同一 step 下的
+    **兄弟**（recorder 里 llm 不 push），按树找"工具祖先"会得到 100% 任务级 ——
+    这个错是在"与历史数据人工核对"时被报告里的"可归因成本 $0.0000"暴露出来的。
+
+    而"没有后续工具"的那次调用（收尾）必须**明确落到任务级**，不能被静默丢掉。
+    """
+    from lab.usage import price_of
+
+    model = "deepseek-reasoner"
+    recorder = TraceRecorder("t-cost", sut_name="fake-sut")
+    step = recorder.open_step("第一步")
+    # 顺序刻意是"先 LLM 再工具"：归因规则是按**时间**找紧随其后的工具调用
+    first = recorder.begin_span("llm", model, {"model": model})
+    first.end(prompt_tokens=1000, completion_tokens=500)
+    tool = recorder.open_tool("write_file", "file", {"filepath": "/a"})
+    tool.end(success=True)
+    last = recorder.begin_span("llm", model, {"model": model})
+    last.end(prompt_tokens=2000, completion_tokens=100)
+    step.end(success=True)
+    recorder.finish_task(ok=True)
+
+    # 时间字段是**相对任务开始的毫秒偏移**，测试里显式赋值：
+    # 连续几行代码的真实耗时常常都是 0ms，靠真实时钟会让"紧随其后"无法确定。
+    llm_spans = [s for s in recorder.spans if s.kind == SpanKind.LLM]
+    tool_span = next(s for s in recorder.spans if s.kind == SpanKind.TOOL)
+    llm_spans[0].start_ms, llm_spans[0].end_ms = 0, 100
+    tool_span.start_ms, tool_span.end_ms = 200, 300
+    llm_spans[1].start_ms, llm_spans[1].end_ms = 400, 500
+
+    store = SpanStore(tmp_path / "traces.db")
+    store.save_run(_fake_result("t-cost", recorder.spans), recorder.spans)
+
+    price = price_of(model)
+    assert price, "价格表里必须有这个模型，否则用例根本测不到东西"
+    cost_tool = 1000 / 1_000_000 * price[0] + 500 / 1_000_000 * price[1]
+    cost_step = 2000 / 1_000_000 * price[0] + 100 / 1_000_000 * price[1]
+
+    by_tool = store.cost_by(kind="tool")
+    rows = {row["name"]: row for row in by_tool["rows"]}
+    assert rows["write_file"]["cost_usd"] == pytest.approx(cost_tool, rel=1e-3)
+    assert rows["write_file"]["llm_calls"] == 1
+    assert any("任务级" in name for name in rows), rows
+    assert by_tool["total_cost"] == pytest.approx(cost_tool + cost_step, rel=1e-3)
+    assert by_tool["attributed_cost"] == pytest.approx(cost_tool, rel=1e-3)
+    assert by_tool["unattributed_cost"] == pytest.approx(cost_step, rel=1e-3)
+
+    # 换成按 step 聚合：两次调用都该归给"第一步"
+    by_step = store.cost_by(kind="step")
+    step_rows = {row["name"]: row for row in by_step["rows"]}
+    assert step_rows["第一步"]["cost_usd"] == pytest.approx(cost_tool + cost_step, rel=1e-3)
+    assert step_rows["第一步"]["llm_calls"] == 2
+
+
+def test_cost_by_rejects_unknown_kind(tmp_path):
+    """kind 只接受 tool / step —— 拼错时要**响亮地失败**，而不是返回空表。"""
+    store = SpanStore(tmp_path / "traces.db")
+    with pytest.raises(ValueError):
+        store.cost_by(kind="file")
+
+
+def test_task_success_audit_counts_only_clean_runs(tmp_path):
+    """对账口径：只算**干净运行**（`faults_injected=0`）—— 故障格不能算进"稳不稳定"。
+
+    为什么这个口径重要：故障注入会**人为压低**成功率（实测故障格成本 +109%、
+    Agent 在额外重试），把它算进稳定性会把装置噪声当成能力边界。
+    """
+    from lab.bench.runner import RunOutcome
+
+    store = SpanStore(tmp_path / "traces.db")
+    for run_index, ok, faults in ((0, True, 0), (1, False, 0), (2, False, 5)):
+        store.save_outcome(
+            RunOutcome(
+                run_id=f"r{run_index}",
+                suite_id="s-audit",
+                task_uid="u",
+                task_key="syn_sum_range",
+                group="synthetic",
+                run_index=run_index,
+                ok=ok,
+                faults_injected=faults,
+            )
+        )
+
+    row = {item["task_key"]: item for item in store.task_success_audit()}["syn_sum_range"]
+    assert (row["clean_n"], row["clean_ok"]) == (2, 1)
+    assert (row["fault_n"], row["fault_ok"]) == (1, 0)
+    # 最近一次**干净**失败要能直接定位（告警要能接一条 bench show）
+    assert row["last_clean_fail_suite"] == "s-audit"
+    assert row["last_clean_fail_run"] == 1
 
 
 def test_store_roundtrip_preserves_tree(tmp_path):
@@ -330,12 +429,12 @@ def test_resolve_task_id_short_prefix(tmp_path):
 
 # ==================== view：文本渲染 ====================
 
+
 def test_render_tree_shows_hierarchy_and_attrs():
     recorder = TraceRecorder("t1", sut_name="fake-sut")
     step = recorder.open_step("写文件")
     tool = recorder.open_tool("write_file", "file", {"filepath": "/a.txt"})
-    tool.end(success=True, attempts=2, faults_injected="partial_write",
-              postcondition_warning="写入内容与预期不一致")
+    tool.end(success=True, attempts=2, faults_injected="partial_write", postcondition_warning="写入内容与预期不一致")
     step.end(success=True)
     recorder.finish_task(ok=True)
 

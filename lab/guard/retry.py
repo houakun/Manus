@@ -31,18 +31,29 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
+from app.domain.models.tool_result import ToolResult
 
 # 重复执行**安全**的工具（幂等或"重试最坏只是失败，不会产生第二次副作用"）
 IDEMPOTENT_TOOLS = {
     # 纯读
-    "read_file", "search_in_file", "find_files", "list_files", "check_file_exists",
-    "shell_read_output", "shell_wait_process",
-    "browser_view", "browser_console_view", "browser_scroll_up", "browser_scroll_down",
-    "search_web", "get_remote_agent_cards",
+    "read_file",
+    "search_in_file",
+    "find_files",
+    "list_files",
+    "check_file_exists",
+    "shell_read_output",
+    "shell_wait_process",
+    "browser_view",
+    "browser_console_view",
+    "browser_scroll_up",
+    "browser_scroll_down",
+    "search_web",
+    "get_remote_agent_cards",
     # 写入类但重试安全：第二次执行会因为"目标已不存在/已生效"而失败或等价成功，
     # 不会产生叠加副作用。注意 write_file 不在此列 —— append=True 时会叠加！
-    "replace_in_file", "delete_file", "shell_kill_process",
+    "replace_in_file",
+    "delete_file",
+    "shell_kill_process",
 }
 
 # 重复执行**会产生副作用**的工具
@@ -52,8 +63,13 @@ NON_IDEMPOTENT_TOOLS = {
     "shell_write_input",  # 向交互式进程重复输入 = 语义改变
     "message_notify_user",  # 重复播报 = 打扰用户
     "message_ask_user",  # 重复提问 = 对话错乱
-    "browser_navigate", "browser_restart", "browser_click", "browser_input",
-    "browser_press_key", "browser_select_option", "browser_console_exec",
+    "browser_navigate",
+    "browser_restart",
+    "browser_click",
+    "browser_input",
+    "browser_press_key",
+    "browser_select_option",
+    "browser_console_exec",
     "call_remote_agent",  # 消耗远程资源，且可能非幂等
 }
 
@@ -74,20 +90,18 @@ def is_idempotent(function_name: str) -> bool:
     """判断工具是否幂等。**未知工具返回 False**（fail-safe）。"""
     if function_name in NON_IDEMPOTENT_TOOLS:
         return False
-    if function_name in IDEMPOTENT_TOOLS:
-        return True
-    # 未知（例如 MCP 动态工具）→ 按危险处理
-    return False
+    # 未知（例如 MCP 动态工具）→ 按危险处理；只有已知幂等的才返回 True
+    return function_name in IDEMPOTENT_TOOLS
 
 
 def compute_backoff(
-        attempt: int,
-        *,
-        base: float = 0.5,
-        factor: float = 2.0,
-        cap: float = 8.0,
-        jitter_ratio: float = 0.25,
-        rng: Optional[random.Random] = None,
+    attempt: int,
+    *,
+    base: float = 0.5,
+    factor: float = 2.0,
+    cap: float = 8.0,
+    jitter_ratio: float = 0.25,
+    rng: Optional[random.Random] = None,
 ) -> float:
     """指数退避 + 抖动。
 
@@ -97,7 +111,7 @@ def compute_backoff(
     传入固定 seed 的 rng 可让评测可复现。
     """
     exponent = max(0, attempt - 1)
-    delay = min(cap, base * (factor ** exponent))
+    delay = min(cap, base * (factor**exponent))
     if jitter_ratio <= 0:
         return delay
     generator = rng or random
@@ -117,13 +131,13 @@ class RetryDecision:
 
 
 def decide_retry(
-        *,
-        function_name: str,
-        result: Optional[ToolResult],
-        error: Optional[BaseException],
-        attempt: int,
-        max_attempts: int,
-        rng: Optional[random.Random] = None,
+    *,
+    function_name: str,
+    result: Optional[ToolResult],
+    error: Optional[BaseException],
+    attempt: int,
+    max_attempts: int,
+    rng: Optional[random.Random] = None,
 ) -> RetryDecision:
     """决定要不要重试，并给出**可读的原因**。
 

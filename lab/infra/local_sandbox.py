@@ -47,11 +47,12 @@ SUT 的 FileTool / ShellTool 本身**不含任何业务逻辑**，它们只是 `
 - 命令中的沙箱绝对路径靠**字符串替换**成本地真实路径，复杂命令（heredoc、变量拼接、
   通配符展开）可能替换不到 —— 这是近似模拟，不等价于真沙箱；
   （脚本内容里的绝对路径由上面的虚拟盘符兜住，但**命令里的**复杂 shell 语法仍只是近似）
-- **子进程的 PATH 继承自本进程**：从 Git Bash 启动会带上 Git 的 `usr\\bin`
-  （于是 `sqlite3` / `grep` / `od` / `tr` 全在），从 PowerShell 启动则全都不在。
-  也就是说"Agent 看到的世界"取决于评测是怎么被启动的 —— 这是**已知的、尚未修的可复现性缺陷**
-  （证据：同一段命令在两种上下文里 `where sqlite3` 一个成功一个失败），
-  修它需要先定"fast mode 保证哪些工具存在"，故未在本轮动。
+- **子进程的 PATH 不再原样继承**（Step 8 修，见 `lab/infra/env.py`）：
+  改成"固定前缀（Git / 系统目录）+ 父 PATH 兜底 + 解释器兜底"，
+  所以 `sqlite3` / `grep` / `od` / `tr` 这类工具在 Git Bash 与 PowerShell 下看到的是**同一批**。
+  残余：**只在父 PATH 里**的工具（宿主 `python` / `node`）仍随启动上下文变 ——
+  它们被记进**环境指纹**（`python -m lab sandbox env`），用来判断"两次跑是不是同一个环境"，
+  而不是假装它不存在。
 - 不提供浏览器与网络能力（fast mode 的工具集里已经把浏览器/搜索工具去掉了）。
 以上限制决定了 fast mode 适合**计算 / 文件 IO / 文本处理类确定性任务**，
 不适合浏览器任务 —— 后者仍需真沙箱，Step 4 的任务集要按这个边界来设计。
@@ -74,14 +75,14 @@ import sys
 import tempfile
 import weakref
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Dict, List, Optional
+from typing import Any, BinaryIO, Callable, Dict, List, Optional
 
 from lab.bootstrap import ensure_sut_on_path
 from lab.infra.env import deterministic_path, environment_fingerprint
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
+from app.domain.models.tool_result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +183,7 @@ def _release_all_drives() -> None:
     """进程退出时释放本进程占用的所有虚拟盘（atexit 兑底）。"""
     for letter in list(_DRIVE_POOL):
         with contextlib.suppress(Exception):
-            subprocess.run(["subst", letter, "/D"], capture_output=True, timeout=10)
+            subprocess.run(["subst", letter, "/D"], capture_output=True, timeout=10, check=False)
         with contextlib.suppress(Exception):
             (_drive_registry_dir() / f"{letter.rstrip(':')}.pid").unlink(missing_ok=True)
         _DRIVE_POOL.pop(letter, None)
@@ -212,9 +213,7 @@ def _pid_alive(pid: int) -> bool:
 
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             STILL_ACTIVE = 259
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not handle:
                 return False
             try:
@@ -232,10 +231,13 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _drive_owner(drive: str) -> Optional[int]:
-    """读该盘符登记的属主 pid；没有登记返回 None。"""
-    with contextlib.suppress(Exception):
-        return int((_drive_registry_dir() / f"{drive.rstrip(':')}.pid").read_text().strip())
-    return None
+    """读该盘符登记的属主 pid；**没有登记或内容坏了都返回 None**。"""
+    path = _drive_registry_dir() / f"{drive.rstrip(':')}.pid"
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        # 文件不存在 / 内容不是数字 —— 都按"无属主"处理（下一步会当成可回收）
+        return None
 
 
 def _drive_is_reclaimable(drive: str, target: str) -> bool:
@@ -264,7 +266,7 @@ def list_drive_mappings() -> List[Dict[str, str]]:
     if os.name != "nt":
         return []
     with contextlib.suppress(Exception):
-        done = subprocess.run(["subst"], capture_output=True, text=True, timeout=10, errors="replace")
+        done = subprocess.run(["subst"], capture_output=True, text=True, timeout=10, errors="replace", check=False)
         mappings: List[Dict[str, str]] = []
         for line in (done.stdout or "").splitlines():
             # 形如 `Z:\: => C:\path\to\ws`
@@ -296,7 +298,7 @@ def escape_roots() -> List[Path]:
         return [root] if root.exists() else []
 
     drives: List[str] = []
-    lister = getattr(os, "listdrives", None)  # Python 3.12+
+    lister: Optional[Callable[[], List[str]]] = getattr(os, "listdrives", None)  # Python 3.12+
     if callable(lister):
         try:
             drives = [str(item) for item in lister()]
@@ -335,29 +337,46 @@ def describe_escape_roots() -> List[Dict[str, Any]]:
 
 class LocalSandbox:
     """Sandbox 协议的本地实现（结构化类型，无需显式继承）。"""
+
     # 与 SUT 提示词保持一致：模型认为自己在家目录 /home/ubuntu 下工作
     SANDBOX_HOME = "/home/ubuntu"
     SANDBOX_TMP = "/tmp"
 
     # 传给子进程的环境变量白名单（见 _build_child_env 的注释说明为什么不能直接用 os.environ）
-    _ENV_ALLOWLIST = {
-        # 进程执行必需
-        "PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR",
-        # 临时目录
-        "TEMP", "TMP", "TMPDIR",
-        # 家目录（部分工具依赖）
-        "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
-        # 区域设置
-        "LANG", "LC_ALL", "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE",
-    }
+    _ENV_ALLOWLIST = frozenset(
+        {
+            # 进程执行必需
+            "PATH",
+            "PATHEXT",
+            "COMSPEC",
+            "SYSTEMROOT",
+            "SYSTEMDRIVE",
+            "WINDIR",
+            # 临时目录
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            # 家目录（部分工具依赖）
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            # 区域设置
+            "LANG",
+            "LC_ALL",
+            "NUMBER_OF_PROCESSORS",
+            "OS",
+            "PROCESSOR_ARCHITECTURE",
+        }
+    )
 
     def __init__(
-            self,
-            workspace: Path,
-            *,
-            exec_timeout: int = 60,
-            max_output_chars: int = 32_000,
-            extra_env: Optional[Dict[str, str]] = None,
+        self,
+        workspace: Path,
+        *,
+        exec_timeout: int = 60,
+        max_output_chars: int = 32_000,
+        extra_env: Optional[Dict[str, str]] = None,
     ) -> None:
         """构造函数。
 
@@ -392,10 +411,7 @@ class LocalSandbox:
             raise SandboxPathError(f"路径包含上跳符，已拒绝: {logical_path}")
 
         # 2.剥掉根标记与 Windows 盘符（C: / D:），只保留相对部分
-        parts = [
-            p for p in raw.parts
-            if p not in ("/", ".", "") and not p.endswith(":")
-        ]
+        parts = [p for p in raw.parts if p not in ("/", ".", "") and not p.endswith(":")]
         candidate = self._root.joinpath(*parts).resolve() if parts else self._root
 
         # 3.第二道防线：resolve() 之后必须仍在 workspace 内（防符号链接逃逸）
@@ -448,7 +464,7 @@ class LocalSandbox:
             if not _drive_is_reclaimable(drive, target):
                 continue
             with contextlib.suppress(Exception):
-                subprocess.run(["subst", drive, "/D"], capture_output=True, timeout=10)
+                subprocess.run(["subst", drive, "/D"], capture_output=True, timeout=10, check=False)
             _DRIVE_POOL.pop(drive, None)
             if self._try_claim(drive):
                 logger.info(f"回收了虚拟盘 {drive}（原目标：{target or '未知'}）")
@@ -466,7 +482,11 @@ class LocalSandbox:
         with contextlib.suppress(Exception):
             done = subprocess.run(
                 ["subst", drive, str(self._root)],
-                capture_output=True, text=True, timeout=10, errors="replace",
+                capture_output=True,
+                text=True,
+                timeout=10,
+                errors="replace",
+                check=False,
             )
             if done.returncode == 0 and os.path.exists(drive + "\\"):
                 self._drive = drive
@@ -483,7 +503,7 @@ class LocalSandbox:
         if not self._drive:
             return
         with contextlib.suppress(Exception):
-            subprocess.run(["subst", self._drive, "/D"], capture_output=True, timeout=10)
+            subprocess.run(["subst", self._drive, "/D"], capture_output=True, timeout=10, check=False)
         with contextlib.suppress(Exception):
             (_drive_registry_dir() / f"{self._drive.rstrip(':')}.pid").unlink(missing_ok=True)
         _DRIVE_POOL.pop(self._drive, None)
@@ -547,9 +567,9 @@ class LocalSandbox:
 
     @staticmethod
     def _fail(
-            message: str,
-            error_type: str = "sandbox_error",
-            **data: Any,
+        message: str,
+        error_type: str = "sandbox_error",
+        **data: Any,
     ) -> ToolResult:
         """构造失败结果。统一带上 error_type，便于上层做重试与归因。"""
         return ToolResult(
@@ -564,7 +584,7 @@ class LocalSandbox:
 
     @property
     def id(self) -> str:
-        return f"local-{abs(hash(str(self._root))) % 10 ** 8:08d}"
+        return f"local-{abs(hash(str(self._root))) % 10**8:08d}"
 
     async def ensure_sandbox(self) -> None:
         """确保沙箱"已启动"。本地实现只需确认目录存在，不做任何容器操作。"""
@@ -593,12 +613,12 @@ class LocalSandbox:
     # ==================== 文件操作 ====================
 
     async def read_file(
-            self,
-            filepath: str,
-            start_line: Optional[int] = None,
-            end_line: Optional[int] = None,
-            sudo: bool = False,
-            max_length: int = 10000,
+        self,
+        filepath: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        sudo: bool = False,
+        max_length: int = 10000,
     ) -> ToolResult:
         """读取文件内容，支持按行截取与长度截断。"""
         try:
@@ -636,13 +656,13 @@ class LocalSandbox:
         )
 
     async def write_file(
-            self,
-            filepath: str,
-            content: str,
-            append: bool = False,
-            leading_newline: bool = False,
-            trailing_newline: bool = False,
-            sudo: bool = False,
+        self,
+        filepath: str,
+        content: str,
+        append: bool = False,
+        leading_newline: bool = False,
+        trailing_newline: bool = False,
+        sudo: bool = False,
     ) -> ToolResult:
         """写入文件（支持追加模式，append=True 时是**非幂等**操作）。"""
         try:
@@ -671,11 +691,11 @@ class LocalSandbox:
         )
 
     async def replace_in_file(
-            self,
-            filepath: str,
-            old_str: str,
-            new_str: str,
-            sudo: bool = False,
+        self,
+        filepath: str,
+        old_str: str,
+        new_str: str,
+        sudo: bool = False,
     ) -> ToolResult:
         """按字符串替换文件内容。"""
         try:
@@ -765,11 +785,7 @@ class LocalSandbox:
 
         pattern = glob_pattern or "*"
         try:
-            found = sorted(
-                self._to_logical(item)
-                for item in local_dir.glob(pattern)
-                if item.is_file()
-            )
+            found = sorted(self._to_logical(item) for item in local_dir.glob(pattern) if item.is_file())
         except Exception as e:
             return self._fail(f"查找文件失败: {e}", error_type="io_error", dir_path=dir_path)
 
@@ -813,10 +829,10 @@ class LocalSandbox:
         return ToolResult(success=True, message=f"删除成功: {filepath}", data={"filepath": filepath, "deleted": True})
 
     async def upload_file(
-            self,
-            file_data: BinaryIO,
-            filepath: str,
-            filename: str = None,
+        self,
+        file_data: BinaryIO,
+        filepath: str,
+        filename: Optional[str] = None,
     ) -> ToolResult:
         """把二进制流写入沙箱路径（用于把用户附件同步进沙箱）。"""
         try:
@@ -886,11 +902,7 @@ class LocalSandbox:
         另外固定 PYTHONIOENCODING/PYTHONUTF8，保证子进程 Python 输出 UTF-8，
         与这里的 decode("utf-8") 对齐（Windows 下默认编码是 GBK，会出现乱码）。
         """
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key.upper() in self._ENV_ALLOWLIST
-        }
+        env = {key: value for key, value in os.environ.items() if key.upper() in self._ENV_ALLOWLIST}
         # PATH **不能原样继承**：实测同一段命令从 Git Bash 启动能看到
         # sqlite3/grep/od/tr，从 PowerShell 启动则全部看不到（连 python 都没有）——
         # 也就是说"Agent 看到的世界"取决于评测是怎么被启动的。
@@ -1021,9 +1033,12 @@ class LocalSandbox:
             return self._fail(f"命令启动失败: {e}", error_type="sandbox_error", session_id=session_id, command=command)
 
         # 3.硬超时：这是"终止保证"的最小实现（Step 3 会把它升级成预算中间件）
+        # ⚠️ `raw_output` 必须先有默认值：`wait_for` 被取消时那次赋值**从未发生**，
+        # 于是超时分支里的 decode 会抛 NameError —— 而那正是最需要如实报超时的时刻。
+        raw_output: Optional[bytes] = None
         try:
             raw_output, _ = await asyncio.wait_for(process.communicate(), timeout=self._exec_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # 关键：必须连根杀掉**整棵进程树**（见下面的注释）
             await self._kill_process_tree(process)
             # 进程树死后管道会 EOF，再取一次残余输出（拿不到也不影响结论）
@@ -1057,7 +1072,7 @@ class LocalSandbox:
         self._session_returncodes[session_id] = process.returncode or 0
 
         # 注意：这里 success 表示"命令成功执行完"，与 SUT 真沙箱语义一致
-        #（真沙箱只要 HTTP 200 就 success=True，returncode 放在 data 里）。
+        # （真沙箱只要 HTTP 200 就 success=True，returncode 放在 data 里）。
         # 非零返回码不应该被吞掉，因此 message 里显式提示，供模型判断。
         hint = "" if process.returncode == 0 else f"（返回码 {process.returncode}，命令执行失败）"
 
@@ -1113,7 +1128,11 @@ class LocalSandbox:
             # Windows 没有进程组信号语义，用 taskkill /T 递归结束整棵树
             with contextlib.suppress(Exception):
                 killer = await asyncio.create_subprocess_exec(
-                    "taskkill", "/F", "/T", "/PID", str(process.pid),
+                    "taskkill",
+                    "/F",
+                    "/T",
+                    "/PID",
+                    str(process.pid),
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
@@ -1161,10 +1180,10 @@ class LocalSandbox:
         )
 
     async def write_shell_input(
-            self,
-            session_id: str,
-            input_text: str,
-            press_enter: bool = True,
+        self,
+        session_id: str,
+        input_text: str,
+        press_enter: bool = True,
     ) -> ToolResult:
         """fast mode 不支持交互式输入 —— 明确报错，而不是静默假装成功。"""
         return self._fail(

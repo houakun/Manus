@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -13,22 +14,22 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
-from app.domain.services.tools.base import BaseTool, tool  # noqa: E402
+from app.domain.models.tool_result import ToolResult
+from app.domain.services.tools.base import BaseTool, tool
 
-from lab.faults.injector import FaultInjector  # noqa: E402
-from lab.faults.kinds import FaultKind, FaultRule  # noqa: E402
-from lab.guard.budget import Budget, BudgetMode, BudgetPolicy  # noqa: E402
-from lab.guard.loop_guard import LoopGuard, signature  # noqa: E402
-from lab.guard.postcondition import check_postcondition  # noqa: E402
-from lab.guard.retry import compute_backoff, decide_retry, is_idempotent  # noqa: E402
-from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
-from lab.middleware import GuardedTool, ToolGuard  # noqa: E402
-from lab.trace.span import TraceRecorder  # noqa: E402
-from lab.usage import Usage  # noqa: E402
-
+from lab.faults.injector import FaultInjector
+from lab.faults.kinds import FaultKind, FaultRule
+from lab.guard.budget import Budget, BudgetMode, BudgetPolicy
+from lab.guard.loop_guard import LoopGuard, signature
+from lab.guard.postcondition import check_postcondition
+from lab.guard.retry import compute_backoff, decide_retry, is_idempotent
+from lab.infra.local_sandbox import LocalSandbox
+from lab.middleware import ToolGuard
+from lab.trace.span import TraceRecorder
+from lab.usage import Usage
 
 # ==================== 测试替身：可编程工具 ====================
+
 
 class FakeTool(BaseTool):
     """可编程工具（注册两个工具名，以便测试幂等性差异）：
@@ -42,7 +43,7 @@ class FakeTool(BaseTool):
 
     name: str = "fake"
 
-    def __init__(self, results=None, *, error: Exception = None) -> None:
+    def __init__(self, results=None, *, error: Optional[Exception] = None) -> None:
         super().__init__()
         self.calls: list = []
         self._results = list(results or [])
@@ -83,6 +84,7 @@ class FakeTool(BaseTool):
 
 # ==================== 1. 预算（observe 模式） ====================
 
+
 def test_budget_observe_never_intervenes():
     """observe 模式必须**只记录不干预**：它不能改变任何控制流。"""
     usage = Usage()
@@ -121,7 +123,7 @@ def test_budget_violation_is_recorded_only_once():
 def test_budget_hard_limit_is_multiplier_of_soft():
     """硬上限 = 软阈值 × 倍数，不是手工设的另一个数字。"""
     policy = BudgetPolicy(max_tokens=1000, enforce_multiplier=2.5)
-    assert policy.hard_limits()[list(policy.soft_limits())[0]] == 2500
+    assert policy.hard_limits()[next(iter(policy.soft_limits()))] == 2500
 
     usage = Usage()
     usage.add_llm_call({"prompt_tokens": 3000, "completion_tokens": 0, "total_tokens": 3000}, 0)
@@ -159,11 +161,14 @@ def test_budget_defaults_match_user_baseline():
 
 # ==================== 2. 循环检测 ====================
 
+
 def test_loop_guard_detects_consecutive_repeats():
     guard = LoopGuard(repeat_threshold=3)
+    hit = None
     for _ in range(3):
         hit = guard.observe("shell_execute", {"command": "ls"})
 
+    assert hit is not None
     assert hit.consecutive == 3
     assert hit.would_trip is True
     assert len(guard.trips) == 1
@@ -176,9 +181,11 @@ def test_loop_guard_does_not_flag_same_tool_with_different_args():
     然后熔断掉一个本来能成功的任务 —— 这比不熔断更糟。
     """
     guard = LoopGuard(repeat_threshold=3)
+    hit = None
     for index in range(5):
         hit = guard.observe("write_file", {"filepath": f"/f{index}.txt"})
 
+    assert hit is not None
     assert hit.consecutive == 1
     assert hit.would_trip is False
     assert guard.trips == []
@@ -188,10 +195,12 @@ def test_loop_guard_does_not_flag_same_tool_with_different_args():
 def test_loop_guard_alternating_is_not_consecutive():
     """A B A B A B：累计 3 次但不连续 → 更像探索，不熔断。"""
     guard = LoopGuard(repeat_threshold=3)
+    hit = None
     for _ in range(3):
         guard.observe("read_file", {"filepath": "/a"})
         hit = guard.observe("read_file", {"filepath": "/b"})
 
+    assert hit is not None
     assert hit.consecutive == 1
     assert hit.would_trip is False
     assert hit.total == 3  # 累计确实是 3
@@ -214,6 +223,7 @@ def test_signature_is_order_insensitive():
 
 
 # ==================== 3. 重试（幂等性感知 —— D2 的正解） ====================
+
 
 def test_non_idempotent_tools_are_never_auto_retried():
     """D2 的核心验收：非幂等工具即使遇到暂态失败也不自动重试。"""
@@ -282,14 +292,14 @@ def test_backoff_jitter_spreads_retries():
 
 # ==================== 4. 故障注入 ====================
 
+
 def _injector(*rules):
     return FaultInjector(list(rules), seed=0)
 
 
 def test_injection_is_reproducible_with_fixed_seed():
     """故障注入必须可复现，否则"加固后成功率提升"无法归因。"""
-    run_a = [FaultInjector([FaultRule(kind=FaultKind.FLAKY, tool="*", rate=0.5)], seed=1).decide("f")
-             for _ in range(1)]
+    run_a = [FaultInjector([FaultRule(kind=FaultKind.FLAKY, tool="*", rate=0.5)], seed=1).decide("f") for _ in range(1)]
     del run_a
 
     first = FaultInjector([FaultRule(kind=FaultKind.FLAKY, rate=0.5)], seed=1)
@@ -322,6 +332,145 @@ def test_transient_error_is_sequence_based_not_probabilistic():
     assert injector.decide("read_file") is None
 
 
+def test_stable_fault_keeps_the_same_target_corrupted_across_reads():
+    """`stable=True`：同一目标一旦坏过，此后每次调用都**继续坏**。
+
+    这是 T6/T7 两个负结果的解药：默认按调用序号抛硬币，于是同一份文件被读两次时
+    可能一次被损坏、一次没损坏 —— Agent 一重读就发现自相矛盾，故障失效
+    （实测 `silent_wrong_result@read_file(rate=0.5)`：inj=1/2/3/5 → read=2/3/4/9）。
+    """
+    injector = _injector(FaultRule(kind=FaultKind.SILENT_WRONG_RESULT, tool="read_file", rate=1.0, stable=True))
+
+    assert injector.decide("read_file", 1, target="/home/ubuntu/a.txt") is not None
+    assert injector.log[-1]["by"] == "random"
+
+    # 同一个目标：第二次走的是 sticky 分支（不是又抛了一次硬币）
+    assert injector.decide("read_file", 2, target="/home/ubuntu/a.txt") is not None
+    assert injector.log[-1]["by"] == "sticky"
+
+    # 另一个目标独立判定（不能被前一个的 sticky 连带）
+    assert injector.decide("read_file", 1, target="/home/ubuntu/b.txt") is not None
+    assert injector.log[-1]["by"] == "random"
+
+
+def test_fault_target_reads_the_path_out_of_tool_args():
+    """`_fault_target` 必须能从工具参数里认出文件路径。"""
+    from lab.middleware import _fault_target
+
+    assert _fault_target({"filepath": "/home/ubuntu/a.txt"}) == "/home/ubuntu/a.txt"
+    assert _fault_target({"path": "/x"}) == "/x"
+    assert _fault_target({"command": "ls"}) is None  # 没有目标 → 退回按序号
+    assert _fault_target({"filepath": ""}) is None  # 空值不算目标
+    assert _fault_target({"filepath": 123}) is None  # 非字符串不算目标
+
+
+async def test_stable_fault_survives_the_middleware_wiring():
+    """接线测试：`middleware` 必须把**文件路径**当目标交给 injector。
+
+    只看 injector 的单测不够 —— 忘了把 `args["filepath"]` 传下去的话，`stable`
+    会静默退化成"按调用序号"，而 injector 的单测仍然全绿。本项目已有先例：
+    `env.py` 的函数写得再对，忘了调用就一点用没有（见 test_child_env_uses_deterministic_path）。
+    """
+    from lab.middleware import ToolGuard
+
+    class ReadTool(BaseTool):
+        name: str = "readonly"
+
+        @tool(
+            name="read_file",
+            description="带 filepath 的只读工具",
+            parameters={"filepath": {"type": "string", "description": "p"}},
+            required=["filepath"],
+        )
+        async def read_file(self, filepath: str = "") -> ToolResult:
+            return ToolResult(success=True, message="ok", data={"filepath": filepath, "content": "value 123"})
+
+        def has_tool(self, tool_name: str) -> bool:
+            return tool_name == "read_file"
+
+    injector = FaultInjector(
+        [FaultRule(kind=FaultKind.SILENT_WRONG_RESULT, tool="read_file", rate=1.0, stable=True)], seed=0
+    )
+    guard = ToolGuard(injector=injector, verify_postconditions=False)
+    read_tool = ReadTool()
+
+    first = await guard.call_tool(read_tool, "read_file", {"filepath": "/home/ubuntu/a.txt"})
+    second = await guard.call_tool(read_tool, "read_file", {"filepath": "/home/ubuntu/a.txt"})
+
+    assert isinstance(first.data, dict) and isinstance(second.data, dict)
+    # 两次读到的错值**逐字节相同**（否则 Agent 一比对就发现）
+    assert first.data["content"] == second.data["content"] != "value 123"
+    # 日志里第二次必须是 sticky —— 证明中间件真的把 filepath 传下来了
+    assert [item["by"] for item in injector.log] == ["random", "sticky"]
+
+
+def test_stable_is_off_by_default_and_degrades_without_a_target():
+    """默认行为不变（仍按调用序号），且拿不到目标时退回按序号 —— 不能静默变成"全注入"。"""
+    legacy = _injector(FaultRule(kind=FaultKind.FLAKY, rate=0.5))
+    seq = [legacy.decide("f", i) is not None for i in range(1, 21)]
+    assert 0 < sum(seq) < 20  # 仍是概率行为，不是"第一次之后恒真"
+
+    no_target = _injector(FaultRule(kind=FaultKind.FLAKY, rate=0.5, stable=True))
+    for i in range(1, 6):
+        no_target.decide("read_file", i)
+    assert all(item["by"] == "random" for item in no_target.log)
+
+
+def test_stable_corruption_yields_the_same_bytes_every_read():
+    """同一目标两次读到的错值必须**逐字节相同**，否则 Agent 一比对就发现。"""
+    payload = ToolResult(success=True, message="ok", data={"content": "total 12345"})
+    first = FaultInjector._corrupt_data(payload)
+    second = FaultInjector._corrupt_data(payload)
+    assert isinstance(first.data, dict) and isinstance(second.data, dict)
+    assert first.data["content"] == second.data["content"]
+    assert first.data["content"] != "total 12345"
+
+
+def test_corruption_hit_means_content_actually_changed():
+    """ "命中 = 真的改了"必须成立（否则实验会"以为注入了、其实没注入"）。
+
+    旧代码判定用 `str.isdigit()`、转换用 `re.sub(r"\\d", ...)`，而 `'²'.isdigit()`
+    为 True 但 `\\d` 一个都不匹配 —— 命中却零改动、`touched` 却已是 True。
+    现在判定与转换共用同一张数字表，且无数字时有"隐蔽标记"兑底。
+    """
+    # 正常路径：前 3 个数字各 +1，其余数字不动
+    result = ToolResult(success=True, message="ok", data={"content": "a1b2c3d4"})
+    rolled = FaultInjector._corrupt_data(result)
+    assert isinstance(rolled.data, dict)
+    assert rolled.data["content"] == "a2b3c4d4"
+
+    # 上标数字：isdigit() 为 True、`\d` 不匹配 → 走"追加隐蔽标记"兑底，仍然真的改了
+    superscript = chr(0x00B2)
+    tricky = ToolResult(success=True, message="ok", data={"content": f"x{superscript}y"})
+    corrupted = FaultInjector._corrupt_data(tricky)
+    assert isinstance(corrupted.data, dict)
+    assert corrupted.data["content"] != f"x{superscript}y"
+
+    # 完全无可篡改的字符串字段 → 返回原对象（**明确表示没注入**，而不是假装改了）
+    blank = ToolResult(success=True, message="ok", data={"n": 1})
+    assert FaultInjector._corrupt_data(blank) is blank
+
+
+def test_report_counts_how_each_injection_was_triggered():
+    """`report()` 要区分 random / sticky / sequence —— 否则"故障有没有持续生效"看不出来。"""
+    injector = _injector(FaultRule(kind=FaultKind.SILENT_WRONG_RESULT, tool="read_file", rate=1.0, stable=True))
+    injector.decide("read_file", 1, target="/a")
+    injector.decide("read_file", 2, target="/a")
+
+    report = injector.report()
+    assert report["injections"] == 2
+    assert report["by_trigger"] == {"random": 1, "sticky": 1}
+
+
+def test_stable_is_visible_in_the_fault_spec():
+    """`describe()` 必须体现 stable —— 实验条件靠 spec 落库区分，否则两组数据会混。"""
+    stable_rule = FaultRule(kind=FaultKind.SILENT_WRONG_RESULT, tool="read_file", rate=0.5, stable=True)
+    assert stable_rule.describe() == "silent_wrong_result@read_file(rate=0.5,stable)"
+
+    plain = FaultRule(kind=FaultKind.SILENT_WRONG_RESULT, tool="read_file", rate=0.5)
+    assert "stable" not in plain.describe()
+
+
 # ==================== 4. 故障注入（续） ====================
 
 
@@ -341,8 +490,12 @@ def test_all_ten_fault_kinds_have_a_distinct_behavior():
 
     # 4-7 静默失败类：结果被改动但 success 仍为 True
     base = ToolResult(success=True, message="ok", data={"filepath": "/a", "content": "0123456789abcdef"})
-    for kind in (FaultKind.EMPTY_RESULT, FaultKind.MALFORMED_RESULT,
-                 FaultKind.TRUNCATED_RESULT, FaultKind.SILENT_WRONG_RESULT):
+    for kind in (
+        FaultKind.EMPTY_RESULT,
+        FaultKind.MALFORMED_RESULT,
+        FaultKind.TRUNCATED_RESULT,
+        FaultKind.SILENT_WRONG_RESULT,
+    ):
         injector = _injector(FaultRule(kind=kind))
         decision = injector.decide("read_file")
         mutated = injector.mutate_result(decision, "read_file", base)
@@ -401,6 +554,7 @@ def test_failed_results_are_not_mutated():
 
 # ==================== 5. 后置校验 ====================
 
+
 async def test_postcondition_detects_missing_fields():
     """malformed_result：声称成功但字段缺失。"""
     warning = await check_postcondition(
@@ -448,7 +602,8 @@ async def test_postcondition_passes_on_correct_write(tmp_path: Path):
         function_name="write_file",
         args={"filepath": "/home/ubuntu/b.txt", "content": content},
         result=ToolResult(
-            success=True, message="ok",
+            success=True,
+            message="ok",
             data={"filepath": "/home/ubuntu/b.txt", "bytes_written": len(content.encode())},
         ),
         sandbox=sandbox,
@@ -496,6 +651,7 @@ async def test_postcondition_does_not_check_failed_results():
 
 
 # ==================== 6. 中间件（把上面全部串起来） ====================
+
 
 async def test_middleware_retries_idempotent_tool_on_injected_transient_fault():
     """端到端验证"故障注入 → 重试 → 最终成功"这条链路。
@@ -585,7 +741,6 @@ async def test_middleware_detects_partial_write_end_to_end(tmp_path: Path):
     **重试救不了静默失败，只有后置校验能。**
     """
     sandbox = LocalSandbox(tmp_path / "ws")
-    tool_impl = FakeTool()  # 用真工具更好，这里用假工具模拟"写入后返回成功"
 
     # 让假工具真的走一次沙箱写入，以便回读校验有意义
     class WriteFake(BaseTool):
@@ -604,9 +759,7 @@ async def test_middleware_detects_partial_write_end_to_end(tmp_path: Path):
     injector = FaultInjector([FaultRule(kind=FaultKind.PARTIAL_WRITE, tool="write_file")])
     guard = ToolGuard(injector=injector, sandbox=sandbox)
 
-    result = await guard.call_tool(
-        WriteFake(), "write_file", {"filepath": "/home/ubuntu/p.txt", "content": "y" * 100}
-    )
+    result = await guard.call_tool(WriteFake(), "write_file", {"filepath": "/home/ubuntu/p.txt", "content": "y" * 100})
 
     # 工具自己说成功（静默失败的定义）
     assert result.success is True
@@ -667,6 +820,7 @@ async def test_delay_injection_actually_waits():
 
 
 # ==================== 7. 加固开关（Step 6：对照实验的前提） ====================
+
 
 def test_guard_config_parsing():
     """spec 解析：all / none / 显式能力名；未知名字必须报错而不是静默忽略。"""
@@ -808,16 +962,18 @@ async def test_postcondition_enforce_feedback_closes_the_self_healing_loop(tmp_p
 
     # observe（默认）：只有告警，结果仍然"成功" → 模型看不到问题
     sandbox_observe = LocalSandbox(tmp_path / "observe")
-    guard_observe = ToolGuard(injector=_injector(), sandbox=sandbox_observe,
-                              config=GuardConfig.from_spec("retry,postcondition"))
+    guard_observe = ToolGuard(
+        injector=_injector(), sandbox=sandbox_observe, config=GuardConfig.from_spec("retry,postcondition")
+    )
     result_observe = await guard_observe.call_tool(WriteFileTool(sandbox_observe), "write_file", args)
     assert result_observe.success is True  # ← 静默失败：模型以为成功了
     assert guard_observe.postcondition_warnings
 
     # enforce：结果变成失败，且告警文本进 message → 模型能自己纠正
     sandbox_enforce = LocalSandbox(tmp_path / "enforce")
-    guard_enforce = ToolGuard(injector=_injector(), sandbox=sandbox_enforce,
-                              config=GuardConfig.from_spec("retry,postcondition,enforce"))
+    guard_enforce = ToolGuard(
+        injector=_injector(), sandbox=sandbox_enforce, config=GuardConfig.from_spec("retry,postcondition,enforce")
+    )
     result_enforce = await guard_enforce.call_tool(WriteFileTool(sandbox_enforce), "write_file", args)
     assert result_enforce.success is False
     assert result_enforce.error_type == "postcondition_failed"
@@ -826,6 +982,7 @@ async def test_postcondition_enforce_feedback_closes_the_self_healing_loop(tmp_p
 
 
 # ==================== 8. 读路径检测面（唯一"Agent 无法自证"的故障类） ====================
+
 
 def _result(content=None, **data):
     from app.domain.models.tool_result import ToolResult
@@ -868,12 +1025,17 @@ def test_content_check_skips_legitimately_truncated_content():
 
     half_json = '{"items": [' + "1," * 50
     # 1.工具自己标了 truncated
-    assert check_postcondition_content(
-        function_name="read_file", args={}, result=_result(half_json, truncated=True)) is None
+    assert (
+        check_postcondition_content(function_name="read_file", args={}, result=_result(half_json, truncated=True))
+        is None
+    )
     # 2.内容长度正好等于请求的 max_length → 强提示是被上限截的
-    assert check_postcondition_content(
-        function_name="read_file", args={"max_length": len(half_json)},
-        result=_result(half_json)) is None
+    assert (
+        check_postcondition_content(
+            function_name="read_file", args={"max_length": len(half_json)}, result=_result(half_json)
+        )
+        is None
+    )
 
 
 async def test_read_consistency_is_audit_only_never_enforced(tmp_path):
@@ -908,8 +1070,7 @@ async def test_read_consistency_is_audit_only_never_enforced(tmp_path):
     guard = ToolGuard(sandbox=sandbox, config=GuardConfig.from_spec("retry,postcondition,enforce"))
     tool = FileTool(sandbox)
 
-    await guard.call_tool(tool, "write_file",
-                          {"filepath": "/home/ubuntu/a.txt", "content": "x" * 100})
+    await guard.call_tool(tool, "write_file", {"filepath": "/home/ubuntu/a.txt", "content": "x" * 100})
     # 模拟文件被 shell 命令改短了（正常现象）
     await sandbox.write_file("/home/ubuntu/a.txt", "x" * 10)
 
@@ -949,8 +1110,7 @@ async def test_read_consistency_passes_when_content_matches(tmp_path):
     guard = ToolGuard(sandbox=sandbox, config=GuardConfig.from_spec("all"))
     tool = FileTool(sandbox)
 
-    await guard.call_tool(tool, "write_file",
-                          {"filepath": "/home/ubuntu/b.txt", "content": "hello"})
+    await guard.call_tool(tool, "write_file", {"filepath": "/home/ubuntu/b.txt", "content": "hello"})
     await guard.call_tool(tool, "read_file", {"filepath": "/home/ubuntu/b.txt"})
 
     assert guard.audit_warnings == []

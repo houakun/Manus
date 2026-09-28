@@ -20,17 +20,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Self
 
 from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.event import BaseEvent  # noqa: E402
-from app.domain.models.file import File  # noqa: E402
-from app.domain.models.memory import Memory  # noqa: E402
-from app.domain.models.session import Session, SessionStatus  # noqa: E402
-from app.domain.repositories.uow import IUnitOfWork  # noqa: E402
+from app.domain.models.event import BaseEvent  # pyright: ignore[reportMissingImports]
+from app.domain.models.file import File  # pyright: ignore[reportMissingImports]
+from app.domain.models.memory import Memory  # pyright: ignore[reportMissingImports]
+from app.domain.models.session import Session, SessionStatus  # pyright: ignore[reportMissingImports]
+from app.domain.repositories.uow import IUnitOfWork  # pyright: ignore[reportMissingImports]
 
 
 class InMemoryStore:
@@ -67,14 +67,14 @@ class InMemorySessionRepository:
         session = self._store.sessions.get(session_id)
         if session:
             session.title = title
-            session.updated_at = datetime.now()
+            session.updated_at = datetime.now()  # noqa: DTZ005  本地 naive：与库里既有数据同源（换 UTC 会让新旧数据不可比）
 
     async def update_latest_message(self, session_id: str, message: str, timestamp: datetime) -> None:
         session = self._store.sessions.get(session_id)
         if session:
             session.latest_message = message
             session.latest_message_at = timestamp
-            session.updated_at = datetime.now()
+            session.updated_at = datetime.now()  # noqa: DTZ005  本地 naive：与库里既有数据同源（换 UTC 会让新旧数据不可比）
 
     async def update_unread_message_count(self, session_id: str, count: int) -> None:
         session = self._store.sessions.get(session_id)
@@ -95,7 +95,7 @@ class InMemorySessionRepository:
         session = self._store.sessions.get(session_id)
         if session:
             session.status = status
-            session.updated_at = datetime.now()
+            session.updated_at = datetime.now()  # noqa: DTZ005  本地 naive：与库里既有数据同源（换 UTC 会让新旧数据不可比）
 
     async def add_event(self, session_id: str, event: BaseEvent) -> None:
         session = self._store.sessions.get(session_id)
@@ -168,7 +168,7 @@ class InMemoryUnitOfWork(IUnitOfWork):
     async def rollback(self) -> None:
         return None
 
-    async def __aenter__(self) -> "InMemoryUnitOfWork":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:

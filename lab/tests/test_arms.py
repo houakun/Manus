@@ -15,8 +15,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from lab.bench.noise import (
@@ -37,7 +35,6 @@ from lab.bench.runner import (
 )
 from lab.bench.task import load_all_tasks
 from lab.faults.kinds import FaultKind, FaultRule
-
 
 # ==================== 1. 交错顺序 ====================
 
@@ -403,8 +400,9 @@ def test_end_to_end_interleaved_two_arms_isolates_workspaces(tmp_path, monkeypat
     """
     import asyncio
 
-    import lab.api as api_module
     from app.domain.models.app_config import LLMConfig
+
+    import lab.api as api_module
     from lab.bench.runner import run_suite
     from lab.guard.config import GuardConfig
     from lab.tests.fakes import ScriptedLLM, json_content

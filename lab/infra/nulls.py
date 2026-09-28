@@ -23,7 +23,7 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
+from app.domain.models.tool_result import ToolResult
 
 _UNAVAILABLE_MSG = "当前运行模式未启用浏览器/搜索能力（fast mode，无 Docker 沙箱）"
 
@@ -51,20 +51,20 @@ class NullBrowser:
         return _unavailable(url=url)
 
     async def click(
-            self,
-            index: Optional[int] = None,
-            coordinate_x: Optional[float] = None,
-            coordinate_y: Optional[float] = None,
+        self,
+        index: Optional[int] = None,
+        coordinate_x: Optional[float] = None,
+        coordinate_y: Optional[float] = None,
     ) -> ToolResult:
         return _unavailable(index=index, coordinate_x=coordinate_x, coordinate_y=coordinate_y)
 
     async def input(
-            self,
-            text: str,
-            press_enter: bool,
-            index: Optional[int] = None,
-            coordinate_x: Optional[float] = None,
-            coordinate_y: Optional[float] = None,
+        self,
+        text: str,
+        press_enter: bool,
+        index: Optional[int] = None,
+        coordinate_x: Optional[float] = None,
+        coordinate_y: Optional[float] = None,
     ) -> ToolResult:
         return _unavailable(index=index)
 

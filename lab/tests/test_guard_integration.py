@@ -16,12 +16,12 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from lab.faults.injector import FaultInjector  # noqa: E402
-from lab.faults.kinds import FaultKind, FaultRule  # noqa: E402
-from lab.guard.budget import BudgetMode, BudgetPolicy  # noqa: E402
-from lab.tests.fakes import planner_react_script  # noqa: E402
-from lab.tests.test_trace_integration import _build_sut  # noqa: E402
-from lab.trace.span import SpanKind, TraceRecorder  # noqa: E402
+from lab.faults.injector import FaultInjector
+from lab.faults.kinds import FaultKind, FaultRule
+from lab.guard.budget import BudgetMode, BudgetPolicy
+from lab.tests.fakes import planner_react_script
+from lab.tests.test_trace_integration import _build_sut
+from lab.trace.span import SpanKind, TraceRecorder
 
 
 async def test_tool_calls_go_through_middleware(tmp_path):
@@ -69,9 +69,7 @@ async def test_partial_write_is_caught_by_postcondition_end_to_end(tmp_path):
     """
     injector = FaultInjector([FaultRule(kind=FaultKind.PARTIAL_WRITE, tool="write_file")])
     recorder = TraceRecorder("t-partial")
-    script = planner_react_script(
-        tool_args={"filepath": "/home/ubuntu/half.txt", "content": "z" * 200}
-    )
+    script = planner_react_script(tool_args={"filepath": "/home/ubuntu/half.txt", "content": "z" * 200})
     sut, _ = _build_sut(tmp_path, script, recorder, injector=injector)
 
     result = await sut.run("写入一个 200 字符的文件")

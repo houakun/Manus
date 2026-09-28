@@ -29,15 +29,15 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.app_config import AgentConfig  # noqa: E402
+from app.domain.models.app_config import AgentConfig
 
-from lab.infra.counting_llm import CountingLLM  # noqa: E402
-from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
-from lab.infra.nulls import NullBrowser, NullSearchEngine  # noqa: E402
-from lab.sut.manus_adapter import ManusSUT  # noqa: E402
-from lab.tests.fakes import ScriptedLLM, content, json_content, tool_call  # noqa: E402
-from lab.trace.span import TraceRecorder  # noqa: E402
-from lab.usage import Usage  # noqa: E402
+from lab.infra.counting_llm import CountingLLM
+from lab.infra.local_sandbox import LocalSandbox
+from lab.infra.nulls import NullBrowser, NullSearchEngine
+from lab.sut.manus_adapter import ManusSUT
+from lab.tests.fakes import ScriptedLLM, content, json_content, tool_call
+from lab.trace.span import TraceRecorder
+from lab.usage import Usage
 
 VALID_STEP_RESULT = {"success": True, "attachments": [], "result": "已完成"}
 VALID_SUMMARY = {"message": "任务完成", "attachments": []}
@@ -65,11 +65,11 @@ def _build(tmp_path, recorder, script: List[Any]) -> Tuple[ManusSUT, ScriptedLLM
 
 
 def _valid_plan(steps: List[Dict[str, str]]) -> Dict[str, Any]:
-    return {"title": "测试任务", "goal": "测试目标", "language": "中文",
-            "steps": steps, "message": "开始执行"}
+    return {"title": "测试任务", "goal": "测试目标", "language": "中文", "steps": steps, "message": "开始执行"}
 
 
 # ==================== D10：格式不符 → 纠错重试 → 成功 ====================
+
 
 async def test_malformed_structured_output_is_retried_and_recovers(tmp_path):
     """模型第一次返回了数组（实测中的真实故障形态），纠错重试后应成功完成。
@@ -103,9 +103,7 @@ async def test_malformed_structured_output_is_retried_and_recovers(tmp_path):
     # 2.确实发生了纠错重试：第 2 次调用的 messages 里带上了纠错提示与期望结构
     assert len(fake.calls) >= 2
     second_call_messages = fake.calls[1]["messages"]
-    correction = "\n".join(
-        str(m.get("content") or "") for m in second_call_messages if m.get("role") == "user"
-    )
+    correction = "\n".join(str(m.get("content") or "") for m in second_call_messages if m.get("role") == "user")
     assert "格式不符合约定" in correction
     # 期望结构必须真的在提示里（否则模型没法知道该改成什么形状）
     assert "title" in correction and "steps" in correction
@@ -124,9 +122,12 @@ async def test_correction_prompt_lists_required_fields(tmp_path):
     from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser
 
     agent = BaseAgent(
-        uow_factory=lambda: None, session_id="s",
+        uow_factory=lambda: None,
+        session_id="s",
         agent_config=AgentConfig(max_iterations=4, max_retries=2, max_search_results=3),
-        llm=ScriptedLLM([]), json_parser=RepairJSONParser(), tools=[],
+        llm=ScriptedLLM([]),
+        json_parser=RepairJSONParser(),
+        tools=[],
     )
 
     plan_schema = agent._expected_schema(Plan)
@@ -153,6 +154,7 @@ async def test_correction_prompt_lists_required_fields(tmp_path):
 
 
 # ==================== 坏格式持续出现 → 结构化错误，而不是崩溃 ====================
+
 
 async def test_persistent_malformed_output_yields_error_event_not_crash(tmp_path):
     """连续两次格式不符 → `ErrorEvent`（而不是 ValidationError 把流炸掉）。
@@ -198,6 +200,7 @@ async def test_tool_events_are_still_forwarded_during_structured_call(tmp_path):
 
 # ==================== D9：空计划不能虚报成功 ====================
 
+
 async def test_empty_plan_is_reported_as_error_not_success(tmp_path):
     """D9 的验收：计划里 0 个步骤 → 必须是失败，不能是 `ok=True`。
 
@@ -236,6 +239,7 @@ async def test_empty_plan_does_not_duplicate_error_events(tmp_path):
 
 
 # ==================== 工具层兜底：不存在的工具名 / 坏参数 ====================
+
 
 @pytest.fixture()
 def no_sleep(monkeypatch):
@@ -277,8 +281,7 @@ async def test_unknown_tool_name_is_fed_back_not_crashed(tmp_path, no_sleep):
 
     # 3.轨迹里能看见这次无效调用及其失败类型
     failed_tools = [
-        s for s in recorder.spans
-        if s.kind.value == "tool" and s.attrs.get("error_type") == "tool_not_found"
+        s for s in recorder.spans if s.kind.value == "tool" and s.attrs.get("error_type") == "tool_not_found"
     ]
     assert failed_tools
 
@@ -314,17 +317,22 @@ async def test_malformed_tool_arguments_are_fed_back():
     bad_call = {
         "role": "assistant",
         "content": "",
-        "tool_calls": [{
-            "id": "call-x",
-            "type": "function",
-            "function": {"name": "write_file", "arguments": "EXPLODE"},
-        }],
+        "tool_calls": [
+            {
+                "id": "call-x",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": "EXPLODE"},
+            }
+        ],
     }
     fake = ScriptedLLM([bad_call, content("我看到参数解析失败了，已换一种写法。")])
     agent = BaseAgent(
-        uow_factory=uow_factory, session_id="s-malformed",
+        uow_factory=uow_factory,
+        session_id="s-malformed",
         agent_config=AgentConfig(max_iterations=4, max_retries=2, max_search_results=3),
-        llm=fake, json_parser=_ExplodingParser(), tools=[],
+        llm=fake,
+        json_parser=_ExplodingParser(),
+        tools=[],
     )
 
     events = [event async for event in agent.invoke("随便干点什么")]
@@ -340,6 +348,7 @@ async def test_malformed_tool_arguments_are_fed_back():
 
 
 # ==================== 收尾兜底：活干完了但总结失败 ====================
+
 
 async def test_summarize_failure_falls_back_to_delivered_results(tmp_path, no_sleep):
     """汇总结论生成失败、但步骤已完成 → 用兜底总结交付，**不应报成失败**。

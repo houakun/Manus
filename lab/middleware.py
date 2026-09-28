@@ -40,25 +40,25 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
-from app.domain.services.tools.base import BaseTool  # noqa: E402
+from app.domain.models.tool_result import ToolResult
+from app.domain.services.tools.base import BaseTool
 
-from lab.faults.injector import FaultInjector  # noqa: E402
-from lab.guard.budget import Budget  # noqa: E402
-from lab.guard.config import GuardConfig  # noqa: E402
-from lab.guard.loop_guard import LoopGuard  # noqa: E402
-from lab.guard.postcondition import (  # noqa: E402
+from lab.faults.injector import FaultInjector
+from lab.guard.budget import Budget
+from lab.guard.config import GuardConfig
+from lab.guard.loop_guard import LoopGuard
+from lab.guard.postcondition import (
     check_postcondition,
     check_postcondition_content,
     check_read_consistency,
 )
-from lab.guard.retry import decide_retry, is_idempotent  # noqa: E402
+from lab.guard.retry import decide_retry, is_idempotent
 
 
 def _classify_exception(error: Optional[BaseException]) -> tuple:
@@ -76,22 +76,36 @@ def _classify_exception(error: Optional[BaseException]) -> tuple:
     return "tool_error", False
 
 
+def _fault_target(args: Dict[str, Any]) -> Optional[str]:
+    """从工具参数里取**稳定故障**的目标键（文件路径）。
+
+    为什么需要它：`stable` 故障的语义是"同一个目标在整个运行内保持同一种损坏"，
+    所以决策粒度必须是**目标**而不是调用序号 —— 否则第一次读被损坏、第二次没损坏，
+    Agent 一重读就发现不一致（这正是 T6/T7 两个负结果的机制）。
+    """
+    for key in ("filepath", "path", "filename", "target"):
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 class ToolGuard:
     """工具层中间件集合（一个实例 = 一个任务）。"""
 
     def __init__(
-            self,
-            *,
-            recorder: Any = None,
-            budget: Optional[Budget] = None,
-            loop_guard: Optional[LoopGuard] = None,
-            injector: Optional[FaultInjector] = None,
-            sandbox: Any = None,
-            max_attempts: int = 3,
-            verify_postconditions: bool = True,
-            seed: int = 42,
-            watch_literals: Optional[List[str]] = None,
-            config: Optional[GuardConfig] = None,
+        self,
+        *,
+        recorder: Any = None,
+        budget: Optional[Budget] = None,
+        loop_guard: Optional[LoopGuard] = None,
+        injector: Optional[FaultInjector] = None,
+        sandbox: Any = None,
+        max_attempts: int = 3,
+        verify_postconditions: bool = True,
+        seed: int = 42,
+        watch_literals: Optional[List[str]] = None,
+        config: Optional[GuardConfig] = None,
     ) -> None:
         self._recorder = recorder
         self.budget = budget
@@ -166,8 +180,13 @@ class ToolGuard:
 
     # ==================== 工具包装 ====================
 
-    def wrap_tools(self, tools: List[BaseTool]) -> List[BaseTool]:
-        """把工具列表整体包一层代理。"""
+    def wrap_tools(self, tools: Sequence[BaseTool]) -> List[BaseTool]:
+        """把工具列表整体包一层代理。
+
+        参数用 `Sequence`（协变）而不是 `List`：调用方传的往往是**具体工具**
+        （`list[FileTool | ShellTool]`），而 `List` 是**不变**的 —— 写成
+        `List[BaseTool]` 会拒收"元素是子类的列表"，逼调用方去 cast。
+        """
         return [GuardedTool(inner=tool, guard=self) for tool in tools]
 
     # ==================== 由适配器调用 ====================
@@ -194,7 +213,7 @@ class ToolGuard:
         if violations and self._recorder is not None:
             self._recorder.annotate(
                 budget_violations=",".join(v.metric for v in violations),
-                **{"budget_hard_exceeded": any(v.exceeded_hard for v in violations)},
+                budget_hard_exceeded=any(v.exceeded_hard for v in violations),
             )
 
     # ==================== 核心：一次工具调用 ====================
@@ -220,27 +239,32 @@ class ToolGuard:
         while attempt < self._max_attempts:
             attempt += 1
 
-            decision = self.injector.decide(function_name, attempt) if self.injector else None
-            if decision is not None:
+            # 用一个局部名并**显式判空**：`decision` 非 None 蕴含 `injector` 非 None，
+            # 但静态检查器推不出这层关联，会把这四行报成"None 没有该属性"。
+            injector = self.injector
+            decision = (
+                injector.decide(function_name, attempt, target=_fault_target(args)) if injector is not None else None
+            )
+            if injector is not None and decision is not None:
                 faults.append(decision.label)
                 self.fault_counts[decision.label] = self.fault_counts.get(decision.label, 0) + 1
-                await self.injector.maybe_delay(decision)
+                await injector.maybe_delay(decision)
 
             # 2.1 故障注入：需要"真的失败"的类型
-            injected = self.injector.maybe_raise(decision, function_name) if decision else None
+            injected = injector.maybe_raise(decision, function_name) if (injector is not None and decision) else None
             if injected is not None:
                 error, result = injected, None
             else:
                 # 2.2 参数篡改（partial_write 在这里真正截断内容）
-                call_args = self.injector.mutate_args(decision, args) if decision else args
+                call_args = injector.mutate_args(decision, args) if (injector is not None and decision) else args
                 try:
                     result = await inner.invoke(function_name, **call_args)
                     error = None
                 except Exception as exc:  # noqa: BLE001
                     error, result = exc, None
                 # 2.3 结果篡改（制造静默失败）
-                if result is not None and decision is not None:
-                    result = self.injector.mutate_result(decision, function_name, result)
+                if result is not None and injector is not None and decision is not None:
+                    result = injector.mutate_result(decision, function_name, result)
 
             # 2.4 重试判定
             decision_retry = decide_retry(
@@ -284,9 +308,7 @@ class ToolGuard:
                     result=result,
                     sandbox=self._sandbox,
                 )
-                warning = warning or check_postcondition_content(
-                    function_name=function_name, args=args, result=result
-                )
+                warning = warning or check_postcondition_content(function_name=function_name, args=args, result=result)
                 # 4.2 审计级校验（**不**参与 enforce）：读回内容与最近写入的交叉比对
                 data = result.data if isinstance(result.data, dict) else {}
                 audit = check_read_consistency(
@@ -372,8 +394,10 @@ class ToolGuard:
             # 加固配置必须进报告：没有它，两次运行的数据无法区分是谁的
             # （这是对照实验能做归因的前提）
             "config": self.config.label,
-            "features": {name: getattr(self.config, name) for name in
-                         ("retry", "postconditions", "loop_guard", "budget", "postcondition_enforce")},
+            "features": {
+                name: getattr(self.config, name)
+                for name in ("retry", "postconditions", "loop_guard", "budget", "postcondition_enforce")
+            },
             "postconditions": {"warnings": self.postcondition_warnings},
             "audit": {"warnings": self.audit_warnings},
             "retries": {"total": sum(self.retry_stats.values()), "by_reason": dict(self.retry_stats)},
@@ -383,9 +407,7 @@ class ToolGuard:
         if self.hardcode_suspects:
             data["hardcode_suspects"] = {key: sorted(set(value)) for key, value in self.hardcode_suspects.items()}
         if self.escaped_writes:
-            data["escaped_writes"] = {
-                key: sorted(set(value))[:10] for key, value in self.escaped_writes.items()
-            }
+            data["escaped_writes"] = {key: sorted(set(value))[:10] for key, value in self.escaped_writes.items()}
         if self.budget is not None:
             data["budget"] = self.budget.report().model_dump(mode="json")
         if self.injector is not None:

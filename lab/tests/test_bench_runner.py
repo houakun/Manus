@@ -30,12 +30,12 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.app_config import AgentConfig  # noqa: E402
+from app.domain.models.app_config import AgentConfig
 
-from lab.bench.report import render_report, render_suite_list  # noqa: E402
-from lab.bench.runner import run_suite  # noqa: E402
-from lab.tests.fakes import ScriptedLLM, planner_react_script  # noqa: E402
-from lab.trace.store import SpanStore  # noqa: E402
+from lab.bench.report import render_report, render_suite_list
+from lab.bench.runner import run_suite
+from lab.tests.fakes import ScriptedLLM, planner_react_script
+from lab.trace.store import SpanStore
 
 
 @pytest.fixture()
@@ -54,7 +54,8 @@ def _wire_fake_llm(monkeypatch, tmp_path, script):
     monkeypatch.setattr(lab_api, "OpenAILLM", lambda config: ScriptedLLM(list(script)))
     # Agent 配置收敛，避免测试跑很多轮
     monkeypatch.setattr(
-        lab_api, "load_agent_config",
+        lab_api,
+        "load_agent_config",
         lambda **kwargs: AgentConfig(max_iterations=4, max_retries=2, max_search_results=3),
     )
     db_path = tmp_path / "traces.db"
@@ -66,13 +67,19 @@ def test_failed_run_keeps_harness_alive_and_report_generatable(tmp_path, monkeyp
     """失败路径：LLM 完全不可用 → 全部判定失败，但流水线必须跑完并出报告。"""
     db_path = _wire_fake_llm(monkeypatch, tmp_path, [])  # 空脚本 → 每次调用都失败
 
-    suite = asyncio.run(run_suite(
-        runs_per_task=1, limit=2, bench_root=tmp_path / "bench", progress=False,
-    ))
+    suite = asyncio.run(
+        run_suite(
+            runs_per_task=1,
+            limit=2,
+            bench_root=tmp_path / "bench",
+            progress=False,
+        )
+    )
 
     assert suite.total_runs == 2
     assert suite.successes == 0
     # Wilson 区间：0/2 的上界远小于 1，不能让人误读成"成功率未知但可能很高"
+    assert suite.success_rate.high is not None
     assert suite.success_rate.high < 1.0
     # 指标必须算出来（即使全是 0）—— 报告里不能出现空白单元格
     assert suite.tokens.n == 2
@@ -109,9 +116,14 @@ def test_success_path_and_hardcode_detection(tmp_path, monkeypatch, no_sleep):
     )
     _wire_fake_llm(monkeypatch, tmp_path, script)
 
-    suite = asyncio.run(run_suite(
-        runs_per_task=1, keys=["syn_sum_range"], bench_root=tmp_path / "bench", progress=False,
-    ))
+    suite = asyncio.run(
+        run_suite(
+            runs_per_task=1,
+            keys=["syn_sum_range"],
+            bench_root=tmp_path / "bench",
+            progress=False,
+        )
+    )
 
     assert suite.total_runs == 1
     outcome = suite.outcomes[0]
@@ -137,9 +149,14 @@ def test_suite_isolates_workspaces_between_runs(tmp_path, monkeypatch, no_sleep)
     )
     _wire_fake_llm(monkeypatch, tmp_path, script + script)  # 两次运行，两次都能成功
 
-    suite = asyncio.run(run_suite(
-        runs_per_task=2, keys=["syn_sum_range"], bench_root=tmp_path / "bench", progress=False,
-    ))
+    suite = asyncio.run(
+        run_suite(
+            runs_per_task=2,
+            keys=["syn_sum_range"],
+            bench_root=tmp_path / "bench",
+            progress=False,
+        )
+    )
 
     assert suite.total_runs == 2
     workspaces = {outcome.workspace for outcome in suite.outcomes}
@@ -158,16 +175,25 @@ def test_recover_rebuilds_suite_from_workspaces(tmp_path, monkeypatch, no_sleep)
     from lab.bench.recover import recover_suite
     from lab.bench.runner import run_suite as real_run_suite
 
-    db_path = _wire_fake_llm(monkeypatch, tmp_path, planner_react_script(
-        tool_name="write_file",
-        tool_args={"filepath": "/home/ubuntu/a.txt", "content": "alpha"},
-        final_message="done",
-    ))
+    db_path = _wire_fake_llm(
+        monkeypatch,
+        tmp_path,
+        planner_react_script(
+            tool_name="write_file",
+            tool_args={"filepath": "/home/ubuntu/a.txt", "content": "alpha"},
+            final_message="done",
+        ),
+    )
 
     bench_root = tmp_path / "bench"
-    original = asyncio.run(real_run_suite(
-        runs_per_task=1, keys=["syn_sort_numbers"], bench_root=bench_root, progress=False,
-    ))
+    original = asyncio.run(
+        real_run_suite(
+            runs_per_task=1,
+            keys=["syn_sort_numbers"],
+            bench_root=bench_root,
+            progress=False,
+        )
+    )
     assert original.total_runs == 1
     original_outcome = original.outcomes[0]
 
@@ -178,13 +204,19 @@ def test_recover_rebuilds_suite_from_workspaces(tmp_path, monkeypatch, no_sleep)
     store.finalize_suite(original)
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("DELETE FROM bench_runs WHERE suite_id = ?", (original.suite_id,))
-    assert store.load_suite(original.suite_id).outcomes == []
+    reloaded = store.load_suite(original.suite_id)
+    assert reloaded is not None and reloaded.outcomes == []
 
     # 从工作区 + 轨迹重建
-    recovered = asyncio.run(recover_suite(
-        bench_root=bench_root, store=store,
-        suite_id="recovered-1", label="重建", group="synthetic",
-    ))
+    recovered = asyncio.run(
+        recover_suite(
+            bench_root=bench_root,
+            store=store,
+            suite_id="recovered-1",
+            label="重建",
+            group="synthetic",
+        )
+    )
 
     assert len(recovered.outcomes) == 1
     rebuilt = recovered.outcomes[0]
@@ -192,14 +224,20 @@ def test_recover_rebuilds_suite_from_workspaces(tmp_path, monkeypatch, no_sleep)
     assert rebuilt.tokens == original_outcome.tokens
     assert rebuilt.workspace == original_outcome.workspace
     # 重建结果也进了库
-    assert len(store.load_suite("recovered-1").outcomes) == 1
+    recovered = store.load_suite("recovered-1")
+    assert recovered is not None and len(recovered.outcomes) == 1
 
     # 分组过滤：指定 semireal 时不应把 synthetic 的工作区扫进来
     # （这个 bug 真实存在过：重建 semireal 的数据时混进了 synthetic 的工作区）
-    empty = asyncio.run(recover_suite(
-        bench_root=bench_root, store=store,
-        suite_id="recovered-2", label="空", group="semireal",
-    ))
+    empty = asyncio.run(
+        recover_suite(
+            bench_root=bench_root,
+            store=store,
+            suite_id="recovered-2",
+            label="空",
+            group="semireal",
+        )
+    )
     assert empty.outcomes == []
 
 
@@ -221,10 +259,15 @@ def test_budget_observation_is_recorded_in_outcomes(tmp_path, monkeypatch, no_sl
 
     # 脚本化 LLM 每次消耗 120 token、共 5 次 = 600；
     # 软阈值 300（会被突破），硬上限 300×2.5=750（不会）
-    suite = asyncio.run(run_suite(
-        runs_per_task=1, keys=["syn_sum_range"], bench_root=tmp_path / "bench", progress=False,
-        budget_policy=BudgetPolicy(max_tokens=300),
-    ))
+    suite = asyncio.run(
+        run_suite(
+            runs_per_task=1,
+            keys=["syn_sum_range"],
+            bench_root=tmp_path / "bench",
+            progress=False,
+            budget_policy=BudgetPolicy(max_tokens=300),
+        )
+    )
 
     outcome = suite.outcomes[0]
     assert outcome.ok is True  # observe 不干预：任务照常成功
@@ -252,14 +295,39 @@ def test_guard_config_is_recorded_in_outcome(tmp_path, monkeypatch, no_sleep):
     )
     _wire_fake_llm(monkeypatch, tmp_path, script)
 
-    suite = asyncio.run(real_run_suite(
-        runs_per_task=1, keys=["syn_sum_range"], bench_root=tmp_path / "bench",
-        progress=False, guard_config=GuardConfig.from_spec("none"),
-    ))
+    suite = asyncio.run(
+        real_run_suite(
+            runs_per_task=1,
+            keys=["syn_sum_range"],
+            bench_root=tmp_path / "bench",
+            progress=False,
+            guard_config=GuardConfig.from_spec("none"),
+        )
+    )
 
     assert suite.outcomes[0].guard_config == "none"
     # 配置也要进 suite 备注（报告里会渲染出来）
     assert any("加固配置" in note for note in suite.notes)
+
+
+def test_safe_int_tolerates_dirty_history():
+    """`recover` 读的是**历史数据** —— 脏列值不能让整条命令挂掉。
+
+    守的是 `recover` 的卖点（"一条坏行不该让整条命令挂掉"，与 `_json_list` 同源）：
+    实测这类列可能是 `""` / `"n/a"` / `"3.5"`，裸 `int()` 会当场抛。
+    """
+    from lab.bench.recover import _safe_float, _safe_int
+
+    assert _safe_int("3") == 3
+    assert _safe_int("") == 0
+    assert _safe_int("n/a") == 0
+    assert _safe_int("3.5") == 0  # 不是整数就不猜
+    assert _safe_int(None) == 0
+    assert _safe_int(None, default=-1) == -1
+
+    assert _safe_float("0.5") == 0.5
+    assert _safe_float("n/a") == 0.0
+    assert _safe_float(None) == 0.0
 
 
 def test_guard_none_produces_no_postcondition_warnings(tmp_path, monkeypatch, no_sleep):
@@ -274,8 +342,13 @@ def test_guard_none_produces_no_postcondition_warnings(tmp_path, monkeypatch, no
     )
     _wire_fake_llm(monkeypatch, tmp_path, script)
 
-    suite = asyncio.run(real_run_suite(
-        runs_per_task=1, keys=["syn_sum_range"], bench_root=tmp_path / "bench",
-        progress=False, guard_config=GuardConfig.from_spec("none"),
-    ))
+    suite = asyncio.run(
+        real_run_suite(
+            runs_per_task=1,
+            keys=["syn_sum_range"],
+            bench_root=tmp_path / "bench",
+            progress=False,
+            guard_config=GuardConfig.from_spec("none"),
+        )
+    )
     assert suite.outcomes[0].postcondition_warnings == 0

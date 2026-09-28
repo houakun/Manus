@@ -14,14 +14,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from lab.bench.runner import SuiteResult
 from lab.bench.stats import Interval
 
 
-def _interval_row(name: str, interval: Interval, unit: str = "", digits: int = 1,
-                  clamp_min: Optional[float] = None) -> str:
+def _interval_row(
+    name: str, interval: Interval, unit: str = "", digits: int = 1, clamp_min: Optional[float] = None
+) -> str:
     """渲染一行"均值 + 区间"。
 
     clamp_min：对 token/成本/耗时这类**不可能为负**的指标把下界截到 0。
@@ -69,7 +70,60 @@ def _uid_by_key(task_key: str, purposes: Dict[str, str]) -> str:
     return ""
 
 
-def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> str:
+def _report_store(store: Any) -> Any:
+    """拿到 trace 库（成本归因要读 span）。
+
+    报告其它部分只依赖 suite 对象，所以这里**允许失败**：
+    拿不到库时归因一节退化成一句说明，而不是让整份报告挂掉。
+    """
+    if store is not None:
+        return store
+    try:
+        from lab.api import default_trace_store
+
+        return default_trace_store()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cost_attribution_lines(suite: SuiteResult, store: Any) -> List[str]:
+    """成本归因：钱花在哪个工具（T3 / 审计 §4.12）。
+
+    为什么值得单独一节：报告其它部分只给 **task 级**成本（"这个任务花了 $0.12"），
+    答不了"钱花在哪一步"。而实测里最贵的那次运行是"20 步里 10 步在探环境/看字节"，
+    那种结论只能靠归因看出来。
+    """
+    lines = ["## 一·六、成本归因（钱花在哪一步 / 哪个工具）", ""]
+    attribution = store.cost_by(suite_id=suite.suite_id, kind="tool")
+    rows = attribution["rows"]
+    if not rows:
+        lines += ["（没有可归因的 LLM span：旧数据或纯回放数据可能没有 token 明细）", ""]
+        return lines
+
+    lines.append(
+        f"可归因成本 **${attribution['attributed_cost']:.4f}**"
+        f"（LLM 总成本 ${attribution['total_cost']:.4f}，"
+        f"未归因 ${attribution['unattributed_cost']:.4f} 落在任务级）"
+    )
+    lines += ["", "| 工具 | 成本 | 占比 | tokens | LLM 调用 |", "|---|---|---|---|---|"]
+    for row in rows:
+        lines.append(
+            f"| `{row['name']}` | ${row['cost_usd']:.4f} | {row['share']:.1%} "
+            f"| {row['tokens']:,} | {row['llm_calls']} |"
+        )
+    lines += [
+        "",
+        "> 口径：成本只在 **LLM 调用**那一层可观测（token × 价格表）。按**时间顺序**把每次",
+        "> 调用归给**紧随其后的工具调用**（＝它产出的那个动作）；最后一次调用（收尾）落在",
+        "> “任务级”。为什么不用 span 树：实测 LLM span 与 tool span 是同一 step 下的",
+        "> **兄弟**（recorder 里 llm 不 push），按树找祖先会得到 100% 任务级 ——",
+        "> 这个错是“与历史数据人工核对”时发现的。",
+        "",
+    ]
+    return lines
+
+
+def render_report(suite: SuiteResult, *, task_count: Optional[int] = None, store: Any = None) -> str:
     """渲染完整报告。"""
     lines: List[str] = []
 
@@ -80,17 +134,19 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     lines.append(f"- **开始时间**: {suite.started_at}   **总耗时**: {suite.elapsed_s}s")
     lines.append(f"- **模型**: `{suite.model_name}`   **温度**: {suite.temperature}（评测固定，保证可复现）")
     lines.append(f"- **SUT**: `{suite.outcomes[0].sut_name if suite.outcomes else 'n/a'}`")
-    lines.append(f"- **规模**: {task_count or len(suite.task_summaries)} 个任务 × {suite.runs_per_task} 次 = "
-                 f"**{suite.total_runs}** 次运行")
+    lines.append(
+        f"- **规模**: {task_count or len(suite.task_summaries)} 个任务 × {suite.runs_per_task} 次 = "
+        f"**{suite.total_runs}** 次运行"
+    )
     lines.append(f"- **预算模式**: `{suite.budget_mode}`（只记录不干预）")
     # ---- 实验条件：没有这一块，这个报告的数字无法被归因 ----
-    lines.append(f"- **加固配置**: `{suite.guard_config or 'all'}`"
-                 + ("　**故障注入**: ``" + suite.fault_spec + "``" if suite.fault_spec else "")
-                 + ("　**LLM 回放**: `" + suite.replay_mode + "`"
-                    if suite.replay_mode and suite.replay_mode != "off" else ""))
+    lines.append(
+        f"- **加固配置**: `{suite.guard_config or 'all'}`"
+        + ("　**故障注入**: ``" + suite.fault_spec + "``" if suite.fault_spec else "")
+        + ("　**LLM 回放**: `" + suite.replay_mode + "`" if suite.replay_mode and suite.replay_mode != "off" else "")
+    )
     if suite.interleaved:
-        lines.append(f"- **交错 A/B**: 是（{len(suite.arm_labels)} 个臂："
-                     f"{'、'.join(suite.arm_labels)}）")
+        lines.append(f"- **交错 A/B**: 是（{len(suite.arm_labels)} 个臂：{'、'.join(suite.arm_labels)}）")
     if suite.concurrency > 1:
         lines.append(f"- ⚠️ **并发度**: {suite.concurrency}（耗时指标不可横向比较）")
     if getattr(suite, "env_digest", ""):
@@ -109,20 +165,22 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     purposes = _task_purposes()
     regression_uids = {uid for uid, purpose in purposes.items() if purpose == "regression"}
     task_level = suite.task_level()
-    regression_level = (suite.task_level(only_uids=regression_uids)
-                        if regression_uids else None)
-    lines.append(f"**运行级成功率 {rate.point:.1%}**（成功运行数/总运行数），"
-                 f"95% Wilson 区间 [{rate.low:.1%}, {rate.high:.1%}]，n={rate.n}")
+    regression_level = suite.task_level(only_uids=regression_uids) if regression_uids else None
+    lines.append(
+        f"**运行级成功率 {rate.point:.1%}**（成功运行数/总运行数），"
+        f"95% Wilson 区间 [{rate.low:.1%}, {rate.high:.1%}]，n={rate.n}"
+    )
     if task_level.tasks:
         pow_rate, at_rate = task_level.pass_pow_k_rate, task_level.pass_at_k_rate
         lines.append("")
-        lines.append(f"**任务级 pass^{task_level.k} = {pow_rate.point:.1%}**"
-                     f"（{task_level.pass_pow_k}/{task_level.tasks} 个任务 **{task_level.k} 次全对**），"
-                     f"区间 [{pow_rate.low:.1%}, {pow_rate.high:.1%}]；"
-                     f"pass@{task_level.k} = {at_rate.point:.1%}（至少成功一次）")
-        if (regression_level and regression_level.tasks
-                and regression_level.tasks != task_level.tasks):
-            rp, ra = regression_level.pass_pow_k_rate, regression_level.pass_at_k_rate
+        lines.append(
+            f"**任务级 pass^{task_level.k} = {pow_rate.point:.1%}**"
+            f"（{task_level.pass_pow_k}/{task_level.tasks} 个任务 **{task_level.k} 次全对**），"
+            f"区间 [{pow_rate.low:.1%}, {pow_rate.high:.1%}]；"
+            f"pass@{task_level.k} = {at_rate.point:.1%}（至少成功一次）"
+        )
+        if regression_level and regression_level.tasks and regression_level.tasks != task_level.tasks:
+            rp = regression_level.pass_pow_k_rate
             lines.append("")
             lines.append(
                 f"**只看 regression 任务（回归门禁口径）**：pass^{regression_level.k} = "
@@ -133,29 +191,37 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
         # 饱和度：Wilson 下界 > 95% → 已经没有改进信号，只能追回归
         if pow_rate.point >= 1.0 and (pow_rate.low or 0) > 0.95:
             lines.append("")
-            lines.append("> 🟡 **已饱和**：pass^k 的 Wilson 下界已超 95% —— "
-                         "**100% 的 eval 只能追踪回归，给不出改进信号**（审计 §4.9）。"
-                         "要恢复区分度必须加任务难度或换更难的任务集。")
+            lines.append(
+                "> 🟡 **已饱和**：pass^k 的 Wilson 下界已超 95% —— "
+                "**100% 的 eval 只能追踪回归，给不出改进信号**（审计 §4.9）。"
+                "要恢复区分度必须加任务难度或换更难的任务集。"
+            )
         if task_level.unstable:
             lines.append("")
             lines.append(f"不稳定任务（部分成功）：{', '.join(task_level.unstable)}")
             capability_unstable = [
-                name for name in task_level.unstable
+                name
+                for name in task_level.unstable
                 if purposes.get(_uid_by_key(name.split("(")[0], purposes)) == "capability"
             ]
             if capability_unstable:
-                lines.append(f"> 其中 **capability 任务**：{', '.join(capability_unstable)} —— "
-                             "它们的波动是**能力边界的发现**，不是回归噪声。")
+                lines.append(
+                    f"> 其中 **capability 任务**：{', '.join(capability_unstable)} —— "
+                    "它们的波动是**能力边界的发现**，不是回归噪声。"
+                )
         lines.append("")
         if task_level.unstable:
             lines.append("")
             lines.append(f"不稳定任务（部分成功）：{', '.join(task_level.unstable)}")
         lines.append("")
-        lines.append("> **两个口径读法不同**：运行级看「每次尝试的期望」，"
-                     "`pass^k` 看「**同一个任务能不能每次都做对**」（生产的 SLA 语义）。"
-                     "当少数任务不稳定时，后者会把它暴露出来，前者会把它平摊掉。")
-        lines.append("> ⚠️ `pass^k` **不是显著性的提升**：两者的区间可能都重叠；"
-                     "它的样本量是**任务数**，想收窄区间必须加任务。")
+        lines.append(
+            "> **两个口径读法不同**：运行级看「每次尝试的期望」，"
+            "`pass^k` 看「**同一个任务能不能每次都做对**」（生产的 SLA 语义）。"
+            "当少数任务不稳定时，后者会把它暴露出来，前者会把它平摊掉。"
+        )
+        lines.append(
+            "> ⚠️ `pass^k` **不是显著性的提升**：两者的区间可能都重叠；它的样本量是**任务数**，想收窄区间必须加任务。"
+        )
         for caveat in task_level.caveats:
             lines.append(f"> - {caveat}")
     lines.append("")
@@ -181,34 +247,42 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
         gap = suite.self_report_gap
         lines.append("| 口径 | 成功数 | 成功率 |")
         lines.append("|---|---|---|")
-        lines.append(f"| SUT 自述 `result.ok` | {suite.self_reported_successes}/{suite.total_runs} "
-                     f"| {suite.self_reported_successes / max(1, suite.total_runs):.1%} |")
-        lines.append(f"| **独立判定（权威）** | **{suite.successes}/{suite.total_runs}** "
-                     f"| **{rate.point:.1%}** |")
+        lines.append(
+            f"| SUT 自述 `result.ok` | {suite.self_reported_successes}/{suite.total_runs} "
+            f"| {suite.self_reported_successes / max(1, suite.total_runs):.1%} |"
+        )
+        lines.append(f"| **独立判定（权威）** | **{suite.successes}/{suite.total_runs}** | **{rate.point:.1%}** |")
         lines.append("")
         if gap:
-            lines.append(f"⚠️ **{gap} 次运行是「自报成功但实际失败」**"
-                         f"（占 {gap / max(1, suite.total_runs):.0%}）。"
-                         f"这类虚报是最危险的：如果只看 SUT 自述，成功率会被直接抬高。")
+            lines.append(
+                f"⚠️ **{gap} 次运行是「自报成功但实际失败」**"
+                f"（占 {gap / max(1, suite.total_runs):.0%}）。"
+                f"这类虚报是最危险的：如果只看 SUT 自述，成功率会被直接抬高。"
+            )
             lines.append("")
-            lines.append("> 实测案例：某任务 SUT 规划出 **0 个步骤、一个工具都没调**，"
-                         "仍然返回 `ok=True`（`error=None`）。"
-                         "独立判定则发现产物根本不存在。")
+            lines.append(
+                "> 实测案例：某任务 SUT 规划出 **0 个步骤、一个工具都没调**，"
+                "仍然返回 `ok=True`（`error=None`）。"
+                "独立判定则发现产物根本不存在。"
+            )
         else:
             lines.append("本次没有出现虚报成功。")
 
         false_negative = suite.false_negative_runs
         if false_negative:
             lines.append("")
-            lines.append(f"⚠️ **{false_negative} 次运行是「自报失败但产物合格」**"
-                         f"（占 {false_negative / max(1, suite.total_runs):.0%}）"
-                         f"—— 与虚报相反的方向，它会让自述**低估**成功率。")
+            lines.append(
+                f"⚠️ **{false_negative} 次运行是「自报失败但产物合格」**"
+                f"（占 {false_negative / max(1, suite.total_runs):.0%}）"
+                f"—— 与虚报相反的方向，它会让自述**低估**成功率。"
+            )
             lines.append("")
-            lines.append("> 实测的三个典型原因：活干完了但**汇总阶段的 LLM 调用失败**、"
-                         "活干完了但 Agent **又去问用户问题**（headless 下无法继续）、"
-                         "活干完了但**整任务超时**被砍。")
-            lines.append("> 三者共同说明：「任务完成」应当看**交付物**，"
-                         "而不是看 Agent 有没有好好收尾。")
+            lines.append(
+                "> 实测的三个典型原因：活干完了但**汇总阶段的 LLM 调用失败**、"
+                "活干完了但 Agent **又去问用户问题**（headless 下无法继续）、"
+                "活干完了但**整任务超时**被砍。"
+            )
+            lines.append("> 三者共同说明：「任务完成」应当看**交付物**，而不是看 Agent 有没有好好收尾。")
         lines.append("")
 
     # ==================== 分组 ====================
@@ -234,21 +308,41 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
         for arm_label in suite.arm_labels:
             sub = suite.for_arm(arm_label)
             reg = sub.task_level(only_uids=regression_uids) if regression_uids else None
-            pow_text = (f"{reg.pass_pow_k}/{reg.tasks} = {reg.pass_pow_k_rate.point:.0%}"
-                        if reg and reg.tasks else "—")
+            pow_text = f"{reg.pass_pow_k}/{reg.tasks} = {reg.pass_pow_k_rate.point:.0%}" if reg and reg.tasks else "—"
             cost = sub.cost.point
             cps = (cost * sub.total_runs / sub.successes) if sub.successes else float("inf")
-            lines.append(f"| `{arm_label}` | {pow_text} | ${cost:.4f} "
-                         f"| {'∞' if cps == float('inf') else f'${cps:.4f}'} |")
+            lines.append(
+                f"| `{arm_label}` | {pow_text} | ${cost:.4f} | {'∞' if cps == float('inf') else f'${cps:.4f}'} |"
+            )
         lines.append("")
-        lines.append("> 两臂来自**同一个交错 suite**（A,B,B,A…），所以时间漂移对两边同权 ——"
-                     "这比分两段跑强。但两臂**不是独立样本**，配对区间要按配对设计读。")
+        lines.append(
+            "> 两臂来自**同一个交错 suite**（A,B,B,A…），所以时间漂移对两边同权 ——"
+            "这比分两段跑强。但两臂**不是独立样本**，配对区间要按配对设计读。"
+        )
         lines.append(
             "> 正式对比：`python -m lab bench compare "
             + suite.suite_id[:8]
-            + " --arm \"" + suite.arm_labels[0] + "\" --arm \"" + suite.arm_labels[1] + "\"`"
+            + ' --arm "'
+            + suite.arm_labels[0]
+            + '" --arm "'
+            + suite.arm_labels[1]
+            + '"`'
         )
         lines.append("")
+
+    # ---- 成本归因（T3）：task 级成本回答不了“钱花在哪一步” ----
+    report_store = _report_store(store)
+    if report_store is not None:
+        try:
+            lines.extend(_cost_attribution_lines(suite, report_store))
+        except Exception as exc:  # noqa: BLE001
+            # 归因是**附加信息**：它读不到不该让整份报告失败
+            lines += [
+                "## 一·六、成本归因（钱花在哪一步 / 哪个工具）",
+                "",
+                f"（不可用：{type(exc).__name__}: {exc}）",
+                "",
+            ]
 
     lines.append("## 二、分组对比")
     lines.append("")
@@ -262,9 +356,11 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
             f"| {data['tokens'].point:,.0f} | {data['elapsed'].point:,.0f} ms |"
         )
     lines.append("")
-    lines.append("> `synthetic` 是纯合成任务（完全可控），`semireal` 是半真实小场景"
-                 "（CSV 清洗 / 日志分析 / 改代码等）。两者成功率差多少，"
-                 "可以直接回答\"这套系统在玩具任务上刷分、在真实任务上崩掉\"这类质疑。")
+    lines.append(
+        "> `synthetic` 是纯合成任务（完全可控），`semireal` 是半真实小场景"
+        "（CSV 清洗 / 日志分析 / 改代码等）。两者成功率差多少，"
+        '可以直接回答"这套系统在玩具任务上刷分、在真实任务上崩掉"这类质疑。'
+    )
     lines.append("")
 
     # ==================== 逐任务 ====================
@@ -290,10 +386,9 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
         lines.append("这些任务最能说明系统的方差 —— **它们才是加固工作的靶子**：")
         lines.append("")
         for summary in unstable:
-            lines.append(f"- `{summary.task_uid}`：{summary.successes}/{summary.runs} 成功 "
-                         f"（{summary.title}）")
+            lines.append(f"- `{summary.task_uid}`：{summary.successes}/{summary.runs} 成功 （{summary.title}）")
     else:
-        lines.append("本次没有出现\"同一任务部分成功部分失败\"的情况。")
+        lines.append('本次没有出现"同一任务部分成功部分失败"的情况。')
         lines.append("")
         lines.append("> 但这**不等于系统稳定**：如果 n 很小，不稳定任务很可能只是没被抽到。")
     lines.append("")
@@ -308,8 +403,10 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
         for key, count in attribution.items():
             lines.append(f"| `{key}` | {count} |")
         lines.append("")
-        lines.append("> `verification_failed` 表示 Agent 自己认为成功、但判定器判定失败 ——"
-                     "这类是**最值得看的失败**（要区分是能力问题还是验证器问题）。")
+        lines.append(
+            "> `verification_failed` 表示 Agent 自己认为成功、但判定器判定失败 ——"
+            "这类是**最值得看的失败**（要区分是能力问题还是验证器问题）。"
+        )
         lines.append("> `tool:*` 前缀是工具层出错次数（可能不影响最终成败）。")
     else:
         lines.append("本次没有失败。")
@@ -336,14 +433,13 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     lines.append("## 七、预算观察（observe 模式的产出）")
     lines.append("")
     stats = suite.budget_stats()
-    lines.append(f"- 越界运行数：**{stats['violated_runs']}/{stats['runs']}**"
-                 f"（{stats['violated_rate']:.1%}）")
-    lines.append(f"- enforce 模式下\"本会中止\"的运行数：**{stats['would_stop_runs']}**")
+    lines.append(f"- 越界运行数：**{stats['violated_runs']}/{stats['runs']}**（{stats['violated_rate']:.1%}）")
+    lines.append(f'- enforce 模式下"本会中止"的运行数：**{stats["would_stop_runs"]}**')
     if stats["by_metric"]:
         lines.append(f"- 按维度：{stats['by_metric']}")
     lines.append("")
     lines.append("> 这一节是**切换模式前的决策依据**：")
-    lines.append("> 若\"本会中止\"的比例很小 → 硬上限设得合适，可以放心切 enforce；")
+    lines.append('> 若"本会中止"的比例很小 → 硬上限设得合适，可以放心切 enforce；')
     lines.append("> 若很大 → 硬上限太紧，切过去会砍掉大量本来能成功的任务。")
     lines.append("")
 
@@ -367,12 +463,12 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
                 "处置：加 `--replay-ignore-volatile`，或补录缺失的请求。"
             )
         else:
-            lines.append(
-                "- ✅ **回放是完整的**（0 次缓存未命中）：本次运行与录制时的请求集合逐条一致。"
-            )
+            lines.append("- ✅ **回放是完整的**（0 次缓存未命中）：本次运行与录制时的请求集合逐条一致。")
     if suite.fixture_failures:
-        lines.append(f"- ⚠️ 有 {len(suite.fixture_failures)} 次运行在执行前就失败了，"
-                     f"**未计入成功率**（否则会把环境问题算成 Agent 能力问题）")
+        lines.append(
+            f"- ⚠️ 有 {len(suite.fixture_failures)} 次运行在执行前就失败了，"
+            f"**未计入成功率**（否则会把环境问题算成 Agent 能力问题）"
+        )
     lines.append("- 耗时指标包含模型服务端排队时间，跨时段对比需要谨慎。")
     lines.append("- 判定器只看最终产物，**不评价过程质量**（过程分在第六节单独给）。")
     lines.append("- 任务集从 20 个任务中抽取，覆盖面有限；结论外推到其它任务类型需要谨慎。")
@@ -389,15 +485,17 @@ def render_report(suite: SuiteResult, *, task_count: Optional[int] = None) -> st
     replay_flag = "" if suite.replay_mode in ("", "off") else f" --replay {suite.replay_mode}"
     if suite.interleaved:
         arm_flags = "".join(
-            f' --ab-guard "{arm.get("guard_spec") or "all"}" --ab-label "{arm.get("label")}"'
-            for arm in suite.arms
+            f' --ab-guard "{arm.get("guard_spec") or "all"}" --ab-label "{arm.get("label")}"' for arm in suite.arms
         )
-        lines.append(f"python -m lab bench run --runs {suite.runs_per_task} "
-                     f"--label \"{suite.label}\"{arm_flags}{replay_flag}")
+        lines.append(
+            f'python -m lab bench run --runs {suite.runs_per_task} --label "{suite.label}"{arm_flags}{replay_flag}'
+        )
     else:
-        lines.append(f"python -m lab bench run --runs {suite.runs_per_task} "
-                     f"--guard {suite.guard_config or 'all'} "
-                     f"--label \"{suite.label}\"{replay_flag}")
+        lines.append(
+            f"python -m lab bench run --runs {suite.runs_per_task} "
+            f"--guard {suite.guard_config or 'all'} "
+            f'--label "{suite.label}"{replay_flag}'
+        )
     lines.append("")
     lines.append("# 3. 重新出报告（不重跑）")
     lines.append(f"python -m lab bench report {suite.suite_id}")
@@ -418,8 +516,7 @@ def render_suite_list(suites: List[Dict[str, Any]]) -> str:
     """列出历史评测。"""
     if not suites:
         return "(还没有任何评测记录)"
-    lines = ["| suite_id | label | 模型 | n/任务 | 运行数 | 成功率 | 开始时间 |",
-             "|---|---|---|---|---|---|---|"]
+    lines = ["| suite_id | label | 模型 | n/任务 | 运行数 | 成功率 | 开始时间 |", "|---|---|---|---|---|---|---|"]
     for row in suites:
         total = row["total_runs"] or 0
         successes = row["successes"] or 0

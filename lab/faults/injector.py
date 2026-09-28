@@ -35,15 +35,52 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
-from lab.faults.kinds import FaultKind, FaultRule  # noqa: E402
+from app.domain.models.tool_result import ToolResult
+
+from lab.faults.kinds import FaultKind, FaultRule
 
 # 允许被"内容篡改"的工具：必须是**只读**工具。
 # 绝不能篡改 write_file 的结果 —— 那是伪造成功，会让 workspace 和 trace 不一致。
 _READ_ONLY_TOOLS = {
-    "read_file", "shell_read_output", "search_in_file", "find_files", "list_files",
-    "browser_view", "browser_console_view", "search_web",
+    "read_file",
+    "shell_read_output",
+    "search_in_file",
+    "find_files",
+    "list_files",
+    "browser_view",
+    "browser_console_view",
+    "search_web",
 }
+
+# 内容篡改用的数字表。**判定与转换必须共用同一张表**：
+# 旧代码用 `str.isdigit()` 判定、用 `re.sub(r"\d", ...)` 转换，而两者语义不同 ——
+# `str.isdigit()` 比 `\d`（Unicode Nd）更宽（实测 `'x²y'`：isdigit 为 True、
+# `\d` 一个都不匹配），于是"命中却没改动"，`touched` 却已经是 True：
+# 实验会变成"以为注入了、其实没注入"，结论静默地错。
+_DIGITS = frozenset("0123456789")
+_DIGIT_ROTATE = str.maketrans("0123456789", "1234567890")
+
+# 无数字可用时的替代损坏手段（docstring 里承诺的那种"隐蔽标记"）：
+# 零宽空格 —— 肉眼几乎不可见，但字符串比较能发现。
+_CORRUPTION_MARKER = "\u200b"
+
+
+def _rotate_digits(value: str, *, limit: int) -> str:
+    """把文本里**前 `limit` 个 ASCII 数字**各 +1（'9'→'0'），其余字符原样。
+
+    等价于 `re.sub(r"\\d", lambda m: str((int(m.group()) + 1) % 10), value, count=limit)`，
+    但不经过 `int()` 解析（因此不可能抛），且与 `_corrupt_data` 的判定同源。
+    """
+    rotated = value.translate(_DIGIT_ROTATE)
+    kept = 0
+    out: List[str] = []
+    for original, changed in zip(value, rotated):
+        if kept < limit and original in _DIGITS:
+            out.append(changed)
+            kept += 1
+        else:
+            out.append(original)
+    return "".join(out)
 
 
 @dataclass
@@ -67,6 +104,9 @@ class FaultInjector:
         self._rng = random.Random(seed)
         self._calls: Dict[str, int] = {}  # 每个工具被调用（或尝试）过几次
         self._injected: Dict[int, int] = {}  # 每条规则注入了几次
+        # `stable` 规则的"已坏目标"集合（键 = `规则序号:目标`）。
+        # 进了这个集合的目标，后续每次调用都被**强制**注入（见 `decide`）。
+        self._sticky: set[str] = set()
         self.log: List[Dict[str, Any]] = []  # 注入流水，最终进 trace
 
     @property
@@ -75,11 +115,19 @@ class FaultInjector:
 
     # ==================== 判定 ====================
 
-    def decide(self, function_name: str, attempt: int = 1) -> Optional[FaultDecision]:
+    def decide(
+        self,
+        function_name: str,
+        attempt: int = 1,
+        *,
+        target: Optional[str] = None,
+    ) -> Optional[FaultDecision]:
         """判断这一次调用是否注入故障。
 
         注意：`attempt` 只用于记录，真正的判定依据是**该工具的累计调用序号**，
         这样"前 N 次失败"的语义才是确定的。
+
+        `target`（例如文件路径）只在 `rule.stable` 时参与判定：见 `FaultRule.stable`。
         """
         if not self.rules:
             return None
@@ -92,31 +140,44 @@ class FaultInjector:
                 continue
             if index < rule.start_after:
                 continue
+
+            # 稳定模式：这个目标已经坏过 → **继续坏**，跳过 rate 与 max_injections。
+            # 这是 `stable` 的全部要点：绝不让"重读"看到另一个值。
+            sticky_key = f"{rule_index}:{target}"
+            if rule.stable and target and sticky_key in self._sticky:
+                self._record(rule_index, rule, function_name, index, by="sticky")
+                return FaultDecision(kind=rule.kind, rule=rule)
+
             if rule.max_injections is not None and self._injected.get(rule_index, 0) >= rule.max_injections:
                 continue
             # transient_error 按序号：前 fail_times 次失败，之后恢复正常
             if rule.kind == FaultKind.TRANSIENT_ERROR and rule.fail_times is not None:
                 if index >= rule.fail_times:
                     continue
-                self._record(rule_index, rule, function_name, index, forced=True)
+                self._record(rule_index, rule, function_name, index, by="sequence")
                 return FaultDecision(kind=rule.kind, rule=rule)
             # 其余按概率
             if self._rng.random() >= rule.rate:
                 continue
-            self._record(rule_index, rule, function_name, index, forced=False)
+            if rule.stable and target:
+                self._sticky.add(sticky_key)
+            self._record(rule_index, rule, function_name, index, by="random")
             return FaultDecision(kind=rule.kind, rule=rule)
 
         return None
 
-    def _record(self, rule_index: int, rule: FaultRule, function_name: str, index: int, *, forced: bool) -> None:
+    def _record(self, rule_index: int, rule: FaultRule, function_name: str, index: int, *, by: str) -> None:
         self._injected[rule_index] = self._injected.get(rule_index, 0) + 1
-        self.log.append({
-            "tool": function_name,
-            "kind": rule.kind.value,
-            "call_index": index,
-            "rule": rule.describe(),
-            "by": "sequence" if forced else "random",
-        })
+        self.log.append(
+            {
+                "tool": function_name,
+                "kind": rule.kind.value,
+                "call_index": index,
+                "rule": rule.describe(),
+                # sequence = 按序号（transient）／ random = 按概率 ／ sticky = 继承已坏目标
+                "by": by,
+            }
+        )
 
     # ==================== 三个钩子 ====================
 
@@ -130,7 +191,7 @@ class FaultInjector:
         if decision is None:
             return None
         if decision.kind == FaultKind.TIMEOUT:
-            return asyncio.TimeoutError(f"注入故障: {function_name} 超时")
+            return TimeoutError(f"注入故障: {function_name} 超时")
         if decision.kind == FaultKind.TRANSIENT_ERROR:
             return ConnectionError(f"注入故障: {function_name} 暂时不可用（transient）")
         if decision.kind == FaultKind.PERMANENT_ERROR:
@@ -156,10 +217,10 @@ class FaultInjector:
         return mutated
 
     def mutate_result(
-            self,
-            decision: Optional[FaultDecision],
-            function_name: str,
-            result: ToolResult,
+        self,
+        decision: Optional[FaultDecision],
+        function_name: str,
+        result: ToolResult,
     ) -> ToolResult:
         """在**真实调用之后**改结果（制造静默失败）。"""
         if decision is None or not result.success:
@@ -221,38 +282,51 @@ class FaultInjector:
 
     @staticmethod
     def _corrupt_data(result: ToolResult) -> ToolResult:
-        """内容篡改：把文本里的数字改掉 / 追加一个隐蔽标记。
+        """内容篡改：优先把前 3 个数字各 +1；没有数字时**追加一个隐蔽标记**。
 
         选"改数字"是因为它最阴险：如果 Agent 拿这个数字去做计算，
         最终答案会错，但整条链路每一步都显示成功。
+
+        两种手段都保证"**命中 = 真的改了**"：若命中却什么都没改，实验就变成
+        "以为注入了、其实没注入"，结论静默地错（`_truncate_data` 有同样的兑底）。
         """
         data = result.data
         if not isinstance(data, dict):
             return result
         mutated = dict(data)
-        touched = False
+
         for key, value in mutated.items():
             if not isinstance(value, str) or not value:
                 continue
-            if any(ch.isdigit() for ch in value):
-                import re
+            if any(ch in _DIGITS for ch in value):
+                mutated[key] = _rotate_digits(value, limit=3)
+                return ToolResult(success=True, message=result.message, data=mutated, attempts=result.attempts)
 
-                mutated[key] = re.sub(r"\d", lambda m: str((int(m.group()) + 1) % 10), value, count=3)
-                touched = True
-                break
-        if not touched:
-            return result
-        return ToolResult(success=True, message=result.message, data=mutated, attempts=result.attempts)
+        # 兑底：没有可改的数字 → 追加零宽空格（仍是确定性的，所以 `stable` 仍成立）
+        for key, value in mutated.items():
+            if isinstance(value, str) and value:
+                mutated[key] = value + _CORRUPTION_MARKER
+                return ToolResult(success=True, message=result.message, data=mutated, attempts=result.attempts)
+
+        return result
 
     # ==================== 报告 ====================
 
     def report(self) -> Dict[str, Any]:
         """注入汇总（进 TaskResult / trace）。"""
         by_kind: Dict[str, int] = {}
+        by_trigger: Dict[str, int] = {}
         for item in self.log:
             by_kind[item["kind"]] = by_kind.get(item["kind"], 0) + 1
+            trigger = item.get("by") or "random"
+            by_trigger[trigger] = by_trigger.get(trigger, 0) + 1
         return {
             "rules": [rule.describe() for rule in self.rules],
             "injections": len(self.log),
             "by_kind": by_kind,
+            # `random` = 按概率新命中；`sticky` = 继承已坏目标（`stable=True` 的**直接证据**）；
+            # `sequence` = 按序号（transient_error）。
+            # 为什么必须落库：跑完 42 次后要回答"故障到底有没有持续生效"，
+            # 只看 `injections` 计数会把"sticky 生效"与"恰好连续命中"混为一谈。
+            "by_trigger": by_trigger,
         }

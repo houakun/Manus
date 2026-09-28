@@ -34,11 +34,39 @@ from lab.bootstrap import SUT_API_DIR, ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.app_config import AgentConfig, LLMConfig  # noqa: E402
+from app.domain.models.app_config import AgentConfig, LLMConfig
 
 DEFAULT_CONFIG_FILE = SUT_API_DIR / "config.yaml"
 # 评测默认温度：0.0 = 尽量确定性，保证同一任务可复现
 DEFAULT_TEMPERATURE = 0.0
+
+
+def _load_dotenv() -> None:
+    """把仓库根目录的 `.env` 载入进程环境（**不覆盖**已存在的变量）。
+
+    为什么需要它：api 侧的 `Settings` 自带 `env_file=".env"`，而 lab 原来只读
+    `os.getenv` —— 于是同一份 LLM 配置在两边行为不一致（lab 必须手工 export 才能
+    用 .env 里的密钥）。而"密钥不进版本库"的前提正是：真密钥只放 .env，
+    被跟踪的 `api/config.yaml` 里只留占位符。
+
+    刻意用 `setdefault`：显式导出的环境变量优先级**高于** .env（与环境变量 > 文件
+    这套既有优先级一致），也让测试里 monkeypatch.setenv 能盖住 .env。
+    """
+    path = Path(__file__).resolve().parents[1] / ".env"
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+        if name and name not in os.environ:
+            os.environ[name] = value
+
+
+_load_dotenv()
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -56,25 +84,32 @@ def load_raw_config(config_file: Optional[Path] = None) -> dict:
 
 
 def load_llm_config(
-        *,
-        temperature: Optional[float] = None,
-        config_file: Optional[Path] = None,
+    *,
+    temperature: Optional[float] = None,
+    config_file: Optional[Path] = None,
 ) -> LLMConfig:
     """构造 LLM 配置：SUT config.yaml 为基础，环境变量与显式参数优先。"""
     raw = (load_raw_config(config_file) or {}).get("llm_config") or {}
 
     # 1.优先级：函数参数 > 环境变量 > config.yaml > 代码默认值
-    base_url = _env_str("LAB_LLM_BASE_URL") or raw.get("base_url") or "https://api.deepseek.com"
+    base_url = _env_str("LAB_LLM_BASE_URL") or raw.get("base_url") or "https://opencode.ai/zen/go/v1"
     api_key = _env_str("LAB_LLM_API_KEY") or raw.get("api_key") or ""
-    model_name = _env_str("LAB_LLM_MODEL") or raw.get("model_name") or "deepseek-chat"
+    model_name = _env_str("LAB_LLM_MODEL") or raw.get("model_name") or "deepseek-v4.1-flash"
 
     # 2.温度：显式参数 > 环境变量 > 评测默认 0.0（注意这里【不】回落到 config.yaml 的 0.7）
     if temperature is not None:
         real_temperature = float(temperature)
-    elif _env_str("LAB_TEMPERATURE") is not None:
-        real_temperature = float(_env_str("LAB_TEMPERATURE"))
     else:
-        real_temperature = DEFAULT_TEMPERATURE
+        env_temperature = _env_str("LAB_TEMPERATURE")
+        if env_temperature is None:
+            real_temperature = DEFAULT_TEMPERATURE
+        else:
+            try:
+                real_temperature = float(env_temperature)
+            except ValueError as exc:
+                # 环境变量写错时要**响亮地失败并指出是哪个变量**，
+                # 而不是抛裸 ValueError（那会让人去查温度参数本身）
+                raise ValueError(f"LAB_TEMPERATURE 不是数字: {env_temperature!r}") from exc
 
     max_tokens = int(_env_str("LAB_MAX_TOKENS") or raw.get("max_tokens") or 8192)
 
@@ -88,9 +123,9 @@ def load_llm_config(
 
 
 def load_agent_config(
-        *,
-        max_iterations: Optional[int] = None,
-        config_file: Optional[Path] = None,
+    *,
+    max_iterations: Optional[int] = None,
+    config_file: Optional[Path] = None,
 ) -> AgentConfig:
     """构造 Agent 通用配置。
 

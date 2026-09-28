@@ -20,23 +20,21 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.app_config import AgentConfig  # noqa: E402
+from app.domain.models.app_config import AgentConfig
 
-from lab.infra.counting_llm import CountingLLM  # noqa: E402
-from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
-from lab.infra.nulls import NullBrowser, NullSearchEngine  # noqa: E402
-from lab.infra.memory_uow import create_uow_factory  # noqa: E402
-from lab.sut.manus_adapter import ManusSUT  # noqa: E402
-from lab.tests.fakes import ScriptedLLM, planner_react_script  # noqa: E402
-from lab.trace.span import SpanKind, TraceRecorder  # noqa: E402
-from lab.trace.store import SpanStore  # noqa: E402
-from lab.trace.view import render_tree  # noqa: E402
-from lab.usage import Usage  # noqa: E402
+from lab.infra.counting_llm import CountingLLM
+from lab.infra.local_sandbox import LocalSandbox
+from lab.infra.nulls import NullBrowser, NullSearchEngine
+from lab.sut.manus_adapter import ManusSUT
+from lab.tests.fakes import ScriptedLLM, planner_react_script
+from lab.trace.span import SpanKind, TraceRecorder
+from lab.trace.store import SpanStore
+from lab.trace.view import render_tree
+from lab.usage import Usage
 
 
 def _build_sut(tmp_path, script, recorder, *, injector=None, budget_policy=None):
     """组装一个 fast mode 的 SUT（全部依赖都是 lab 侧替身）。"""
-    from lab.faults.injector import FaultInjector
     from lab.guard.budget import Budget, BudgetPolicy
     from lab.middleware import ToolGuard
 
@@ -180,13 +178,15 @@ async def test_multiple_tool_calls_in_one_step_all_nest(tmp_path):
     from lab.tests.fakes import json_content, tool_call
 
     script = [
-        json_content({
-            "title": "两步工具",
-            "goal": "g",
-            "language": "中文",
-            "steps": [{"description": "写两个文件"}],
-            "message": "开始",
-        }),
+        json_content(
+            {
+                "title": "两步工具",
+                "goal": "g",
+                "language": "中文",
+                "steps": [{"description": "写两个文件"}],
+                "message": "开始",
+            }
+        ),
         tool_call("write_file", {"filepath": "/home/ubuntu/x.txt", "content": "1"}, "c1"),
         tool_call("write_file", {"filepath": "/home/ubuntu/y.txt", "content": "2"}, "c2"),
         json_content({"success": True, "attachments": [], "result": "都写好了"}),
@@ -217,10 +217,15 @@ async def test_failed_tool_records_error_type_in_span(tmp_path):
 
     # read_file 一个不存在的文件 → LocalSandbox 返回 error_type=file_not_found
     script = [
-        json_content({
-            "title": "读不存在的文件", "goal": "g", "language": "中文",
-            "steps": [{"description": "读取"}], "message": "开始",
-        }),
+        json_content(
+            {
+                "title": "读不存在的文件",
+                "goal": "g",
+                "language": "中文",
+                "steps": [{"description": "读取"}],
+                "message": "开始",
+            }
+        ),
         tool_call("read_file", {"filepath": "/home/ubuntu/missing.txt"}),
         json_content({"success": False, "attachments": [], "result": "文件不存在"}),
         json_content({"steps": []}),

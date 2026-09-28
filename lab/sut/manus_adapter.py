@@ -30,7 +30,7 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.event import (  # noqa: E402
+from app.domain.models.event import (
     ErrorEvent,
     MessageEvent,
     PlanEvent,
@@ -41,23 +41,23 @@ from app.domain.models.event import (  # noqa: E402
     ToolEventStatus,
     WaitEvent,
 )
-from app.domain.models.message import Message  # noqa: E402
-from app.domain.models.plan import ExecutionStatus, Plan  # noqa: E402
-from app.domain.models.session import Session  # noqa: E402
-from app.domain.services.flows.planner_react import PlannerReActFlow  # noqa: E402
-from app.domain.services.tools.a2a import A2ATool  # noqa: E402
-from app.domain.services.tools.base import BaseTool  # noqa: E402
-from app.domain.services.tools.file import FileTool  # noqa: E402
-from app.domain.services.tools.mcp import MCPTool  # noqa: E402
-from app.domain.services.tools.message import MessageTool  # noqa: E402
-from app.domain.services.tools.shell import ShellTool  # noqa: E402
-from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser  # noqa: E402
+from app.domain.models.message import Message
+from app.domain.models.plan import ExecutionStatus, Plan
+from app.domain.models.session import Session
+from app.domain.services.flows.planner_react import PlannerReActFlow
+from app.domain.services.tools.a2a import A2ATool
+from app.domain.services.tools.base import BaseTool
+from app.domain.services.tools.file import FileTool
+from app.domain.services.tools.mcp import MCPTool
+from app.domain.services.tools.message import MessageTool
+from app.domain.services.tools.shell import ShellTool
+from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser
 
-from lab.infra.memory_uow import create_uow_factory  # noqa: E402
-from lab.middleware import ToolGuard  # noqa: E402
-from lab.sut.base import SUT, StepStats, TaskResult  # noqa: E402
-from lab.trace.span import TraceRecorder  # noqa: E402
-from lab.usage import Usage  # noqa: E402
+from lab.infra.memory_uow import create_uow_factory
+from lab.middleware import ToolGuard
+from lab.sut.base import SUT, StepStats, TaskResult
+from lab.trace.span import TraceRecorder
+from lab.usage import Usage
 
 
 class ManusSUT(SUT):

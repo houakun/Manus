@@ -33,7 +33,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -49,11 +48,11 @@ NOISE_FLOOR_FILE = "noise_floor.json"
 class NoiseMetric(BaseModel):
     """一个指标的噪声地板。"""
 
-    name: str                       # 机器可读名（success_pt / cost_pct / ...）
-    label: str                      # 显示名
+    name: str  # 机器可读名（success_pt / cost_pct / ...）
+    label: str  # 显示名
     unit: str = ""
-    delta: float = 0.0              # 观测到的两臂差值（点估计）
-    resolution: float = 0.0         # 95% 配对区间半宽 = "小于它看不出来"
+    delta: float = 0.0  # 观测到的两臂差值（点估计）
+    resolution: float = 0.0  # 95% 配对区间半宽 = "小于它看不出来"
     per_task: List[float] = Field(default_factory=list)  # 逐任务差值（看有没有被个别任务主导）
 
     @property
@@ -93,10 +92,10 @@ class NoiseFloor(BaseModel):
 
 
 def measure_noise_floor(
-        suite: SuiteResult,
-        *,
-        label: str = "",
-        include_uids: Optional[Sequence[str]] = None,
+    suite: SuiteResult,
+    *,
+    label: str = "",
+    include_uids: Optional[Sequence[str]] = None,
 ) -> NoiseFloor:
     """从"两个同配置臂交错跑出来"的 suite 计算噪声地板。
 
@@ -144,17 +143,23 @@ def measure_noise_floor(
 
     # ---- 成功率（百分点）----
     rate = _paired_rate_diff(left, right)
-    floor.metrics.append(NoiseMetric(
-        name="success_pt", label="成功率", unit="pt",
-        delta=rate["delta"], resolution=rate["resolution"], per_task=rate["per_task"],
-    ))
+    floor.metrics.append(
+        NoiseMetric(
+            name="success_pt",
+            label="成功率",
+            unit="pt",
+            delta=rate["delta"],
+            resolution=rate["resolution"],
+            per_task=rate["per_task"],
+        )
+    )
 
     # ---- 连续量（相对变化 %）----
     for field, name, unit in (
-            ("cost_usd", "cost_pct", "成本"),
-            ("tokens", "tokens_pct", "token"),
-            ("elapsed_ms", "elapsed_ms_pct", "耗时"),
-            ("tool_calls", "tool_calls_pct", "工具调用"),
+        ("cost_usd", "cost_pct", "成本"),
+        ("tokens", "tokens_pct", "token"),
+        ("elapsed_ms", "elapsed_ms_pct", "耗时"),
+        ("tool_calls", "tool_calls_pct", "工具调用"),
     ):
         metric = _paired_relative_diff(left, right, field, name, unit)
         if metric is not None:
@@ -187,7 +192,7 @@ def measure_noise_floor(
             "它只适合用来**定向对比某个任务的变化量**。要用它当阀值请跑全套。"
         )
     floor.notes.append(
-        "本测量假设\"两臂除了名字没有差别\"。若它们真的只是同一配置的两份，"
+        '本测量假设"两臂除了名字没有差别"。若它们真的只是同一配置的两份，'
         "那 `delta` 就是纯噪声；如果 `delta` 大得离谱，先怀疑**实验装置**"
         "（例如某个臂的工作区没隔离干净），而不是先相信这个地板。"
     )
@@ -214,11 +219,11 @@ def _paired_rate_diff(left: SuiteResult, right: SuiteResult) -> Dict[str, Any]:
 
 
 def _paired_relative_diff(
-        left: SuiteResult,
-        right: SuiteResult,
-        field: str,
-        name: str,
-        unit_label: str,
+    left: SuiteResult,
+    right: SuiteResult,
+    field: str,
+    name: str,
+    unit_label: str,
 ) -> Optional[NoiseMetric]:
     """逐任务相对变化（%）+ 配对区间半宽。
 
@@ -232,8 +237,12 @@ def _paired_relative_diff(
         return None
     diffs = [(b[key] - a[key]) / a[key] * 100 for key in shared]
     return NoiseMetric(
-        name=name, label=f"{unit_label}（相对）", unit="%",
-        delta=mean(diffs), resolution=_half_width(diffs), per_task=diffs,
+        name=name,
+        label=f"{unit_label}（相对）",
+        unit="%",
+        delta=mean(diffs),
+        resolution=_half_width(diffs),
+        per_task=diffs,
     )
 
 
@@ -260,6 +269,7 @@ def _mean_by_task(suite: SuiteResult, field: str) -> Dict[str, float]:
 
 
 # ==================== 落盘 / 读取 ====================
+
 
 def noise_floor_path() -> Path:
     from lab.bootstrap import ensure_runs_dir
@@ -291,13 +301,16 @@ def render_noise_floor(floor: NoiseFloor) -> str:
     lines.append("## 噪声地板（同一配置跑两次能差多少）")
     lines.append("")
     lines.append(f"- suite: `{floor.suite_id[:8]}`（{floor.label}）")
-    lines.append(f"- 臂: {' / '.join(floor.arms)}"
-                 f"{'（✅ 已交错）' if floor.interleaved else '（❌ 未交错）'}")
-    lines.append(f"- 规模: {floor.task_count} 任务 × 每臂 {floor.runs_per_task} 次"
-                 f"，每臂 n={floor.task_count * floor.runs_per_task}")
-    lines.append(f"- 配置: guard=`{floor.guard_config or 'all'}`"
-                 f" fault=`{floor.fault_spec or '无'}` model=`{floor.model_name}`"
-                 f" T={floor.temperature}")
+    lines.append(f"- 臂: {' / '.join(floor.arms)}{'（✅ 已交错）' if floor.interleaved else '（❌ 未交错）'}")
+    lines.append(
+        f"- 规模: {floor.task_count} 任务 × 每臂 {floor.runs_per_task} 次"
+        f"，每臂 n={floor.task_count * floor.runs_per_task}"
+    )
+    lines.append(
+        f"- 配置: guard=`{floor.guard_config or 'all'}`"
+        f" fault=`{floor.fault_spec or '无'}` model=`{floor.model_name}`"
+        f" T={floor.temperature}"
+    )
     lines.append("")
     lines.append("| 指标 | 观测差值 | **测量分辨率（±）** | 单任务最大 | 被个别任务主导? |")
     lines.append("|---|---|---|---|---|")
@@ -309,10 +322,13 @@ def render_noise_floor(floor: NoiseFloor) -> str:
             f"| {metric.worst_task:+.2f}{metric.unit} | {dominant} |"
         )
     lines.append("")
-    lines.append("> **怎么用**：任何小于 `±分辨率` 的 delta 都**不能**当结论 —— "
-                 "它落在\"同一份代码重跑一次\"的正常波动范围内。")
-    lines.append("> `观测差值` 理想情况接近 0（两臂配置相同）。它偏大说明运气有影响；"
-                 "它偏大**且**分辨率也大，说明当前样本量不足以支撑细粒度结论。")
+    lines.append(
+        '> **怎么用**：任何小于 `±分辨率` 的 delta 都**不能**当结论 —— 它落在"同一份代码重跑一次"的正常波动范围内。'
+    )
+    lines.append(
+        "> `观测差值` 理想情况接近 0（两臂配置相同）。它偏大说明运气有影响；"
+        "它偏大**且**分辨率也大，说明当前样本量不足以支撑细粒度结论。"
+    )
     lines.append("")
     for note in floor.notes:
         lines.append(f"> {note}")

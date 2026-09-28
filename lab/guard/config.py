@@ -39,7 +39,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel
 
@@ -120,10 +120,7 @@ class GuardConfig(BaseModel):
                 enabled.add(key)
 
         if unknown:
-            raise ValueError(
-                f"未知的加固能力 {unknown}；可选：all / none / "
-                f"{'/'.join(sorted(set(_ALIASES)))}"
-            )
+            raise ValueError(f"未知的加固能力 {unknown}；可选：all / none / {'/'.join(sorted(set(_ALIASES)))}")
         if not enabled:
             raise ValueError("guard spec 解析后为空，请用 all / none 或明确的能力名")
 

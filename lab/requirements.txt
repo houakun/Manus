@@ -1,0 +1,30 @@
+# lab（测量台）所需的依赖 —— **刻意不含 SUT 的运行期依赖**。
+#
+# 为什么单独列一份，而不是复用 `api/requirements.txt`：
+# 那一份带着 playwright / docker / alembic / cos-sdk（被测对象的运行期依赖），
+# 而 lab 的测试与 `bench validate` 只需要 SUT 的**纯 Python 部分能 import**。
+# 装全量会让 CI 慢十倍，而多出来的东西一个都用不到。
+#
+# 用法：
+#     python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
+#     pip install -r lab/requirements.txt
+#     python -m pytest -q && python -m lab bench validate     # 两步都应全绿
+#
+# CI 直接读这个文件（见 .github/workflows/ci.yml），避免"CI 里能过、本地装不上"的漂移。
+pydantic==2.11.9
+pyyaml==6.0.2
+json-repair==0.53.0
+httpx==0.28.1
+openai==1.107.2
+mcp==1.22.0
+pytest
+pytest-asyncio
+
+# lint 也进 CI：否则"刻意忽略"就只能靠会被 `--fix` 删掉的 `# noqa` 来维持
+# （实测被删过 109 处 E402，而当时 CI 不跑 lint，所以没人发现 ——
+#   见 ruff.toml 与 lab/README.md「我错在哪 #11」）。
+#
+# **钉版本**（而不是 `ruff>=x`）：ruff 的默认规则集会随版本变
+# （0.16 起默认不再是 F/E 类，实测同一份代码从 2 条变 47 条），
+# 不钉版本的话"门禁口径"会跟着上游漂移 —— 那正是这次要修的东西。
+ruff==0.16.8

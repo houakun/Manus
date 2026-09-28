@@ -20,36 +20,37 @@ import asyncio
 import time
 import uuid
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
 from lab.bootstrap import ensure_runs_dir, ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.infrastructure.external.llm.openai_llm import OpenAILLM  # noqa: E402
+from app.domain.external.sandbox import Sandbox
+from app.infrastructure.external.llm.openai_llm import OpenAILLM
 
-from lab.config import load_agent_config, load_llm_config  # noqa: E402
-from lab.faults.injector import FaultInjector  # noqa: E402
-from lab.faults.kinds import FaultKind, FaultRule  # noqa: E402
-from lab.guard.budget import Budget, BudgetPolicy  # noqa: E402
-from lab.guard.config import GuardConfig  # noqa: E402
-from lab.infra.counting_llm import CountingLLM  # noqa: E402
-from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
-from lab.infra.nulls import NullBrowser, NullSearchEngine  # noqa: E402
-from lab.middleware import ToolGuard  # noqa: E402
-from lab.replay.cache import LLMCache  # noqa: E402
-from lab.replay.llm import (  # noqa: E402
+from lab.config import load_agent_config, load_llm_config
+from lab.faults.injector import FaultInjector
+from lab.faults.kinds import FaultKind, FaultRule
+from lab.guard.budget import Budget, BudgetPolicy
+from lab.guard.config import GuardConfig
+from lab.infra.counting_llm import CountingLLM
+from lab.infra.local_sandbox import LocalSandbox
+from lab.infra.nulls import NullBrowser, NullSearchEngine
+from lab.middleware import ToolGuard
+from lab.replay.cache import LLMCache
+from lab.replay.llm import (
     CachedLLM,
     ReplayMode,
     resolve_cache_path,
     resolve_ignore_volatile,
     resolve_mode,
 )
-from lab.sut.base import TaskResult  # noqa: E402
-from lab.sut.manus_adapter import ManusSUT  # noqa: E402
-from lab.trace.span import TraceRecorder  # noqa: E402
-from lab.trace.store import SpanStore  # noqa: E402
-from lab.usage import Usage  # noqa: E402
+from lab.sut.base import TaskResult
+from lab.sut.manus_adapter import ManusSUT
+from lab.trace.span import TraceRecorder
+from lab.trace.store import SpanStore
+from lab.usage import Usage
 
 # 评测默认的任务级时间上限（秒）。这是"终止保证"的第一道防线：
 # SUT 内部只有 max_iterations（单次 invoke 的迭代上限），没有整任务的时间/成本上限。
@@ -64,11 +65,12 @@ def default_trace_store() -> SpanStore:
 
 
 def fault_rules_from_spec(
-        kinds: Optional[List[str]] = None,
-        *,
-        tool: str = "*",
-        rate: float = 1.0,
-        latency_s: float = 2.0,
+    kinds: Optional[List[str]] = None,
+    *,
+    tool: str = "*",
+    rate: float = 1.0,
+    latency_s: float = 2.0,
+    stable: bool = False,
 ) -> List[FaultRule]:
     """把命令行传的故障名转成注入规则（CLI / 临时实验用）。
 
@@ -81,15 +83,20 @@ def fault_rules_from_spec(
             name = name.strip()
             if not name:
                 continue
-            rules.append(FaultRule(
-                kind=FaultKind(name),
-                tool=tool,
-                rate=rate,
-                latency_s=latency_s,
-                # 这两种故障的语义是"前 N 次失败/前 N 次慢"，默认只影响第一次，
-                # 让重试路径可以被确定性地验证
-                fail_times=1 if FaultKind(name) == FaultKind.TRANSIENT_ERROR else None,
-            ))
+            rules.append(
+                FaultRule(
+                    kind=FaultKind(name),
+                    tool=tool,
+                    rate=rate,
+                    latency_s=latency_s,
+                    # `stable`：把决策粒度从调用序号换成**目标**（见 `FaultRule.stable`）。
+                    # 它是"让重读自证失效"那个实验的开关。
+                    stable=stable,
+                    # 这两种故障的语义是"前 N 次失败/前 N 次慢"，默认只影响第一次，
+                    # 让重试路径可以被确定性地验证
+                    fail_times=1 if FaultKind(name) == FaultKind.TRANSIENT_ERROR else None,
+                )
+            )
     return rules
 
 
@@ -98,23 +105,26 @@ class LabConfigError(RuntimeError):
 
 
 async def run_task(
-        goal: str,
-        *,
-        workspace: Optional[Path] = None,
-        fast_mode: bool = True,
-        max_seconds: float = DEFAULT_MAX_SECONDS,
-        max_iterations: Optional[int] = None,
-        temperature: Optional[float] = None,
-        exec_timeout: int = 60,
-        attachments: Optional[List[str]] = None,
-        trace: bool = True,
-        fault_rules: Optional[List[FaultRule]] = None,
-        budget_policy: Optional[BudgetPolicy] = None,
-        watch_literals: Optional[List[str]] = None,
-        guard_config: Optional[GuardConfig] = None,
-        replay: Optional[str] = None,
-        replay_cache: Optional[Path] = None,
-        replay_ignore_volatile: Optional[bool] = None,
+    goal: str,
+    *,
+    workspace: Optional[Path] = None,
+    fast_mode: bool = True,
+    # 选哪个 SUT：`manus` = 课程版 PlannerReAct（默认，保持既有行为）；
+    # `minimal-react` = 本仓库自研的最小 loop（T10），用于"朴素基线 vs 课程版"对照。
+    sut_kind: str = "manus",
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    max_iterations: Optional[int] = None,
+    temperature: Optional[float] = None,
+    exec_timeout: int = 60,
+    attachments: Optional[List[str]] = None,
+    trace: bool = True,
+    fault_rules: Optional[List[FaultRule]] = None,
+    budget_policy: Optional[BudgetPolicy] = None,
+    watch_literals: Optional[List[str]] = None,
+    guard_config: Optional[GuardConfig] = None,
+    replay: Optional[str] = None,
+    replay_cache: Optional[Path] = None,
+    replay_ignore_volatile: Optional[bool] = None,
 ) -> TaskResult:
     """跑一个任务，返回标准化结果。
 
@@ -192,7 +202,10 @@ async def run_task(
     )
     injector = FaultInjector(fault_rules) if fault_rules else None
     guard = ToolGuard(
-        recorder=recorder, budget=budget, injector=injector, sandbox=sandbox,
+        recorder=recorder,
+        budget=budget,
+        injector=injector,
+        sandbox=sandbox,
         watch_literals=watch_literals,
         config=guard_config or GuardConfig.from_env(),
     )
@@ -215,19 +228,44 @@ async def run_task(
         base_llm = cached_llm
     llm = CountingLLM(base_llm, usage, sink=recorder, after_call=guard.check_budget)
 
-    sut = ManusSUT(
-        llm=llm,
-        agent_config=agent_config,
-        sandbox=sandbox,
-        workspace=workspace,
-        fast_mode=fast_mode,
-        browser=NullBrowser(),
-        search_engine=NullSearchEngine(),
-        usage=usage,
-        max_seconds=max_seconds,
-        trace=recorder,
-        guard=guard,
-    )
+    if sut_kind == "minimal-react":
+        # 第二 SUT（T10）：自研最小 loop。
+        # 工具层**复用 SUT 的**并走同一个 guard.wrap_tools(...) 代理，
+        # 所以两条 loop 的差别只有控制流（否则成功率差异无法归因）。
+        from app.domain.services.tools.file import FileTool
+        from app.domain.services.tools.shell import ShellTool
+
+        from lab.sut.minimal_react import MinimalReActSUT
+
+        # `LocalSandbox` 是 fast mode 的**依赖替换件**：它只实现 FileTool/ShellTool 真正
+        # 用到的那部分（read/write/exec），**刻意**不实现完整 `Sandbox` 协议里的浏览器
+        # 通道（`get_browser()` 会明确 raise，而不是假装有）。
+        # 所以这里显式 `cast` —— 我们**知道**传进去的是子集，而不是"检查器漏看了"。
+        tool_sandbox = cast(Sandbox, sandbox)
+        sut = MinimalReActSUT(
+            llm=llm,
+            tools=guard.wrap_tools([FileTool(sandbox=tool_sandbox), ShellTool(sandbox=tool_sandbox)]),
+            usage=usage,
+            workspace=workspace,
+            model_name=llm_config.model_name,
+            max_steps=max_iterations or 12,
+            max_seconds=max_seconds,
+            trace=recorder,
+        )
+    else:
+        sut = ManusSUT(
+            llm=llm,
+            agent_config=agent_config,
+            sandbox=sandbox,
+            workspace=workspace,
+            fast_mode=fast_mode,
+            browser=NullBrowser(),
+            search_engine=NullSearchEngine(),
+            usage=usage,
+            max_seconds=max_seconds,
+            trace=recorder,
+            guard=guard,
+        )
 
     # 5.执行并补齐计量字段
     started_at = time.monotonic()
@@ -278,9 +316,7 @@ async def run_task(
             if replay_mode is ReplayMode.REPLAY and snapshot.misses:
                 # 根因是"缓存里没有这次请求"，而不是 SUT 报出来的下游症状（llm_error）。
                 # 与 error_chain 的理念一致：把根因提到 error_type，别让人追错方向。
-                result.error_chain.append(
-                    f"replay_miss: 严格回放有 {snapshot.misses} 次未命中缓存"
-                )
+                result.error_chain.append(f"replay_miss: 严格回放有 {snapshot.misses} 次未命中缓存")
                 # 未命中诊断（人话）进 error_chain：它能把"缓存里没有"变成
                 # "第 3 条消息里的 UUID 不一样"，否则人会去怀疑自己刚改的那行代码。
                 for line in (snapshot.miss_diagnosis or [])[:3]:

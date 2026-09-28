@@ -24,7 +24,7 @@
 == 做法 ==
 1. **固定前缀**：把"我们保证要有的工具目录"按固定顺序前置（Git 的两个 bin + 系统目录）；
 2. **父 PATH 兜底**：接在后面 —— 目的是**不拿走**任务已经在用的东西
-   （例如 `bc` 只在用户 PATH 里，而 `syn_sum_range` 的冒烟测试用过 `bc`）；
+   （例如宿主 `python` / `node` 只在用户 PATH 里，而任务真的会用它们）；
 3. **记录残余**：只在父 PATH 里的工具仍随启动上下文变化，所以另外产出
    **环境指纹**（解析出的每个工具的绝对路径 + 可 GROUP BY 的短摘要），
    让"这次运行到底看到了什么"变成**数据**，而不是假设。
@@ -49,10 +49,36 @@ from typing import Any, Dict, List, Optional
 # 前一组来自轨迹（`which` / `command -v` 探的就是它们），
 # 后一组是 Unix 基础文本工具（缺任何一个都会让 Agent 换一条路走）。
 TOOL_PROBES = (
-    "python", "python3", "sqlite3", "git", "bc", "node",
-    "grep", "sed", "awk", "od", "tr", "cmp", "uname", "which",
-    "sort", "head", "tail", "wc", "diff", "find", "xargs",
+    "python",
+    "python3",
+    "sqlite3",
+    "git",
+    "bc",
+    "node",
+    "grep",
+    "sed",
+    "awk",
+    "od",
+    "tr",
+    "cmp",
+    "uname",
+    "which",
+    "sort",
+    "head",
+    "tail",
+    "wc",
+    "diff",
+    "find",
+    "xargs",
 )
+
+# **可选**探测工具：仍然进指纹（信息不丢），但**不参与缺失告警**。
+#
+# `bc` 在这里的理由：实测本机不可用，而当前任务集里**没有任何任务用它**
+# （`grep -rn bc lab/bench/tasks/*/*.yaml` 无结果）—— 它只是早期轨迹遗留的探测项。
+# 若把它算作"必须"，每次 `lab sandbox env` 都会弹同一条**无法消除**的告警，
+# 只会训练人忽略告警 —— 与 lab/README「我错在哪 #4」是同一类错误。
+OPTIONAL_PROBES = frozenset({"bc"})
 
 # 系统目录：父 PATH 被清空时（例如从 IDE/服务启动）它们也可能不在，
 # 而 `where` / `findstr` / `taskkill` 都在里面。
@@ -141,7 +167,7 @@ def deterministic_path(parent_path: Optional[str] = None) -> str:
     三段的顺序都是有理由的：
     1. **固定前缀**（Git 的两个 bin + 系统目录）在最前 —— 它才是"保证"的部分；
     2. **父 PATH** 接在后面 —— 不能"拿走"任务已经在用的东西
-       （例如 `bc` 只在用户 PATH 里，而 `syn_sum_range` 的冒烟测试用过 `bc`）；
+       （例如宿主 `python` / `node` 只在用户 PATH 里，而任务真的会用它们）；
     3. **宿主解释器目录放最后** —— 它不是用来"优先"的，而是**救急**：
        父 PATH 里一个 python 都没有时（从服务/IDE 启动）至少还有 python 可用。
        放最后是为了**绝不遮蔽**：正常情况下 `python` 仍来自父 PATH，
@@ -180,6 +206,8 @@ def render_fingerprint(fingerprint: Dict[str, Any]) -> str:
     """人类可读的指纹（`lab sandbox env` 用）。文本优先，可 grep、可进 CI。"""
     tools = fingerprint.get("tools") or {}
     missing = [name for name, resolved in tools.items() if not resolved]
+    # 只对"必须有"的工具告警：可选工具（`OPTIONAL_PROBES`）缺失是常态。
+    missing_required = [name for name in missing if name not in OPTIONAL_PROBES]
     lines = [
         f"环境指纹：{fingerprint.get('digest', '?')}",
         f"生效 PATH（前 3 项）：{os.pathsep.join((fingerprint.get('path') or '').split(os.pathsep)[:3])}",
@@ -189,12 +217,17 @@ def render_fingerprint(fingerprint: Dict[str, Any]) -> str:
     for name in TOOL_PROBES:
         resolved = tools.get(name)
         lines.append(f"  {'✓' if resolved else '·'} {name:8} {resolved or '（不可用）'}")
-    if missing:
+    if missing_required:
         lines += [
             "",
-            f"⚠️ 有 {len(missing)} 个探测工具不可用：{'、'.join(missing)}",
+            f"⚠️ 有 {len(missing_required)} 个探测工具不可用：{'、'.join(missing_required)}",
             "   这些工具缺失时，模型会花迭代去'探环境'（轨迹里 which/command -v 共出现 110 次），",
             "   而且任务难度会变 —— 这是**测量缺陷**，不是环境差异。",
+        ]
+    elif missing:
+        lines += [
+            "",
+            f"（可选探测工具不可用：{'、'.join(missing)} —— 已计进指纹，但当前任务集不依赖，不计入告警）",
         ]
     return "\n".join(lines)
 

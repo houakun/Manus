@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from pydantic import BaseModel, Field
 
 from lab.bench.runner import RunOutcome, SuiteResult
-from lab.bench.task import regression_uids
 from lab.bench.stats import (
     Interval,
     bootstrap_ci,
@@ -32,6 +31,7 @@ from lab.bench.stats import (
     paired_bootstrap_ci,
     wilson_interval,
 )
+from lab.bench.task import regression_uids
 
 # 参与对比的连续指标：属性名 → (显示名, 单位, 是否越低越好)
 METRICS = {
@@ -100,8 +100,12 @@ def summarize_suite(suite: SuiteResult) -> SuiteSummary:
         boot = bootstrap_ci(values)
         ordered = sorted(values)
         metrics[key] = MetricSummary(
-            name=name, unit=unit, lower_is_better=lower_better,
-            mean=mean(values), t_interval=t_interval, bootstrap_interval=boot,
+            name=name,
+            unit=unit,
+            lower_is_better=lower_better,
+            mean=mean(values),
+            t_interval=t_interval,
+            bootstrap_interval=boot,
             median=boot.point if boot.method.endswith("median") else ordered[len(ordered) // 2],
             p95=ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
         )
@@ -179,14 +183,14 @@ class GateResult(BaseModel):
 
 
 def evaluate_gates(
-        report: ComparisonReport,
-        *,
-        max_success_drop_pt: float = 5.0,
-        max_passk_drop_pt: float = 10.0,
-        max_cost_increase_pct: float = 20.0,
-        require_significant: bool = True,
-        noise_floor: Any = None,
-        auto_thresholds: bool = False,
+    report: ComparisonReport,
+    *,
+    max_success_drop_pt: float = 5.0,
+    max_passk_drop_pt: float = 10.0,
+    max_cost_increase_pct: float = 20.0,
+    require_significant: bool = True,
+    noise_floor: Any = None,
+    auto_thresholds: bool = False,
 ) -> List[GateResult]:
     """把对比结果变成一组可判定的门禁。
 
@@ -224,38 +228,44 @@ def evaluate_gates(
 
     # 1.成功率（运行级）
     drop_pt = (report.baseline.success_rate.point - report.candidate.success_rate.point) * 100
-    results.append(GateResult(
-        name="运行级成功率下降",
-        threshold=f"≤ {effective_success:.1f}pt{auto_note}",
-        observed=f"{drop_pt:+.1f}pt",
-        passed=drop_pt <= effective_success,
-        detail=f"{report.baseline.success_rate.point:.1%} → {report.candidate.success_rate.point:.1%}",
-        resolution=resolution_of("success_pt", "pt"),
-    ))
+    results.append(
+        GateResult(
+            name="运行级成功率下降",
+            threshold=f"≤ {effective_success:.1f}pt{auto_note}",
+            observed=f"{drop_pt:+.1f}pt",
+            passed=drop_pt <= effective_success,
+            detail=f"{report.baseline.success_rate.point:.1%} → {report.candidate.success_rate.point:.1%}",
+            resolution=resolution_of("success_pt", "pt"),
+        )
+    )
 
     # 2.pass^k（任务级）—— 比运行级更敏感，能抓到"少数任务变不稳"
     base_pow, cand_pow = report.baseline_passk, report.candidate_passk
     if base_pow is not None and cand_pow is not None and base_pow.tasks and cand_pow.tasks:
         pow_drop_pt = (base_pow.pass_pow_k_rate.point - cand_pow.pass_pow_k_rate.point) * 100
-        results.append(GateResult(
-            name=f"pass^{base_pow.k} 下降",
-            threshold=f"≤ {effective_passk:.1f}pt{auto_note}",
-            observed=f"{pow_drop_pt:+.1f}pt",
-            passed=pow_drop_pt <= effective_passk,
-            detail=f"{base_pow.pass_pow_k}/{base_pow.tasks} → {cand_pow.pass_pow_k}/{cand_pow.tasks}",
-            resolution=resolution_of("success_pt", "pt"),
-        ))
+        results.append(
+            GateResult(
+                name=f"pass^{base_pow.k} 下降",
+                threshold=f"≤ {effective_passk:.1f}pt{auto_note}",
+                observed=f"{pow_drop_pt:+.1f}pt",
+                passed=pow_drop_pt <= effective_passk,
+                detail=f"{base_pow.pass_pow_k}/{base_pow.tasks} → {cand_pow.pass_pow_k}/{cand_pow.tasks}",
+                resolution=resolution_of("success_pt", "pt"),
+            )
+        )
     else:
         # 跳过的行必须**显式出现**，否则“没有这一行”会被误读成“通过了”。
         # 典型场景：只含 capability 任务的 suite（如 `--group ci`）——
         # 回归门禁对它本来就没有话可说，但不能静静地不说。
-        results.append(GateResult(
-            name="pass^k（任务级）",
-            threshold="—",
-            observed="跳过",
-            passed=True,
-            detail="本口径下没有任务（suite 里只有 capability 任务，回归门禁不适用）",
-        ))
+        results.append(
+            GateResult(
+                name="pass^k（任务级）",
+                threshold="—",
+                observed="跳过",
+                passed=True,
+                detail="本口径下没有任务（suite 里只有 capability 任务，回归门禁不适用）",
+            )
+        )
 
     # 3.成本（配对相对变化）
     paired = report.paired.get("cost_usd")
@@ -263,17 +273,16 @@ def evaluate_gates(
         increase_pct = paired.relative_change * 100
         over = increase_pct > effective_cost
         failed = over and (paired.significant or not require_significant)
-        results.append(GateResult(
-            name="成本上升",
-            threshold=f"≤ {effective_cost:.0f}%"
-                      + auto_note
-                      + ("（需方向可信）" if require_significant else ""),
-            observed=f"{increase_pct:+.1f}%"
-                     + ("" if paired.significant else "（区间跨 0，视为噪声）"),
-            passed=not failed,
-            detail=f"${paired.baseline_mean:.4f} → ${paired.candidate_mean:.4f}（配对 n={paired.n_pairs}）",
-            resolution=resolution_of("cost_pct", "%"),
-        ))
+        results.append(
+            GateResult(
+                name="成本上升",
+                threshold=f"≤ {effective_cost:.0f}%" + auto_note + ("（需方向可信）" if require_significant else ""),
+                observed=f"{increase_pct:+.1f}%" + ("" if paired.significant else "（区间跨 0，视为噪声）"),
+                passed=not failed,
+                detail=f"${paired.baseline_mean:.4f} → ${paired.candidate_mean:.4f}（配对 n={paired.n_pairs}）",
+                resolution=resolution_of("cost_pct", "%"),
+            )
+        )
     # 4.回放完整性（×）：回放未命中 → 两边根本不是同一条轨迹。
     #
     #    实测踩过：严格回放未命中 6 次时，SUT 降级继续跑，交付了合格产物，
@@ -281,13 +290,15 @@ def evaluate_gates(
     #    把回放不完整当成门禁失败，而不是只写在备注里。
     degraded = report.candidate_replay_missed_runs
     if degraded:
-        results.append(GateResult(
-            name="回放完整性",
-            threshold="= 0 次未命中",
-            observed=f"{degraded} 次运行回放不完整",
-            passed=False,
-            detail="这些运行的轨迹不是录制时那条；即使判定为成功也不可复现",
-        ))
+        results.append(
+            GateResult(
+                name="回放完整性",
+                threshold="= 0 次未命中",
+                observed=f"{degraded} 次运行回放不完整",
+                passed=False,
+                detail="这些运行的轨迹不是录制时那条；即使判定为成功也不可复现",
+            )
+        )
     return results
 
 
@@ -345,8 +356,9 @@ class ComparisonReport(BaseModel):
         - 任务集不同：问题本身不同（已有单独的 only_in_* 提示）。
         而 `guard_config` / `fault_spec` 不同是**合法的自变量**，只算提醒。
         """
-        return [key for key in self.config_differences
-                if key in ("model_name", "temperature", "replay_mode", "task_set")]
+        return [
+            key for key in self.config_differences if key in ("model_name", "temperature", "replay_mode", "task_set")
+        ]
 
     @property
     def comparable(self) -> bool:
@@ -394,10 +406,10 @@ def _config_differences(baseline: SuiteResult, candidate: SuiteResult) -> Dict[s
 
 
 def compare_suites(
-        baseline: SuiteResult,
-        candidate: SuiteResult,
-        *,
-        scope: str = "all",
+    baseline: SuiteResult,
+    candidate: SuiteResult,
+    *,
+    scope: str = "all",
 ) -> ComparisonReport:
     """配对对比两个 suite（按 task_key 配对，每边取该任务的均值）。
 
@@ -463,10 +475,16 @@ def compare_suites(
         if not diffs:
             continue
         report.paired[key] = PairedMetric(
-            name=name, unit=unit, n_pairs=len(diffs),
-            baseline_mean=mean(a_values), candidate_mean=mean(b_values),
-            mean_diff=mean(diffs), diff_interval=paired_bootstrap_ci(diffs),
-            wins=wins, losses=losses, ties=ties,
+            name=name,
+            unit=unit,
+            n_pairs=len(diffs),
+            baseline_mean=mean(a_values),
+            candidate_mean=mean(b_values),
+            mean_diff=mean(diffs),
+            diff_interval=paired_bootstrap_ci(diffs),
+            wins=wins,
+            losses=losses,
+            ties=ties,
         )
     return report
 
@@ -479,6 +497,7 @@ def _group_by_task(outcomes: Sequence[RunOutcome]) -> Dict[str, List[RunOutcome]
 
 
 # ==================== Pareto 前沿 ====================
+
 
 class ParetoPoint(BaseModel):
     """Pareto 图上的一个点：成功率 vs 成本。"""
@@ -516,9 +535,7 @@ def pareto_points(suites: Sequence[SuiteResult]) -> List[ParetoPoint]:
             if other is point:
                 continue
             no_worse = other.success_rate >= point.success_rate and other.cost_per_task <= point.cost_per_task
-            strictly_better = (
-                other.success_rate > point.success_rate or other.cost_per_task < point.cost_per_task
-            )
+            strictly_better = other.success_rate > point.success_rate or other.cost_per_task < point.cost_per_task
             if no_worse and strictly_better:
                 point.dominated_by = other.suite_id
                 break
@@ -526,9 +543,9 @@ def pareto_points(suites: Sequence[SuiteResult]) -> List[ParetoPoint]:
 
 
 def group_by_task_set(
-        suites: Sequence[SuiteResult],
-        *,
-        min_runs: int = 1,
+    suites: Sequence[SuiteResult],
+    *,
+    min_runs: int = 1,
 ) -> Dict[Tuple[str, ...], List[SuiteResult]]:
     """按"覆盖的任务集合"给 suite 分组。
 
@@ -551,9 +568,9 @@ def group_by_task_set(
 
 
 def render_pareto_groups(
-        suites: Sequence[SuiteResult],
-        *,
-        min_runs: int = 10,
+    suites: Sequence[SuiteResult],
+    *,
+    min_runs: int = 10,
 ) -> str:
     """按任务集分组渲染 Pareto 表（每组一张）。"""
     groups = group_by_task_set(suites, min_runs=min_runs)
@@ -564,8 +581,10 @@ def render_pareto_groups(
         lines.append(f"（没有 n >= {min_runs} 的 suite 可比较）")
     for task_set, group in sorted(groups.items(), key=lambda kv: -len(kv[1])):
         sizes = sorted({len(s.outcomes) for s in group})
-        lines.append(f"### 任务集：{len(task_set)} 个任务（{'/'.join(t.split('/')[-1] for t in task_set[:3])}"
-                     f"{'…' if len(task_set) > 3 else ''}）")
+        lines.append(
+            f"### 任务集：{len(task_set)} 个任务（{'/'.join(t.split('/')[-1] for t in task_set[:3])}"
+            f"{'…' if len(task_set) > 3 else ''}）"
+        )
         lines.append("")
         lines.append(f"组内 suite 数：{len(group)}，规模：{sizes}")
         if len(group) < 2:
@@ -576,8 +595,10 @@ def render_pareto_groups(
         lines.append("")
 
     if skipped:
-        lines.append(f"> 已排除 {len(skipped)} 个规模 < {min_runs} 的 suite："
-                     f"{[(s.suite_id[:8], len(s.outcomes)) for s in skipped][:5]}")
+        lines.append(
+            f"> 已排除 {len(skipped)} 个规模 < {min_runs} 的 suite："
+            f"{[(s.suite_id[:8], len(s.outcomes)) for s in skipped][:5]}"
+        )
         lines.append("> n 太小的估计值不应该出现在 Pareto 图上（它会因为运气而“支配”一切）。")
     return "\n".join(lines)
 
@@ -603,10 +624,11 @@ def render_pareto(points: Sequence[ParetoPoint]) -> str:
             "（例如限制迭代次数 / 上下文压缩开关 / 不同模型）。"
         )
     else:
-        lines.append(f"> 前沿上有 {len(frontier)} 个点，它们之间**不可比** —— "
-                     "挑哪个取决于你更在意成功率还是成本。")
-    lines.append("> 注意：`成本/成功` 把\"多少钱\"和\"做对没有\"合成一个数，"
-                 "它比\"成本/任务\"更能反映真实代价（便宜但总失败是最贵的）。")
+        lines.append(f"> 前沿上有 {len(frontier)} 个点，它们之间**不可比** —— 挑哪个取决于你更在意成功率还是成本。")
+    lines.append(
+        '> 注意：`成本/成功` 把"多少钱"和"做对没有"合成一个数，'
+        '它比"成本/任务"更能反映真实代价（便宜但总失败是最贵的）。'
+    )
     return "\n".join(lines)
 
 
@@ -619,8 +641,7 @@ def render_comparison(report: ComparisonReport) -> str:
     lines.append(f"- A: {a.label}（n={a.n}）")
     lines.append(f"- B: {b.label}（n={b.n}）")
     if report.scope != "all":
-        lines.append(f"- 口径：**{report.scope}**"
-                     "（capability 任务的波动是能力边界，不进这个口径）")
+        lines.append(f"- 口径：**{report.scope}**（capability 任务的波动是能力边界，不进这个口径）")
     lines.append("")
 
     # ==================== 实验条件对账（放在最前面）====================
@@ -629,9 +650,11 @@ def render_comparison(report: ComparisonReport) -> str:
     if report.interleaved_pair:
         lines.append("### ✅ 实验条件：交错配对")
         lines.append("")
-        lines.append("两边来自**同一个交错 suite 的两个臂**（A,B,B,A…），"
-                     "所以「时间相关的服务端漂移」在设计上对两边同权 —— "
-                     "这比「分两段跑」强得多。")
+        lines.append(
+            "两边来自**同一个交错 suite 的两个臂**（A,B,B,A…），"
+            "所以「时间相关的服务端漂移」在设计上对两边同权 —— "
+            "这比「分两段跑」强得多。"
+        )
         lines.append("")
     if report.baseline_replay_missed_runs or report.candidate_replay_missed_runs:
         # 回放不完整 → 两边的轨迹根本不是同一条，任何 delta 都没有意义。
@@ -641,12 +664,17 @@ def render_comparison(report: ComparisonReport) -> str:
         lines.append(f"- A 侧：{report.baseline_replay_missed_runs} 次运行缓存未命中")
         lines.append(f"- B 侧：{report.candidate_replay_missed_runs} 次运行缓存未命中")
         lines.append("")
-        lines.append("> 这些运行在 LLM 调用失败后**降级继续**了，所以「仍然成功」**不等于**「复现成功」。"
-                     "先让两边都达到 0 未命中（`--replay-ignore-volatile` 或补录），再看 delta。")
+        lines.append(
+            "> 这些运行在 LLM 调用失败后**降级继续**了，所以「仍然成功」**不等于**「复现成功」。"
+            "先让两边都达到 0 未命中（`--replay-ignore-volatile` 或补录），再看 delta。"
+        )
         lines.append("")
     if report.config_differences:
-        header = "### ❌ 实验条件不同（不可直接比）" if report.hard_confounds \
+        header = (
+            "### ❌ 实验条件不同（不可直接比）"
+            if report.hard_confounds
             else "### ⚠️ 实验条件差异（确认是你有意设计的自变量）"
+        )
         lines.append(header)
         lines.append("")
         lines.append("| 项 | A | B | 性质 |")
@@ -657,11 +685,15 @@ def render_comparison(report: ComparisonReport) -> str:
             lines.append(f"| `{key}` | {values[0]} | {values[1]} | {kind} |")
         lines.append("")
         if report.hard_confounds:
-            lines.append("> 🔴 **两边不是同一个实验**：模型/温度/回放模式/任务集不同，"
-                         "下面的所有 delta **不能**读成「某个改动带来的效果」。")
+            lines.append(
+                "> 🔴 **两边不是同一个实验**：模型/温度/回放模式/任务集不同，"
+                "下面的所有 delta **不能**读成「某个改动带来的效果」。"
+            )
         else:
-            lines.append("> 🟡 这里只有自变量（加固/故障）不同 —— 这是合法的对照实验，"
-                         "但结论只能说「在这个自变量下」，**不能**说「代码变好/变差了」。")
+            lines.append(
+                "> 🟡 这里只有自变量（加固/故障）不同 —— 这是合法的对照实验，"
+                "但结论只能说「在这个自变量下」，**不能**说「代码变好/变差了」。"
+            )
         lines.append("")
 
     lines.append("### 总体")
@@ -709,12 +741,16 @@ def render_comparison(report: ComparisonReport) -> str:
             f"| {'⚠️ 是' if metric.heavy_tailed else '否'} |"
         )
     lines.append("")
-    lines.append("> 中位数远低于均值 + bootstrap 区间明显宽于 t 区间 = 分布重尾，"
-                 "**均值不是个好代表**，报告应该同时给中位数与 P95。")
+    lines.append(
+        "> 中位数远低于均值 + bootstrap 区间明显宽于 t 区间 = 分布重尾，"
+        "**均值不是个好代表**，报告应该同时给中位数与 P95。"
+    )
     lines.append("")
-    lines.append("> ⚠️ 共上方的 delta 还需要一个**噪声地板**才能解读："
-                 "`python -m lab bench noise-floor` 测出「同一配置跑两次能差多少」，"
-                 "小于它的 delta 不能用。")
+    lines.append(
+        "> ⚠️ 共上方的 delta 还需要一个**噪声地板**才能解读："
+        "`python -m lab bench noise-floor` 测出「同一配置跑两次能差多少」，"
+        "小于它的 delta 不能用。"
+    )
     lines.append("")
 
     lines.append("### 可信度与失败模式")
@@ -730,8 +766,10 @@ def render_comparison(report: ComparisonReport) -> str:
     lines.append("")
 
     if report.only_in_baseline or report.only_in_candidate:
-        lines.append(f"> 只在 A 里出现的任务: {report.only_in_baseline}；"
-                     f"只在 B 里出现的任务: {report.only_in_candidate}（这些不参与配对）")
+        lines.append(
+            f"> 只在 A 里出现的任务: {report.only_in_baseline}；"
+            f"只在 B 里出现的任务: {report.only_in_candidate}（这些不参与配对）"
+        )
         lines.append("")
 
     lines.append("### ⚠️ 混淆声明")

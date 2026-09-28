@@ -1,0 +1,195 @@
+key: ci_none_in_total
+group: ci
+# capability：新任务类，方差未知（见 test_ci_tasks_are_capability_not_regression）。
+purpose: capability
+title: CI 归因：合计把 None 当数字（一处聚合，两个调用方）
+tags: [ci-attribution, code-fix, aggregation, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}, ...]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数名。
+  注意：metrics 里**允许**有 None（表示缺失），上游不保证全是数字。
+selfcheck:
+  # 这份日志**必须**是真跑出来的：validate 会执行它并逐行比对（手编的会被抓住）。
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_all_numbers_are_summed ... PASSED
+      test_missing_value_is_skipped ... ERROR TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'
+      test_section_with_missing_value ... ERROR TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'
+      test_empty_input_is_zero ... PASSED
+      ---------------------------------------------
+      4 项：2 通过 / 2 失败
+  - path: /home/ubuntu/repo/stats.py
+    content: |
+      """报表用的聚合工具。"""
+
+
+      def total(values):
+          """把一组数字加起来。缺失值（None）应当被跳过。"""
+          # BUG: 直接把 values 交给 sum —— 只要有一个 None 就抛
+          # TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'。
+          # 注意它**不是每次都炸**：全数字的那条用例会通过。
+          return sum(values)
+  - path: /home/ubuntu/repo/report.py
+    content: |
+      """日报：把两个来源的指标合并成一行汇总。"""
+      from stats import total
+
+
+      def daily_sum(counters, gauges):
+          """日报的两个来源都必须计入汇总。"""
+          return total(list(counters) + list(gauges))
+  - path: /home/ubuntu/repo/dashboard.py
+    content: |
+      """看板：逐段汇总，缺值那段要能显示。"""
+      from stats import total
+
+
+      def section_sum(rows):
+          """看板的分段汇总（rows 里可能有缺失值）。"""
+          return total(rows)
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      import dashboard
+      import report
+      import stats
+
+
+      def test_all_numbers_are_summed():
+          actual = report.daily_sum([1, 2], [3])
+          return actual == 6, actual, 6
+
+      def test_missing_value_is_skipped():
+          actual = report.daily_sum([1, None], [3])
+          return actual == 4, actual, 4
+
+      def test_section_with_missing_value():
+          actual = dashboard.section_sum([5, None, None])
+          return actual == 5, actual, 5
+
+      def test_empty_input_is_zero():
+          actual = report.daily_sum([], [])
+          return actual == 0, actual, 0
+
+
+      CASES = [
+          ("test_all_numbers_are_summed", test_all_numbers_are_summed),
+          ("test_missing_value_is_skipped", test_missing_value_is_skipped),
+          ("test_section_with_missing_value", test_section_with_missing_value),
+          ("test_empty_input_is_zero", test_empty_input_is_zero),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # 执行型检查（最强）：脚本来自**任务定义**（不在工作区），Agent 改不了断言，
+  # 而且它真的跑一遍修完的代码 —— 症状级修复会在这里挂掉。
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 合计把 None 当数字（一处聚合，两个调用方）
+    script: |
+      from dashboard import section_sum
+      from report import daily_sum
+
+      problems = []
+      if daily_sum([1, 2], [3]) != 6:
+          problems.append(f"daily_sum(数字)={daily_sum([1, 2], [3])!r}")
+      if daily_sum([1, None], [3]) != 4:
+          problems.append(f"daily_sum(含 None)={daily_sum([1, None], [3])!r}")
+      if section_sum([5, None, None]) != 5:
+          problems.append(f"section_sum(含 None)={section_sum([5, None, None])!r}")
+      if section_sum([]) != 0:
+          problems.append(f"section_sum(空)={section_sum([])!r}")
+      if daily_sum([None], [None]) != 0:
+          problems.append(f"daily_sum(全 None)={daily_sum([None], [None])!r}")
+      if problems:
+          print("FAIL:", problems)
+          raise SystemExit(1)
+      print("OK: 缺失值被跳过，两个调用方都正确")
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "stats.py"
+    description: 归因里点名了真正有 bug 的模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "total"
+    description: 归因里点名了出问题的符号
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/stats.py
+    content: |
+      """报表用的聚合工具。"""
+
+
+      def total(values):
+          """把一组数字加起来。缺失值（None）被跳过。"""
+          return sum(value for value in values if value is not None)
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "stats.py", "symbol": "total", "why": "sum() 直接吃进 None 元素会抛 TypeError；metrics 里缺失值是合法数据，应当跳过而不是让整个报表崩掉"}]}
+wrong:
+  # 症状级错解：只在**调用点**打补丁，共享模块仍然是坏的 —— 必须被拒绝。
+  - kind: write_file
+    path: /home/ubuntu/repo/report.py
+    content: |
+      """日报：把两个来源的指标合并成一行汇总。"""
+      from stats import total
+
+
+      def daily_sum(counters, gauges):
+          """日报的两个来源都必须计入汇总。"""
+          # 症状级修复：在这里把 None 过滤掉，共享的 total() 仍然是坏的
+          merged = [value for value in list(counters) + list(gauges) if value is not None]
+          return total(merged)
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "report.py", "symbol": "?", "why": "只在调用点补回来的症状级修复"}]}
+notes: >-
+  **自动生成**（`lab/bench/tasks/ci/_capture_logs.py`）：`ci_log.txt` 是真跑 buggy 代码捕获的输出，所以 `selfcheck` 的真实性规则必然通过；手编日志会被 validate 抓住。
+  设计要点：同一处共享模块被**两个调用方**使用（dashboard.py、report.py、stats.py），
+  所以只在调用点打补丁的"症状级修复"会在另一个调用方上暴露；
+  另外还有一条日志里**没有**的边界用例（daily_sum([None], [None])）挡住过拟合。

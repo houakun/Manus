@@ -1,0 +1,204 @@
+key: ci_identity_cache
+group: ci
+# capability：新任务类，方差未知（见 test_ci_tasks_are_capability_not_regression）。
+purpose: capability
+title: CI 归因：用 is 比较整数（小整数碰巧对，大整数不对）
+tags: [ci-attribution, code-fix, identity, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}, ...]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数名。
+  注意：键来自 **反序列化** 的结果，不保证是同一个对象。
+selfcheck:
+  # 这份日志**必须**是真跑出来的：validate 会执行它并逐行比对（手编的会被抓住）。
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_small_key_hits ... PASSED
+      test_small_key_from_json_hits ... PASSED
+      test_large_key_from_json_hits ... FAILED
+          expected True，actual False
+      test_two_large_keys_are_evicted ... PASSED
+      ---------------------------------------------
+      4 项：3 通过 / 1 失败
+  - path: /home/ubuntu/repo/cache.py
+    content: |
+      """缓存键比较。"""
+
+
+      def key_hit(stored, incoming):
+          """两个键是否指向同一条缓存。"""
+          # BUG: 用 is 比较整数。CPython 只对 -5..256 的小整数做驻留，
+          # 所以小键"恰好"能命中、大键（来自反序列化，是新对象）不命中。
+          # 注意它不是每次都错：用例里的 7 和 100 会通过。
+          return stored is incoming
+  - path: /home/ubuntu/repo/store.py
+    content: |
+      """本地缓存。"""
+      import json
+
+      from cache import key_hit
+
+
+      def lookup(stored_key, payload):
+          """从序列化 payload 里恢复键并比较。"""
+          incoming = json.loads(payload)["key"]
+          return key_hit(stored_key, incoming)
+  - path: /home/ubuntu/repo/evict.py
+    content: |
+      """淘汰。"""
+      from cache import key_hit
+
+
+      def count_alive(keys, payload_keys):
+          """统计仍然存活的键。"""
+          return sum(1 for a, b in zip(keys, payload_keys) if key_hit(a, b))
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      import cache
+      import evict
+      import store
+
+
+      def test_small_key_hits():
+          actual = cache.key_hit(7, 7)
+          return actual == True, actual, True
+
+      def test_small_key_from_json_hits():
+          actual = store.lookup(100, '{"key": 100}')
+          return actual == True, actual, True
+
+      def test_large_key_from_json_hits():
+          actual = store.lookup(70000, '{"key": 70000}')
+          return actual == True, actual, True
+
+      def test_two_large_keys_are_evicted():
+          actual = evict.count_alive([70000], [70001])
+          return actual == 0, actual, 0
+
+
+      CASES = [
+          ("test_small_key_hits", test_small_key_hits),
+          ("test_small_key_from_json_hits", test_small_key_from_json_hits),
+          ("test_large_key_from_json_hits", test_large_key_from_json_hits),
+          ("test_two_large_keys_are_evicted", test_two_large_keys_are_evicted),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # 执行型检查（最强）：脚本来自**任务定义**（不在工作区），Agent 改不了断言，
+  # 而且它真的跑一遍修完的代码 —— 症状级修复会在这里挂掉。
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 用 is 比较整数（小整数碰巧对，大整数不对）
+    script: |
+      from cache import key_hit
+      from evict import count_alive
+      from store import lookup
+
+      problems = []
+      if key_hit(7, 7) is not True:
+          problems.append("key_hit(7, 7) 不是 True")
+      if lookup(100, '{"key": 100}') is not True:
+          problems.append("lookup(100) 不是 True")
+      if lookup(70000, '{"key": 70000}') is not True:
+          problems.append("lookup(70000) 不是 True（大整数不驻留）")
+      if lookup(70000, '{"key": 70001}') is not False:
+          problems.append("lookup(70001) 应为 False")
+      if count_alive([70000, 70001], [70000, 70001]) != 2:
+          problems.append(f"count_alive={count_alive([70000, 70001], [70000, 70001])!r}")
+      if problems:
+          print("FAIL:", problems)
+          raise SystemExit(1)
+      print("OK: 按值比较，大整数也能命中")
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "cache.py"
+    description: 归因里点名了真正有 bug 的模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "key_hit"
+    description: 归因里点名了出问题的符号
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/cache.py
+    content: |
+      """缓存键比较。"""
+
+
+      def key_hit(stored, incoming):
+          """两个键是否指向同一条缓存（按**值**比较）。"""
+          # 键可能是反序列化出来的新对象，identity 不成立 —— 必须比 value
+          return stored == incoming
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "cache.py", "symbol": "key_hit", "why": "小整数有驻留缓存（-5..256）所以 is 恰好为真，大整数不驻留 → 同一个值两个对象，命中判定随机失效"}]}
+wrong:
+  # 症状级错解：只在**调用点**打补丁，共享模块仍然是坏的 —— 必须被拒绝。
+  - kind: write_file
+    path: /home/ubuntu/repo/store.py
+    content: |
+      """本地缓存。"""
+      import json
+
+      from cache import key_hit
+
+
+      def lookup(stored_key, payload):
+          """从序列化 payload 里恢复键并比较。"""
+          incoming = json.loads(payload)["key"]
+          # 症状级修复：在这里把小/大整数都转成字符串再比（只在 store 绕过），
+          # 共享的 key_hit 仍然用 is
+          return key_hit(str(stored_key), str(incoming))
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "store.py", "symbol": "?", "why": "只在调用点补回来的症状级修复"}]}
+notes: >-
+  **自动生成**（`lab/bench/tasks/ci/_capture_logs.py`）：`ci_log.txt` 是真跑 buggy 代码捕获的输出，所以 `selfcheck` 的真实性规则必然通过；手编日志会被 validate 抓住。
+  设计要点：同一处共享模块被**两个调用方**使用（cache.py、evict.py、store.py），
+  所以只在调用点打补丁的"症状级修复"会在另一个调用方上暴露；
+  另外还有一条日志里**没有**的边界用例（lookup(70000, ...) 与 lookup(70001, ...) 必须区分）挡住过拟合。

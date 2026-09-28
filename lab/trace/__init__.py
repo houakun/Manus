@@ -8,4 +8,4 @@
 from lab.trace.span import Span, SpanHandle, SpanKind, SpanSink, TraceRecorder
 from lab.trace.store import SpanStore
 
-__all__ = ["Span", "SpanHandle", "SpanKind", "SpanSink", "TraceRecorder", "SpanStore"]
+__all__ = ["Span", "SpanHandle", "SpanKind", "SpanSink", "SpanStore", "TraceRecorder"]

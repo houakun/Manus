@@ -1,0 +1,199 @@
+key: ci_range_boundary
+group: ci
+# capability：新任务类，方差未知（见 test_ci_tasks_are_capability_not_regression）。
+purpose: capability
+title: CI 归因：编号区间漏掉上界（range 少一）
+tags: [ci-attribution, code-fix, boundary, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}, ...]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数名。
+  注意：接口文档写的是**闭区间**（含首尾）。
+selfcheck:
+  # 这份日志**必须**是真跑出来的：validate 会执行它并逐行比对（手编的会被抓住）。
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_single_id_is_issued ... FAILED
+          expected [7]，actual []
+      test_two_ids_are_issued ... FAILED
+          expected [3, 4]，actual [3]
+      test_full_block_is_issued ... FAILED
+          expected [10, 11, 12, 13]，actual [10, 11, 12]
+      test_audit_counts_inclusive ... FAILED
+          expected 5，actual 4
+      ---------------------------------------------
+      4 项：0 通过 / 4 失败
+  - path: /home/ubuntu/repo/ids.py
+    content: |
+      """编号区间生成。"""
+
+
+      def id_range(first, last):
+          """生成 [first, last] 的编号（**闭区间**）。"""
+          # BUG: range 的上界是开区间，漏掉了 last。
+          # 注意它不是每次都错：first==last 时两边都只差一个，
+          # 而调用方 batch() 恰好会过滤空结果，所以"单个编号"那条能过。
+          return list(range(first, last))
+  - path: /home/ubuntu/repo/batch.py
+    content: |
+      """发号器。"""
+      from ids import id_range
+
+
+      def issue(first, last):
+          """发一批编号（含首尾）。"""
+          return id_range(first, last)
+  - path: /home/ubuntu/repo/audit.py
+    content: |
+      """审计：把整段编号标记为已用。"""
+      from ids import id_range
+
+
+      def mark_used(first, last):
+          """标记 [first, last] 全部已用。"""
+          return len(id_range(first, last))
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      import audit
+      import batch
+      import ids
+
+
+      def test_single_id_is_issued():
+          actual = batch.issue(7, 7)
+          return actual == [7], actual, [7]
+
+      def test_two_ids_are_issued():
+          actual = batch.issue(3, 4)
+          return actual == [3, 4], actual, [3, 4]
+
+      def test_full_block_is_issued():
+          actual = batch.issue(10, 13)
+          return actual == [10, 11, 12, 13], actual, [10, 11, 12, 13]
+
+      def test_audit_counts_inclusive():
+          actual = audit.mark_used(1, 5)
+          return actual == 5, actual, 5
+
+
+      CASES = [
+          ("test_single_id_is_issued", test_single_id_is_issued),
+          ("test_two_ids_are_issued", test_two_ids_are_issued),
+          ("test_full_block_is_issued", test_full_block_is_issued),
+          ("test_audit_counts_inclusive", test_audit_counts_inclusive),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # 执行型检查（最强）：脚本来自**任务定义**（不在工作区），Agent 改不了断言，
+  # 而且它真的跑一遍修完的代码 —— 症状级修复会在这里挂掉。
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 编号区间漏掉上界（range 少一）
+    script: |
+      from audit import mark_used
+      from batch import issue
+
+      problems = []
+      for first, last, expected in ((7, 7, [7]), (3, 4, [3, 4]), (10, 13, [10, 11, 12, 13])):
+          actual = issue(first, last)
+          if actual != expected:
+              problems.append(f"issue({first}, {last})={actual!r}")
+      if mark_used(1, 5) != 5:
+          problems.append(f"mark_used(1, 5)={mark_used(1, 5)!r}")
+      if mark_used(4, 4) != 1:
+          problems.append(f"mark_used(4, 4)={mark_used(4, 4)!r}")
+      if problems:
+          print("FAIL:", problems)
+          raise SystemExit(1)
+      print("OK: 闭区间在两个调用方都正确")
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "ids.py"
+    description: 归因里点名了真正有 bug 的模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "id_range"
+    description: 归因里点名了出问题的符号
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/ids.py
+    content: |
+      """编号区间生成。"""
+
+
+      def id_range(first, last):
+          """生成 [first, last] 的编号（闭区间）。"""
+          return list(range(first, last + 1))
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "ids.py", "symbol": "id_range", "why": "range(1, last) 不含 last：调用方以为包含上界，于是最后一个编号永远发不出去"}]}
+wrong:
+  # 症状级错解：只在**调用点**打补丁，共享模块仍然是坏的 —— 必须被拒绝。
+  - kind: write_file
+    path: /home/ubuntu/repo/batch.py
+    content: |
+      """发号器。"""
+      from ids import id_range
+
+
+      def issue(first, last):
+          """发一批编号（含首尾）。"""
+          # 症状级修复：只在发号器里把 last 补回来，共享的 id_range 仍然漏上界
+          result = id_range(first, last)
+          if last not in result:
+              result.append(last)
+          return result
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "batch.py", "symbol": "?", "why": "只在调用点补回来的症状级修复"}]}
+notes: >-
+  **自动生成**（`lab/bench/tasks/ci/_capture_logs.py`）：`ci_log.txt` 是真跑 buggy 代码捕获的输出，所以 `selfcheck` 的真实性规则必然通过；手编日志会被 validate 抓住。
+  设计要点：同一处共享模块被**两个调用方**使用（audit.py、batch.py、ids.py），
+  所以只在调用点打补丁的"症状级修复"会在另一个调用方上暴露；
+  另外还有一条日志里**没有**的边界用例（mark_used(4, 4)）挡住过拟合。

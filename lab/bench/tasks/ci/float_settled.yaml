@@ -1,0 +1,207 @@
+key: ci_float_settled
+group: ci
+# capability：新任务类，方差未知（见 test_ci_tasks_are_capability_not_regression）。
+purpose: capability
+title: CI 归因：浮点等值判断（0.1+0.2-0.3 不等于 0）
+tags: [ci-attribution, code-fix, float, exec]
+goal: >-
+  /home/ubuntu/ci_log.txt 是最近一次 CI 的失败输出。代码在 /home/ubuntu/repo/ 下，
+  测试在 /home/ubuntu/repo/tests/ 下（**测试文件由 CI 提供，不得修改、不得删除**）。
+  请定位失败的根本原因并修好代码，使 `python repo/tests/run_tests.py`
+  （工作目录 /home/ubuntu）退出码为 0；然后把归因写入 /home/ubuntu/diagnosis.json，
+  格式为 {"root_causes": [{"file": "...", "symbol": "...", "why": "..."}, ...]}，
+  file 用相对 /home/ubuntu/repo/ 的路径，symbol 填出问题的函数名。
+  注意：金额来自多步加减，**不要**假设二进制里能精确表示。
+selfcheck:
+  # 这份日志**必须**是真跑出来的：validate 会执行它并逐行比对（手编的会被抓住）。
+  command: python repo/tests/run_tests.py
+  expect_exit: 1
+  output_recorded_in: /home/ubuntu/ci_log.txt
+fixtures:
+  - path: /home/ubuntu/ci_log.txt
+    content: |
+      $ python tests/run_tests.py
+      test_integer_zero_is_settled ... PASSED
+      test_float_residue_is_settled ... FAILED
+          expected 'settled'，actual 'open'
+      test_small_residue_is_settled ... FAILED
+          expected 'settled'，actual 'open'
+      test_reconcile_counts_residue_rows ... FAILED
+          expected 2，actual 1
+      test_nonzero_is_open ... PASSED
+      ---------------------------------------------
+      5 项：2 通过 / 3 失败
+  - path: /home/ubuntu/repo/money.py
+    content: |
+      """金额工具。"""
+
+
+      def is_settled(balance):
+          """余额是否为 0（已结清）。"""
+          # BUG: 浮点等值比较。0.1 + 0.2 - 0.3 在二进制里不等于 0，
+          # 于是"理论上已结清"的账永远结不了。
+          # 注意它不是每次都错：整数金额那条会通过。
+          return balance == 0
+  - path: /home/ubuntu/repo/ledger.py
+    content: |
+      """账单。"""
+      from money import is_settled
+
+
+      def account_status(balance):
+          """账户状态。"""
+          return "settled" if is_settled(balance) else "open"
+  - path: /home/ubuntu/repo/reconcile.py
+    content: |
+      """对账。"""
+      from money import is_settled
+
+
+      def rows_to_close(rows):
+          """统计已结清的笔数。"""
+          return sum(1 for row in rows if is_settled(row))
+  - path: /home/ubuntu/repo/tests/run_tests.py
+    content: |
+      # CI-FROZEN: 本文件由 CI 提供，不得修改
+      """最小的测试运行器（不依赖 pytest，只用标准库）。"""
+      import pathlib
+      import sys
+
+      sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+      import ledger
+      import money
+      import reconcile
+
+
+      def test_integer_zero_is_settled():
+          actual = ledger.account_status(0)
+          return actual == 'settled', actual, 'settled'
+
+      def test_float_residue_is_settled():
+          actual = ledger.account_status(0.1 + 0.2 - 0.3)
+          return actual == 'settled', actual, 'settled'
+
+      def test_small_residue_is_settled():
+          actual = ledger.account_status(1e-12)
+          return actual == 'settled', actual, 'settled'
+
+      def test_reconcile_counts_residue_rows():
+          actual = reconcile.rows_to_close([0, 0.1 + 0.2 - 0.3])
+          return actual == 2, actual, 2
+
+      def test_nonzero_is_open():
+          actual = ledger.account_status(0.5)
+          return actual == 'open', actual, 'open'
+
+
+      CASES = [
+          ("test_integer_zero_is_settled", test_integer_zero_is_settled),
+          ("test_float_residue_is_settled", test_float_residue_is_settled),
+          ("test_small_residue_is_settled", test_small_residue_is_settled),
+          ("test_reconcile_counts_residue_rows", test_reconcile_counts_residue_rows),
+          ("test_nonzero_is_open", test_nonzero_is_open),
+      ]
+
+
+      def main():
+          failed = 0
+          for name, fn in CASES:
+              try:
+                  ok, actual, expected = fn()
+              except Exception as exc:  # noqa: BLE001
+                  print(f"{name} ... ERROR {type(exc).__name__}: {exc}")
+                  failed += 1
+                  continue
+              if ok:
+                  print(f"{name} ... PASSED")
+              else:
+                  print(f"{name} ... FAILED")
+                  print(f"    expected {expected!r}，actual {actual!r}")
+                  failed += 1
+          print("-" * 45)
+          print(f"{len(CASES)} 项：{len(CASES) - failed} 通过 / {failed} 失败")
+          return 1 if failed else 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+verify:
+  # 执行型检查（最强）：脚本来自**任务定义**（不在工作区），Agent 改不了断言，
+  # 而且它真的跑一遍修完的代码 —— 症状级修复会在这里挂掉。
+  - kind: exec_script
+    script_cwd: /home/ubuntu/repo
+    description: 浮点等值判断（0.1+0.2-0.3 不等于 0）
+    script: |
+      from ledger import account_status
+      from reconcile import rows_to_close
+
+      problems = []
+      if account_status(0) != "settled":
+          problems.append(f"account_status(0)={account_status(0)!r}")
+      if account_status(0.1 + 0.2 - 0.3) != "settled":
+          problems.append(f"account_status(残差)={account_status(0.1 + 0.2 - 0.3)!r}")
+      if account_status(1e-12) != "settled":
+          problems.append(f"account_status(1e-12)={account_status(1e-12)!r}")
+      if account_status(0.5) != "open":
+          problems.append(f"account_status(0.5)={account_status(0.5)!r}")
+      if rows_to_close([0, 0.1 + 0.2 - 0.3, 0.5]) != 2:
+          problems.append(f"rows_to_close={rows_to_close([0, 0.1 + 0.2 - 0.3, 0.5])!r}")
+      if problems:
+          print("FAIL:", problems)
+          raise SystemExit(1)
+      print("OK: 浮点按容差比较，两个调用方都正确")
+  - kind: file_content
+    path: /home/ubuntu/repo/tests/run_tests.py
+    contains: "# CI-FROZEN"
+    description: CI 提供的测试运行器未被删除或整体覆盖
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "money.py"
+    description: 归因里点名了真正有 bug 的模块
+  - kind: file_content
+    path: /home/ubuntu/diagnosis.json
+    contains: "is_settled"
+    description: 归因里点名了出问题的符号
+process:
+  max_tool_calls: 40
+solution:
+  - kind: write_file
+    path: /home/ubuntu/repo/money.py
+    content: |
+      """金额工具。"""
+
+      # 容差取 1e-9：比金额的最小单位（分）小 7 个量级，
+      # 既能吃掉二进制误差，又不会把真正未结清的账判成已结清。
+      TOLERANCE = 1e-9
+
+
+      def is_settled(balance):
+          """余额是否为 0（已结清，按容差比较）。"""
+          return abs(balance) < TOLERANCE
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "money.py", "symbol": "is_settled", "why": "浮点寄存器误差让 0.1+0.2-0.3 != 0，等值比较永远判不出'已结清'；应当按容差比较（或换算成分）"}]}
+wrong:
+  # 症状级错解：只在**调用点**打补丁，共享模块仍然是坏的 —— 必须被拒绝。
+  - kind: write_file
+    path: /home/ubuntu/repo/ledger.py
+    content: |
+      """账单。"""
+      from money import is_settled
+
+
+      def account_status(balance):
+          """账户状态。"""
+          # 症状级修复：只在账单这一处四舍五入到分，共享的 is_settled 仍然用等值比较
+          return "settled" if is_settled(round(balance, 2)) else "open"
+  - kind: write_file
+    path: /home/ubuntu/diagnosis.json
+    content: |
+      {"root_causes": [{"file": "ledger.py", "symbol": "?", "why": "只在调用点补回来的症状级修复"}]}
+notes: >-
+  **自动生成**（`lab/bench/tasks/ci/_capture_logs.py`）：`ci_log.txt` 是真跑 buggy 代码捕获的输出，所以 `selfcheck` 的真实性规则必然通过；手编日志会被 validate 抓住。
+  设计要点：同一处共享模块被**两个调用方**使用（ledger.py、money.py、reconcile.py），
+  所以只在调用点打补丁的"症状级修复"会在另一个调用方上暴露；
+  另外还有一条日志里**没有**的边界用例（account_status(0.5) 仍须是 open）挡住过拟合。

@@ -35,6 +35,7 @@ def sandbox(tmp_path: Path) -> LocalSandbox:
 
 # ==================== 1. 路径映射 ====================
 
+
 @pytest.mark.asyncio
 async def test_absolute_path_maps_into_workspace_and_returns_logical_path(sandbox: LocalSandbox):
     """绝对路径要落到 workspace 内，且返回给模型的是逻辑路径。"""
@@ -70,6 +71,7 @@ async def test_windows_style_path_is_normalised(sandbox: LocalSandbox):
 
 # ==================== 2. 目录穿越防护 ====================
 
+
 @pytest.mark.parametrize(
     "evil_path",
     [
@@ -99,6 +101,7 @@ async def test_to_local_raises_directly_for_internal_callers(sandbox: LocalSandb
 
 
 # ==================== 3. 文件能力 ====================
+
 
 @pytest.mark.asyncio
 async def test_append_is_non_idempotent(sandbox: LocalSandbox):
@@ -153,6 +156,7 @@ async def test_read_missing_file_and_truncation(sandbox: LocalSandbox):
 
 # ==================== 4. Shell 能力 ====================
 
+
 @pytest.mark.asyncio
 async def test_exec_command_returns_output_and_returncode(sandbox: LocalSandbox):
     result = await sandbox.exec_command("s1", "/home/ubuntu", f'"{sys.executable}" -c "print(6*7)"')
@@ -182,9 +186,7 @@ async def test_command_timeout_is_enforced(sandbox: LocalSandbox):
 
     sandbox._exec_timeout = 2
     started = time.monotonic()
-    result = await sandbox.exec_command(
-        "s3", "/home/ubuntu", f'"{sys.executable}" -c "import time;time.sleep(60)"'
-    )
+    result = await sandbox.exec_command("s3", "/home/ubuntu", f'"{sys.executable}" -c "import time;time.sleep(60)"')
     elapsed = time.monotonic() - started
 
     assert result.success is False
@@ -201,9 +203,7 @@ async def test_command_timeout_is_enforced(sandbox: LocalSandbox):
 async def test_shell_path_rewriting(sandbox: LocalSandbox):
     """命令里的沙箱逻辑路径要被改写成真实路径，否则脚本路径根本找不到。"""
     await sandbox.write_file("/home/ubuntu/who.py", "print('rewritten-ok')")
-    result = await sandbox.exec_command(
-        "s4", "/home/ubuntu", f'"{sys.executable}" /home/ubuntu/who.py'
-    )
+    result = await sandbox.exec_command("s4", "/home/ubuntu", f'"{sys.executable}" /home/ubuntu/who.py')
 
     assert result.data["returncode"] == 0
     assert "rewritten-ok" in result.data["output"]
@@ -218,6 +218,7 @@ async def test_unsupported_interactive_shell_reports_failure(sandbox: LocalSandb
 
 
 # ==================== 5. 子进程环境隔离（安全 + 正确性） ====================
+
 
 @pytest.mark.asyncio
 async def test_child_env_does_not_leak_host_variables(sandbox: LocalSandbox, monkeypatch):
@@ -246,14 +247,14 @@ async def test_child_env_strips_python_home_pollution(sandbox: LocalSandbox, mon
     """
     monkeypatch.setenv("PYTHONHOME", "/nonexistent/python/home")
 
-    result = await sandbox.exec_command(
-        "s7", "/home/ubuntu", f'"{sys.executable}" -c "print(\'clean\')"'
-    )
+    result = await sandbox.exec_command("s7", "/home/ubuntu", f'"{sys.executable}" -c "print(\'clean\')"')
 
     assert result.data["returncode"] == 0
     assert "clean" in result.data["output"]
 
-    env_dump = (await sandbox.exec_command("s8", "/home/ubuntu", "set" if sys.platform == "win32" else "env")).data["output"]
+    env_dump = (await sandbox.exec_command("s8", "/home/ubuntu", "set" if sys.platform == "win32" else "env")).data[
+        "output"
+    ]
     assert "PYTHONHOME" not in env_dump
 
 
@@ -267,6 +268,7 @@ async def test_extra_env_is_opt_in(sandbox: LocalSandbox):
 
 # ==================== 6. 脚本逃逸检测（安全 + 正确性） ====================
 
+
 @pytest.mark.asyncio
 async def test_detects_script_writing_outside_workspace(tmp_path: Path, monkeypatch):
     """**关掉虚拟盘**时，脚本里的绝对路径仍会落到工作区外 —— 那种情况必须被检测到。
@@ -279,7 +281,7 @@ async def test_detects_script_writing_outside_workspace(tmp_path: Path, monkeypa
     这是 fast mode 的真实缺陷（不是假设）：路径映射只作用于文件工具与命令行，
     管不到脚本内容。实测在一次真实的 `sem_refactor_config` 运行里，
     Agent 把文件写到了 `D:/home/ubuntu/parts/part_000...`（用正斜杠写路径，
-    因为 Windows 风格的反斜杠在这个 docstring 里会被 Python 当成转义序列 —— 
+    因为 Windows 风格的反斜杠在这个 docstring 里会被 Python 当成转义序列 ——
     这就是为什么本仓库的脚本内容里一律用 chr(10)/chr(47) 拼字符）。
     """
     monkeypatch.setenv("LAB_SANDBOX_VIRTUAL_DRIVE", "0")
@@ -298,7 +300,8 @@ async def test_detects_script_writing_outside_workspace(tmp_path: Path, monkeypa
 
     # 用 chr() 拼出绝对路径：避免测试代码本身被多层转义搞错
     code = (
-        "import pathlib; p=" + "+".join(f"chr({ord(c)})" for c in "/home/ubuntu/_esc_probe.txt")
+        "import pathlib; p="
+        + "+".join(f"chr({ord(c)})" for c in "/home/ubuntu/_esc_probe.txt")
         + "; pathlib.Path(p).write_text(chr(120))"
     )
     result = await sandbox.exec_command("esc", "/home/ubuntu", f'python -c "{code}"')
@@ -345,6 +348,7 @@ async def test_escape_detection_reports_delta_not_existence(sandbox: LocalSandbo
 # 目标环境（Ubuntu）不会有这两个现象，所以这里的测试同时是**保真性**测试：
 # "本地 fast mode 的输出看起来应当像 Ubuntu 的输出"。
 
+
 def test_output_normalises_crlf_to_lf():
     """CRLF 必须归一成 LF —— 否则模型会去修一个由本地实现造出来的问题。"""
     from lab.infra.local_sandbox import decode_command_output
@@ -358,15 +362,14 @@ def test_output_preserves_in_line_carriage_return():
     """行内的 `\r` 是进度条刷新（`\rProgress 50%`），有真实含义，不能一并删掉。"""
     from lab.infra.local_sandbox import decode_command_output
 
-    assert decode_command_output(b"Progress 10%\rProgress 90%\ndone\n") == \
-        "Progress 10%\rProgress 90%\ndone\n"
+    assert decode_command_output(b"Progress 10%\rProgress 90%\ndone\n") == "Progress 10%\rProgress 90%\ndone\n"
 
 
 def test_output_decodes_utf8_first():
     """Python 子进程的输出是 UTF-8（_build_child_env 固定的），必须原样读出中文。"""
     from lab.infra.local_sandbox import decode_command_output
 
-    raw = "写入成功: /home/ubuntu/a.txt\n".encode("utf-8")
+    raw = "写入成功: /home/ubuntu/a.txt\n".encode()
     assert decode_command_output(raw) == "写入成功: /home/ubuntu/a.txt\n"
 
 
@@ -392,7 +395,7 @@ def test_output_handles_mixed_encodings_in_one_stream():
     """
     from lab.infra.local_sandbox import decode_command_output
 
-    raw = "中文输出正常\n".encode("utf-8") + "'foo' 不是内部或外部命令\r\n".encode("cp936")
+    raw = "中文输出正常\n".encode() + "'foo' 不是内部或外部命令\r\n".encode("cp936")
     decoded = decode_command_output(raw)
     assert "中文输出正常" in decoded
     assert "不是内部或外部命令" in decoded
@@ -405,9 +408,7 @@ async def test_real_command_output_has_no_crlf(sandbox: LocalSandbox):
 
     这是"接线"测试 —— 解码函数写得再对，忘了在 exec_command 里调用就一点用没有。
     """
-    result = await sandbox.exec_command(
-        "crlf1", "/home/ubuntu", f'"{sys.executable}" -c "print(1);print(2)"'
-    )
+    result = await sandbox.exec_command("crlf1", "/home/ubuntu", f'"{sys.executable}" -c "print(1);print(2)"')
 
     output = result.data["output"]
     assert "\r" not in output, f"输出里仍有 \r: {output!r}"
@@ -421,9 +422,7 @@ async def test_failed_command_error_text_is_readable(sandbox: LocalSandbox):
     注意：不同 shell 的报错文案不同（cmd.exe / bash），所以这里只断言
     "没有替换字符"，不断言具体措辞 —— 断言文案会把测试绑死在 Windows 上。
     """
-    result = await sandbox.exec_command(
-        "bad1", "/home/ubuntu", "this_command_definitely_does_not_exist_zzz"
-    )
+    result = await sandbox.exec_command("bad1", "/home/ubuntu", "this_command_definitely_does_not_exist_zzz")
 
     output = result.data["output"]
     assert "\ufffd" not in output, f"报错里有乱码: {output!r}"
@@ -434,6 +433,7 @@ async def test_failed_command_error_text_is_readable(sandbox: LocalSandbox):
 #
 # 这两个装置的存在理由都是**实测**出来的（见 docs/noise-floor-measured.md）：
 # 噪声地板 ±24% 里有一大块不是模型抖动，而是本地实现的失真。
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="虚拟盘符是 Windows 机制")
 @pytest.mark.asyncio

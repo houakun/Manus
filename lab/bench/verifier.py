@@ -28,7 +28,7 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from lab.bench.task import BenchTask, VerifyCheck  # noqa: E402
+from lab.bench.task import BenchTask, VerifyCheck
 
 # 命令行总长安全线（Windows 上封顶 ~8191）。超过就让任务作者把脚本写短，
 # 而不是静默截断 —— 截出来的判定器要么永远通过、要么永远失败。
@@ -47,6 +47,7 @@ class CheckResult(BaseModel):
 
 
 # ==================== 归一化 ====================
+
 
 def normalize_text(text: str, mode: str) -> str:
     """按声明的方式归一化文本。"""
@@ -94,6 +95,7 @@ def _parse_csv(text: str) -> List[List[str]]:
 
 # ==================== 单条检查 ====================
 
+
 def _exec_script_command(script: str) -> str:
     """把检查脚本编成一行命令（base64 + `-c`）。
 
@@ -102,10 +104,7 @@ def _exec_script_command(script: str) -> str:
     否则就会在 Linux/CI 上碎掉、而我本机（Windows）看不出来 —— 真实踩过。
     """
     payload = base64.urlsafe_b64encode(script.encode("utf-8")).decode("ascii")
-    return (
-        f'"{sys.executable}" -c '
-        f'"import base64;exec(base64.urlsafe_b64decode(\'{payload}\').decode(\'utf-8\'))"'
-    )
+    return f"\"{sys.executable}\" -c \"import base64;exec(base64.urlsafe_b64decode('{payload}').decode('utf-8'))\""
 
 
 async def _run_exec_script(check: VerifyCheck, sandbox: Any) -> "CheckResult":
@@ -152,9 +151,12 @@ async def _run_exec_script(check: VerifyCheck, sandbox: Any) -> "CheckResult":
     label = check.description or "执行型检查"
     if len(command) > _EXEC_SCRIPT_COMMAND_LIMIT:
         return CheckResult(
-            kind=check.kind, ok=False,
-            detail=(f"{label}: 检查脚本过长（命令行 {len(command)} 字符 > "
-                    f"{_EXEC_SCRIPT_COMMAND_LIMIT}）—— 请把 script 写短（参考解一般几十行就够）"),
+            kind=check.kind,
+            ok=False,
+            detail=(
+                f"{label}: 检查脚本过长（命令行 {len(command)} 字符 > "
+                f"{_EXEC_SCRIPT_COMMAND_LIMIT}）—— 请把 script 写短（参考解一般几十行就够）"
+            ),
         )
 
     # 不变式（可测）：命令里不可能出现会被路径映射改写的片段。
@@ -162,7 +164,7 @@ async def _run_exec_script(check: VerifyCheck, sandbox: Any) -> "CheckResult":
     assert "/tmp" not in command and "/home/ubuntu" not in command, "命令里出现了会被改写的路径"
 
     result = await sandbox.exec_command(
-        session_id=f"verify-{hashlib.sha1(payload.encode()).hexdigest()[:10]}",
+        session_id=f"verify-{hashlib.sha256(payload.encode()).hexdigest()[:10]}",
         exec_dir=check.script_cwd or sandbox.SANDBOX_HOME,
         command=command,
     )
@@ -192,7 +194,8 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
         result = await sandbox.check_file_exists(check.path)
         actual = bool((_as_dict(result.data) or {}).get("exists"))
         return CheckResult(
-            kind=check.kind, ok=(actual == expected),
+            kind=check.kind,
+            ok=(actual == expected),
             detail=f"{label}: {check.path} 期望存在={expected}，实际={actual}",
         )
 
@@ -202,7 +205,8 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
         files = (_as_dict(result.data) or {}).get("files") or []
         expected = check.count if check.count is not None else 0
         return CheckResult(
-            kind=check.kind, ok=(len(files) == expected),
+            kind=check.kind,
+            ok=(len(files) == expected),
             detail=f"{label}: {check.path} 期望 {expected} 个文件，实际 {len(files)} 个 {files[:5]}",
         )
 
@@ -212,7 +216,8 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
         allow = set(check.allow or [])
         extra = [f for f in files if f.split("/")[-1] not in allow]
         return CheckResult(
-            kind=check.kind, ok=(not extra),
+            kind=check.kind,
+            ok=(not extra),
             detail=f"{label}: 期望只有 {sorted(allow)}，多出 {extra}",
         )
 
@@ -226,23 +231,27 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
         if check.equals is not None:
             expected = normalize_text(check.equals, check.normalize)
             return CheckResult(
-                kind=check.kind, ok=(normalized == expected),
+                kind=check.kind,
+                ok=(normalized == expected),
                 detail=f"{label}: 期望 {expected!r}，实际 {normalized[:120]!r}",
             )
         if check.contains is not None:
             return CheckResult(
-                kind=check.kind, ok=(check.contains in text),
+                kind=check.kind,
+                ok=(check.contains in text),
                 detail=f"{label}: 期望包含 {check.contains!r}",
             )
         if check.not_contains is not None:
             return CheckResult(
-                kind=check.kind, ok=(check.not_contains not in text),
+                kind=check.kind,
+                ok=(check.not_contains not in text),
                 detail=f"{label}: 期望**不**包含 {check.not_contains!r}",
             )
         if check.matches is not None:
             found = re.search(check.matches, text, re.MULTILINE)
             return CheckResult(
-                kind=check.kind, ok=bool(found),
+                kind=check.kind,
+                ok=bool(found),
                 detail=f"{label}: 期望匹配 /{check.matches}/，实际 {text[:120]!r}",
             )
         return CheckResult(kind=check.kind, ok=False, detail=f"{label}: 检查定义不完整")
@@ -253,10 +262,28 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
             actual = float(normalize_text(text, check.normalize).split()[0])
         except (ValueError, IndexError):
             return CheckResult(kind=check.kind, ok=False, detail=f"{label}: 无法解析出数字，实际 {text[:80]!r}")
-        expected = float(check.value)
+        if check.value is None:
+            # 任务定义缺 value —— 这是**任务集的问题**，要说清楚；
+            # 否则 `float(None)` 抛 TypeError 被外层兜成"判定器出错"，
+            # 报错方向就错了（人会去查判定器，而实际上要改 YAML）。
+            return CheckResult(
+                kind=check.kind,
+                ok=False,
+                detail=f"{label}: 任务定义缺少 value（numeric 检查必须给期望值）",
+            )
+        try:
+            expected = float(check.value)
+        except (TypeError, ValueError):
+            # YAML 里写了非数字（例如字符串）—— 同样是"任务定义的问题"
+            return CheckResult(
+                kind=check.kind,
+                ok=False,
+                detail=f"{label}: 任务定义的 value 不是数字: {check.value!r}",
+            )
         ok = abs(actual - expected) <= check.tolerance
         return CheckResult(
-            kind=check.kind, ok=ok,
+            kind=check.kind,
+            ok=ok,
             detail=f"{label}: 期望 {expected}（容差 {check.tolerance}），实际 {actual}",
         )
 
@@ -266,13 +293,22 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
             actual_json = json.loads(text)
         except json.JSONDecodeError as e:
             return CheckResult(kind=check.kind, ok=False, detail=f"{label}: 不是合法 JSON: {e}")
+        if check.equals is None:
+            # 同上：缺字段要报"任务定义的问题"。注意 `json.loads(None)` 抛的是
+            # TypeError 而不是 JSONDecodeError，所以下面那个 except 抳不住它。
+            return CheckResult(
+                kind=check.kind,
+                ok=False,
+                detail=f"{label}: 任务定义缺少 equals（json_equals 检查必须给期望值）",
+            )
         try:
             expected_json = json.loads(check.equals)
         except json.JSONDecodeError as e:
             return CheckResult(kind=check.kind, ok=False, detail=f"{label}: 检查定义里的期望值不是合法 JSON: {e}")
         ok = actual_json == expected_json
         return CheckResult(
-            kind=check.kind, ok=ok,
+            kind=check.kind,
+            ok=ok,
             detail=f"{label}: 期望 {expected_json}，实际 {actual_json}",
         )
 
@@ -282,9 +318,10 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
         expected_rows = [[str(c).strip() for c in row] for row in (check.rows or [])]
         ok = actual_rows == expected_rows
         return CheckResult(
-            kind=check.kind, ok=ok,
+            kind=check.kind,
+            ok=ok,
             detail=f"{label}: 期望 {len(expected_rows)} 行，实际 {len(actual_rows)} 行"
-                   + ("" if ok else f"；首个差异: 期望 {expected_rows[:2]} 实际 {actual_rows[:2]}"),
+            + ("" if ok else f"；首个差异: 期望 {expected_rows[:2]} 实际 {actual_rows[:2]}"),
         )
 
     # --- 行数 ---
@@ -292,7 +329,8 @@ async def run_check(check: VerifyCheck, sandbox: Any) -> CheckResult:
         lines = [line for line in text.splitlines() if line.strip()]
         ok = len(lines) == (check.count or 0)
         return CheckResult(
-            kind=check.kind, ok=ok,
+            kind=check.kind,
+            ok=ok,
             detail=f"{label}: 期望 {check.count} 行，实际 {len(lines)} 行",
         )
 
@@ -312,14 +350,18 @@ async def run_checks(checks: List[VerifyCheck], sandbox: Any) -> List[CheckResul
         except Exception as exc:  # noqa: BLE001
             # 判定器自己的异常必须被记成"失败"而不是让 harness 崩掉 ——
             # 但 detail 里要说清是判定器出错，避免被误读成任务失败
-            results.append(CheckResult(
-                kind=check.kind, ok=False,
-                detail=f"{check.description or check.kind}: 判定器异常 {type(exc).__name__}: {exc}",
-            ))
+            results.append(
+                CheckResult(
+                    kind=check.kind,
+                    ok=False,
+                    detail=f"{check.description or check.kind}: 判定器异常 {type(exc).__name__}: {exc}",
+                )
+            )
     return results
 
 
 # ==================== 过程规则 ====================
+
 
 def evaluate_process(task: BenchTask, result: Any) -> List[str]:
     """评估过程规则，返回**警告 flag 列表**。

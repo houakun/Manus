@@ -42,7 +42,7 @@ python -m lab trace
 
 | 问题 | 用什么回答 |
 |---|---|
-| 它做得对吗？ | 22 个确定性任务（含 2 个 CI 失败归因）+ 纯函数判定器（不看 Agent 自述） |
+| 它做得对吗？ | 28 个确定性任务（12 synthetic / 8 semireal / 8 CI 失败归因）+ 纯函数判定器（不看 Agent 自述） |
 | 它每次都能做对吗？ | `pass^k`（任务级 k 次全对）+ Wilson/bootstrap 区间 |
 | 钱和时间花在哪了？ | span 级轨迹（task/step/tool/llm 四级）+ 成本归因 |
 | 坏了怎么修？ | 10 类故障注入 + 加固中间件 + 对照实验开关 |
@@ -58,7 +58,9 @@ python -m lab trace
 | `lab trace [task_id]` | 轨迹树 + 汇总（支持短 id） | 免费 |
 | `lab stats` | 跨运行聚合指标 | 免费 |
 | `lab replay stats` | 缓存内容 + **服务端非确定性**比例（同一请求给过几种回答） | 免费 |
-| `lab bench validate` | **任务集三步自检 + 同义反复检测** | 免费 |
+| `lab bench validate` | **任务集三步自检 + 同义反复检测 + 歧义 lint** | 免费 |
+| `lab bench tasks [--group ci]` | 列出任务集（分组 / purpose / 判定项） | 免费 |
+| `lab bench purpose-audit` | **标签 vs 实测对账**：`regression` 任务出现干净失败就告警 | 免费 |
 | `lab bench run --runs 5` | 跑评测（成本预估 / 增量落库 / per-task 分位数阈值） | 💰 |
 | `lab bench run --replay record` | 录制一次真跑（顺带测出服务端非确定性） | 💰 |
 | `lab bench run --ab-guard none --ab-guard all` | **交错 A/B**：同一次评测内两臂交替跑 | 💰 |
@@ -68,7 +70,11 @@ python -m lab trace
 | `lab bench pareto` | 成功率 vs 成本的 Pareto 表（按任务集分组） | 免费 |
 | `lab bench noise-floor` | **噪声地板**：同配置双臂交错跑，得出「小于它看不出来」的门槛 | 💰 |
 | `lab bench gate --baseline <id>` | **回归门禁**：delta 超阈值 → 退出码非 0 | 免费 |
+| `lab bench show <suite> <task>` | **读某一次运行**：工具序列 + 失败检查 + 关键产物 + 轨迹树 | 免费 |
+| `lab bench sample-failures` | 从库里挑失败运行逐个展示（读 transcript 的入口） | 免费 |
 | `lab bench recover` | 从工作区 + 轨迹重建一次中断的评测 | 免费 |
+| `lab bench judge-sheet` | 生成 LLM-judge 的**人工标注表**（默认 100 条，失败优先） | 免费 |
+| `lab bench calibrate --gold <csv>` | 算 Cohen's κ + 每维混淆矩阵；κ<0.6 或样本<20 → **拒绝启用** | 免费 |
 | `lab sandbox clean-escapes` | 清理脚本逃逸到工作区外的残留 | 免费 |
 | `lab sandbox env` | **Agent 会看到的环境指纹**（工具面 + 短摘要，`--json` 可机读） | 免费 |
 
@@ -442,17 +448,34 @@ which sqlite3 || (sudo apt-get update -y && sudo apt-get install -y sqlite3)
 > 这与第 1、8 条是同一类错误：**观测/前提手段本身没有先被验证**。
 > 第 1 条是 `ps aux` 假阴性，第 8 条是命令文本假阳性，这次是"修复的自变量污染了自己的发现"。
 
+### 11. 我用一条**过宽**的自动修复，误伤了 40 个文件
+
+为了清掉几条 lint，我跑了 `ruff check lab/ --fix`。我以为它只处理我指定的那几类
+（未用导入 / 重定义），但**实际生效的规则集比我预期宽得多**：
+实测 **166 处自动改写、波及约 40 个文件**。
+
+危险的不是风格，而是**遮蔽**：真正要审查的改动（虚拟盘符、成本归因、任务集）
+被埋在几百行无关的 import 重排里；`# noqa: E402` 这类注释也被顺带删掉，
+换个更严的检查器就会重新冒出来。
+
+拦住它的本应是三条很朴素的检查，而我漏了第一条：
+1. 改前先看 `--stat` 的影响面（**我没看，改完才看**）；
+2. 自动修复必须**限定选择**（`--select F401,F841`），而不是让工具自己决定；
+3. 改完立刻跑全量测试（这条我做了，所以功能没坏 —— 但流程上仍然是侥幸）。
+
+> 与第 3、7 条同一类：**行动的影响面没有先被测量**。
+
 ---
 
 ## 已知限制（请连同数字一起读）
 
 | 限制 | 影响 |
 |---|---|
-| **噪声地板已实测，但它很宽**（详见 `docs/noise-floor-measured.md`） | 同配置两臂：成本 **±23.6%**、token **±24.4%**、耗时 **±22.6%**、工具调用 **±17.5%**。所以**任何 <24% 的成本 delta 都看不出来** —— v1→v3 的 -22% 就在这个区间内 |
-| **地板的很大一部分是装置问题，不是模型抖动** | 已定位到五个机制，已修 4 个：✅ CRLF/GBK 乱码（命令**输出**，`cmp` 6→0）；✅ **文件里的 CRLF**（实测 9.5% 的 shell 调用在追行尾）；✅ **脚本内容里的绝对路径逃逸**（虚拟盘符）；✅ **子进程 PATH 不随启动上下文变**（固定前缀 + 环境指纹）；🔴 **"缺 `sqlite3`" 已证伪**（那是从命令文本误推的，见 `docs/step8-device-fixes.md` §2） |
+| **噪声地板已实测，但它很宽，而且依模型而变** | 装置修复后（`deepseek-reasoner`）成本 **±16.6%**；**换到 `deepseek-v4.1-flash` 后重测为 ±46.8%**（token ±49.1%、耗时 ±29.3%、工具调用 ±36.0%；7 任务 × 每臂 3 次，suite `62bde6db`）。所以**任何小于当前地板的 delta 都不能当结论**；成本在绝对值上也很小（单次 ≈ $0.021），相对分辨率因此更差 |
+| **地板的很大一部分是装置问题，不是模型抖动** | 已定位到五个机制，已修 4 个：✅ CRLF/GBK 乱码（命令**输出**，`cmp` 6→0）；✅ **文件里的 CRLF**（终态 LF，与命令输出/read_file 一致）；✅ **脚本内容里的绝对路径逃逸**（虚拟盘符，重测逃逸 0/42）；✅ **子进程 PATH 不随启动上下文变**（固定前缀 + 环境指纹）；🔴 **"缺 `sqlite3`" 已证伪**（从命令文本误推） |
 | **成功率的地板是 ±0.00pt，但那是假象** | 离散指标在"无任务翻转"时配对区间会塔成 0；它**不能**用来判小幅度成功率差异 |
 | 任务集 8 个半真实任务 | `pass^k` 的样本量是**任务数**，区间较宽 |
-| 判定器不支持开放式任务 | 未引入 LLM judge（先建确定性基线） |
+| 判定器不支持开放式任务 | LLM-judge **骨架已就位**（`bench judge-sheet` / `bench calibrate`：按维度独立调用、`Unknown` 不计入 κ），但**尚未校准** —— 真实 κ 要等人工标完 100 条金标（`lab/runs/judge_gold.csv`）才算；在那之前 `calibrate` 如实报“无法计算”并**拒绝启用** |
 | fast mode 沙箱**曾经**可被脚本逃逸 | 已修：每次运行分配一个 `subst` 虚拟盘，脚本里的 `/home/ubuntu/...` 会落回工作区（见 `docs/step8-device-fixes.md` §4）。残留风险：`subst` 不可用（组策略/盘符占满）时会**告警式退化**回旧行为 —— 所以仍只能跑可信内容 |
 | Pareto 只有 2 个取舍点 | 画不出曲线，需要跑多组有意取舍的配置 |
 | SUT 提示词里带随机 UUID | 精确回放必然未命中；需 `--replay-ignore-volatile`（已可事后开启） |
@@ -478,9 +501,10 @@ lab/
 ├── bench/              # 评测 harness
 │   ├── task.py verifier.py validate.py runner.py report.py
 │   ├── stats.py compare.py policy.py recover.py noise.py
-│   └── tasks/{synthetic,semireal,ci}/*.yaml   # 22 个任务
-├── infra/              # 依赖替换件：LocalSandbox / 内存 UoW / CountingLLM
-├── sut/                # 被测系统适配层（把 flow 接成 lab 契约）
+│   ├── judge.py calibrate.py                  # LLM-judge 骨架 + κ 校准门禁
+│   └── tasks/{synthetic,semireal,ci}/*.yaml   # 28 个任务（12/8/8）
+├── infra/              # 依赖替换件：LocalSandbox / 内存 UoW / CountingLLM / env.py（确定性 PATH + 指纹）
+├── sut/                # 被测系统适配层：manus_adapter（课程作者的 flow）+ minimal_react（自写最小 loop）
 └── tests/              # 单测（replay / arms / noise / CI 任务 / 中间件 / 判定器 / CLI）
 ```
 
@@ -492,5 +516,10 @@ lab/
 - `docs/step6-followup-purpose-and-readpath.md` —— purpose 分类 + 读路径检测面
 - `docs/step7-replay-noise-interleave.md` —— 回放 / 噪声地板 / 交错 A/B / 故障元数据落库
 - `docs/step8-device-fixes.md` —— **装置保真修复**：文件 CRLF 归一 + 虚拟盘符（含一个被推翻的旧结论与三个实现坑）
+- `docs/step9-readpath-2x2.md` —— 读路径静默故障 2×2（**负结果**：Agent 会重读自证）
+- `docs/step9b-silent-wrong-2x2.md` —— `silent_wrong_result` 2×2（**负结果**）+ 三次实验的统一机制
+- `docs/step9c-stable-corruption.md` —— **稳定损坏 2×2**（`--fault-stable`）：负结果，但给出机制层级的解释（Agent 有**独立执行通道**），并修了一个"命中却零改动"的真 bug
+- `docs/step10-ci-baseline.md` —— `ci` 组 capability 基线（8 任务 × 3 次）
+- `docs/task-ambiguity-lint.md` —— 任务歧义 lint 的告警清单与假阳性分析
 - `docs/noise-floor-measured.md` —— **噪声地板实测**：同配置两臂差 ±24%，它由什么构成，以及"修了一处但地板没降"的自纠
 - `../README.md` —— 被测系统（MoocManus）本身的部署文档

@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from lab.bench.runner import RunOutcome, SuiteResult, summarize_task
 from lab.bench.task import load_all_tasks
-from lab.cli import main
+from lab.cli import _render_artifacts, main
 
 
 def _fake_suite() -> SuiteResult:
@@ -29,21 +27,47 @@ def _fake_suite() -> SuiteResult:
     task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
     outcomes = [
         RunOutcome(
-            run_id="r1", suite_id="s1", task_uid=task.uid, task_key=task.key,
-            group=task.group, run_index=0, ok=True, tokens=1000, cost_usd=0.001,
-            elapsed_ms=5000, llm_calls=5, tool_calls=3, steps_done=1,
+            run_id="r1",
+            suite_id="s1",
+            task_uid=task.uid,
+            task_key=task.key,
+            group=task.group,
+            run_index=0,
+            ok=True,
+            tokens=1000,
+            cost_usd=0.001,
+            elapsed_ms=5000,
+            llm_calls=5,
+            tool_calls=3,
+            steps_done=1,
         ),
         RunOutcome(
-            run_id="r2", suite_id="s1", task_uid=task.uid, task_key=task.key,
-            group=task.group, run_index=1, ok=False, tokens=2000, cost_usd=0.002,
-            elapsed_ms=9000, llm_calls=8, tool_calls=6, steps_done=1,
-            error_type="agent_error", failed_checks=["✗ [numeric] 答案不对"],
+            run_id="r2",
+            suite_id="s1",
+            task_uid=task.uid,
+            task_key=task.key,
+            group=task.group,
+            run_index=1,
+            ok=False,
+            tokens=2000,
+            cost_usd=0.002,
+            elapsed_ms=9000,
+            llm_calls=8,
+            tool_calls=6,
+            steps_done=1,
+            error_type="agent_error",
+            failed_checks=["✗ [numeric] 答案不对"],
         ),
     ]
     return SuiteResult(
-        suite_id="s1", label="测试", model_name="fake-model", runs_per_task=1,
-        started_at="2026-01-01T00:00:00", elapsed_s=14.0,
-        outcomes=outcomes, task_summaries=[summarize_task(task, outcomes)],
+        suite_id="s1",
+        label="测试",
+        model_name="fake-model",
+        runs_per_task=1,
+        started_at="2026-01-01T00:00:00",
+        elapsed_s=14.0,
+        outcomes=outcomes,
+        task_summaries=[summarize_task(task, outcomes)],
     )
 
 
@@ -104,6 +128,7 @@ def test_cli_bench_tasks_and_validate():
 
 # ==================== 替身 ====================
 
+
 async def _async(value):
     return value
 
@@ -139,7 +164,7 @@ class _FakeStore:
 
         注意签名要跟随真实实现 —— 少一个关键字参数就是 TypeError（踩过）。
         """
-        return None
+        return
 
     def load_runs_grouped_by_task(self, limit_per_task: int = 500):
         """CLI 的阈值推导会读它；替身里返回空 → 退回默认阈值。"""
@@ -147,16 +172,43 @@ class _FakeStore:
 
     def list_suites(self, limit: int = 10):
         return [
-            {"suite_id": s.suite_id, "label": s.label, "model_name": s.model_name,
-             "runs_per_task": s.runs_per_task, "started_at": s.started_at,
-             "total_runs": s.total_runs, "successes": s.successes,
-             "task_count": len(s.task_summaries), "elapsed_s": s.elapsed_s,
-             "budget_mode": s.budget_mode}
+            {
+                "suite_id": s.suite_id,
+                "label": s.label,
+                "model_name": s.model_name,
+                "runs_per_task": s.runs_per_task,
+                "started_at": s.started_at,
+                "total_runs": s.total_runs,
+                "successes": s.successes,
+                "task_count": len(s.task_summaries),
+                "elapsed_s": s.elapsed_s,
+                "budget_mode": s.budget_mode,
+            }
             for s in list(self.suites.values())[-limit:]
         ]
 
     def load_suite(self, suite_id: str):
         return self.suites.get(suite_id)
+
+
+def test_artifacts_skip_pycache_and_binary(tmp_path):
+    """关键产物列表：不列 `__pycache__`（运行残留），也不打印二进制内容。
+
+    实测踩到过：`sem_string_reverse` 的 `__pycache__/*.pyc` 既占掉 `max_files`
+    名额、又把一屏乱码打出来，把真正要看的产物挤出去。
+    """
+    ws = tmp_path / "run0"
+    (ws / "home/ubuntu/input").mkdir(parents=True)
+    (ws / "home/ubuntu/__pycache__").mkdir(parents=True)
+    (ws / "home/ubuntu/__pycache__/reverse.cpython-313.pyc").write_bytes(b"\x00\x01binary")
+    (ws / "home/ubuntu/blob.bin").write_bytes(b"\x00\x01binary")
+    (ws / "home/ubuntu/reversed.txt").write_text("TNEGA SUNAM", encoding="utf-8")
+
+    text = "\n".join(_render_artifacts(str(ws), max_files=10))
+    assert "reversed.txt" in text
+    assert "TNEGA SUNAM" in text
+    assert "__pycache__" not in text  # 运行残留不进产物列表
+    assert "二进制内容" in text  # 二进制只说大小，不打内容
 
 
 def test_cli_sandbox_clean_escapes_is_dry_run_by_default(tmp_path, monkeypatch):
@@ -186,7 +238,7 @@ def test_cli_sandbox_clean_escapes_is_dry_run_by_default(tmp_path, monkeypatch):
 def test_cli_sandbox_clean_reports_nothing_when_clean(monkeypatch):
     import lab.infra.local_sandbox as sandbox_module
 
-    monkeypatch.setattr(sandbox_module, "escape_roots", lambda: [])
+    monkeypatch.setattr(sandbox_module, "escape_roots", list)
     assert main(["sandbox", "clean-escapes", "--yes"]) == 0
 
 
@@ -200,13 +252,25 @@ def test_cli_bench_gate_passes_and_fails(tmp_path, monkeypatch):
 
     def _suite(suite_id, ok_count):
         outcomes = [
-            RunOutcome(run_id=f"{suite_id}-{i}", suite_id=suite_id, task_uid=task.uid,
-                       task_key=task.key, group=task.group, run_index=i, ok=(i < ok_count),
-                       tokens=1000, cost_usd=0.001, elapsed_ms=5000, tool_calls=3, steps_done=1)
+            RunOutcome(
+                run_id=f"{suite_id}-{i}",
+                suite_id=suite_id,
+                task_uid=task.uid,
+                task_key=task.key,
+                group=task.group,
+                run_index=i,
+                ok=(i < ok_count),
+                tokens=1000,
+                cost_usd=0.001,
+                elapsed_ms=5000,
+                tool_calls=3,
+                steps_done=1,
+            )
             for i in range(10)
         ]
-        return SuiteResult(suite_id=suite_id, label=suite_id, outcomes=outcomes,
-                           task_summaries=[summarize_task(task, outcomes)])
+        return SuiteResult(
+            suite_id=suite_id, label=suite_id, outcomes=outcomes, task_summaries=[summarize_task(task, outcomes)]
+        )
 
     store = _FakeStore()
     store.save_suite(_suite("base-ok", 10))  # 基准：10/10
@@ -228,13 +292,25 @@ def test_cli_bench_gate_refuses_tiny_candidate(tmp_path, monkeypatch):
 
     def _suite(suite_id, n):
         outcomes = [
-            RunOutcome(run_id=f"{suite_id}-{i}", suite_id=suite_id, task_uid=task.uid,
-                       task_key=task.key, group=task.group, run_index=i, ok=True,
-                       tokens=1000, cost_usd=0.001, elapsed_ms=5000, tool_calls=3, steps_done=1)
+            RunOutcome(
+                run_id=f"{suite_id}-{i}",
+                suite_id=suite_id,
+                task_uid=task.uid,
+                task_key=task.key,
+                group=task.group,
+                run_index=i,
+                ok=True,
+                tokens=1000,
+                cost_usd=0.001,
+                elapsed_ms=5000,
+                tool_calls=3,
+                steps_done=1,
+            )
             for i in range(n)
         ]
-        return SuiteResult(suite_id=suite_id, label=suite_id, outcomes=outcomes,
-                           task_summaries=[summarize_task(task, outcomes)])
+        return SuiteResult(
+            suite_id=suite_id, label=suite_id, outcomes=outcomes, task_summaries=[summarize_task(task, outcomes)]
+        )
 
     store = _FakeStore()
     store.save_suite(_suite("base-ok", 20))
@@ -252,13 +328,28 @@ def test_cli_bench_run_accepts_new_replay_and_ab_arguments():
     """
     from lab.cli import build_parser
 
-    args = build_parser().parse_args([
-        "bench", "run", "--runs", "2", "--yes",
-        "--ab-guard", "none", "--ab-guard", "retry,postcondition",
-        "--ab-label", "无加固", "--ab-label", "加固",
-        "--replay", "record", "--replay-cache", "x.db",
-        "--replay-ignore-volatile",
-    ])
+    args = build_parser().parse_args(
+        [
+            "bench",
+            "run",
+            "--runs",
+            "2",
+            "--yes",
+            "--ab-guard",
+            "none",
+            "--ab-guard",
+            "retry,postcondition",
+            "--ab-label",
+            "无加固",
+            "--ab-label",
+            "加固",
+            "--replay",
+            "record",
+            "--replay-cache",
+            "x.db",
+            "--replay-ignore-volatile",
+        ]
+    )
 
     assert args.ab_guard == ["none", "retry,postcondition"]
     assert args.ab_label == ["无加固", "加固"]
@@ -266,17 +357,35 @@ def test_cli_bench_run_accepts_new_replay_and_ab_arguments():
     assert args.replay_ignore_volatile is True
     assert args.no_interleave is False
 
-    noise = build_parser().parse_args([
-        "bench", "noise-floor", "--runs", "3", "--replay", "replay",
-        "--replay-cache", "y.db", "--replay-ignore-volatile", "--yes",
-    ])
-    for name in ("runs", "purpose", "label_a", "label_b", "file", "yes",
-                 "replay", "replay_cache", "replay_ignore_volatile", "guard"):
+    noise = build_parser().parse_args(
+        [
+            "bench",
+            "noise-floor",
+            "--runs",
+            "3",
+            "--replay",
+            "replay",
+            "--replay-cache",
+            "y.db",
+            "--replay-ignore-volatile",
+            "--yes",
+        ]
+    )
+    for name in (
+        "runs",
+        "purpose",
+        "label_a",
+        "label_b",
+        "file",
+        "yes",
+        "replay",
+        "replay_cache",
+        "replay_ignore_volatile",
+        "guard",
+    ):
         assert hasattr(noise, name), f"bench noise-floor 缺少参数 {name}"
 
-    compare = build_parser().parse_args(
-        ["bench", "compare", "abc123", "--arm", "A", "--arm", "B"]
-    )
+    compare = build_parser().parse_args(["bench", "compare", "abc123", "--arm", "A", "--arm", "B"])
     assert compare.arm == ["A", "B"] and compare.candidate is None
 
     gate = build_parser().parse_args(["bench", "gate", "--baseline", "x"])
@@ -291,7 +400,6 @@ def test_cli_replay_stats_without_cache(tmp_path, monkeypatch):
 
 def test_cli_replay_stats_reports_nondeterminism(tmp_path, monkeypatch):
     """`replay stats` 的核心产出是**服务端非确定性**比例。"""
-    import asyncio
 
     from lab.replay.cache import LLMCache
     from lab.replay.llm import CachedLLM, ReplayMode
@@ -321,6 +429,173 @@ def test_cli_noise_floor_empty_purpose_names_the_reason(capsys):
     assert "--purpose" in err and "capability" in err, err
 
 
+def test_purpose_verdict_rules():
+    """标签对账的三条规则（T5）：干净失败 → 建议改标；capability 全对 → 可考虑改回。
+
+    为什么钉住规则：它是“标签会腐烂”的唯一拦截手段 ——
+    一个 regression 任务后来变得不稳定时，没人会主动重跑一遍统计。
+    """
+    from lab.cli import _purpose_verdict
+
+    assert "建议改标 capability" in _purpose_verdict("regression", 15, 14)
+    assert "可考虑改回 regression" in _purpose_verdict("capability", 6, 6)
+    assert _purpose_verdict("regression", 33, 33) == "一致"
+    # 样本太小先不动（避免因为 3 次全对就把它塞回回归门禁）
+    assert _purpose_verdict("capability", 3, 3) == "一致"
+
+
+def test_cli_bench_run_empty_purpose_names_the_reason(capsys):
+    """`bench run --group ci --purpose regression` 空集时必须说出真正原因。
+
+    与 noise-floor 同一个坑：`ci` 组的任务全是 capability，而 regression 一个都不剩。
+    （本用例在**任何网络/花钱之前**就返回，所以它永远不会误花钱。）
+    """
+    assert main(["bench", "run", "--group", "ci", "--purpose", "regression", "--limit", "1"]) == 2
+    err = capsys.readouterr().err
+    assert "--purpose" in err and "capability" in err, err
+
+
+def test_cli_bench_run_purpose_filter_is_passed_through(monkeypatch):
+    """`bench run --purpose` 必须传到 run_suite，而且默认是 all（不改变既有行为）。
+
+    为什么钉住它：`bench run` 原来没有 `--purpose`，于是"只在 regression 任务上做
+    对照实验"只能手写 7 个 `--task` —— 漏一个就悄悄多跑一个任务，还会写进报告。
+    更隐蔽的是：CLI 里按 purpose 筛过的 tasks 只影响**成本预估**，
+    真正跑什么由 run_suite 决定（它会自己重新 load 任务集），所以口径必须往下传。
+    """
+    from lab import api as lab_api
+
+    captured = {}
+
+    def fake_run_suite(**kwargs):
+        captured.update(kwargs)
+        return _async(_two_arm_suite())
+
+    monkeypatch.setattr("lab.bench.runner.run_suite", fake_run_suite)
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: _FakeStore())
+
+    assert main(["bench", "run", "--group", "ci", "--purpose", "capability", "--limit", "1", "--yes"]) == 0
+    assert captured["purpose"] == "capability"
+    assert captured["group"] == "ci"
+
+    captured.clear()
+    assert main(["bench", "run", "--group", "synthetic", "--limit", "1", "--yes"]) == 0
+    # 默认 all = 不过滤 → 传 None（runner 只认 None 或具体 purpose 值）
+    assert captured["purpose"] is None
+
+
+# ==================== 读轨迹入口（T2 / 审计 §4.8） ====================
+
+
+def _failed_run_store(tmp_path):
+    """造一个临时库：一次**失败**的运行（含 span / 工具序列 / 失败检查 / 产物）。
+
+    为什么不用用户的真实库：CI 里没有 traces.db，而"读轨迹"这条命令的价值
+    恰恰在于**任何机器上都能复现** —— 所以测试必须自带数据。
+    """
+    from lab.bench.runner import RunOutcome, SuiteResult
+    from lab.sut.base import StepStats, TaskResult
+    from lab.trace.span import TraceRecorder
+    from lab.trace.store import SpanStore
+    from lab.usage import Usage
+
+    workspace = tmp_path / "ws"
+    (workspace / "home" / "ubuntu").mkdir(parents=True, exist_ok=True)
+    (workspace / "home" / "ubuntu" / "TOC.md").write_text("- 安装\n", encoding="utf-8")
+
+    recorder = TraceRecorder("t-fail", sut_name="fake-sut")
+    step = recorder.open_step("一步")
+    recorder.begin_span("tool", "shell_execute").end(success=True)
+    step.end(success=True)
+    recorder.finish_task(ok=False)
+
+    usage = Usage()
+    usage.add_llm_call({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}, 3)
+    result = TaskResult(
+        task_id="t-fail",
+        sut_name="fake-sut",
+        ok=False,
+        plan_title="标题",
+        steps=StepStats(total=1, done=1, succeeded=0),
+        tool_sequence=["read_file", "write_file", "shell_execute"],
+        llm_usage=usage,
+        cost_usd=0.01,
+        elapsed_ms=4200,
+        workspace=str(workspace),
+    )
+    store = SpanStore(tmp_path / "traces.db")
+    store.save_run(result, recorder.spans, goal="生成目录")
+    store.save_suite(
+        SuiteResult(
+            suite_id="s-fail",
+            label="假 suite（失败样本）",
+            model_name="fake",
+            outcomes=[
+                RunOutcome(
+                    run_id="r1",
+                    suite_id="s-fail",
+                    task_uid="u1",
+                    task_key="syn_sum_range",
+                    group="synthetic",
+                    run_index=0,
+                    ok=False,
+                    self_reported_ok=True,
+                    failed_checks=["✗ [file_exists] TOC.md 缺少 H1"],
+                    process_flags=["too_many_tool_calls:13>12"],
+                    task_id="t-fail",
+                    sut_name="fake-sut",
+                    tokens=15,
+                    cost_usd=0.01,
+                    elapsed_ms=4200,
+                    tool_calls=3,
+                    arm="noise-a",
+                    workspace=str(workspace),
+                )
+            ],
+        )
+    )
+    return store
+
+
+def test_cli_bench_show_prints_sequence_checks_and_artifacts(tmp_path, monkeypatch, capsys):
+    """`bench show` 必须把"这一次运行"摊开：工具序列 + 失败检查 + 关键产物 + 轨迹树。"""
+    from lab import api as lab_api
+
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: _failed_run_store(tmp_path))
+
+    assert main(["bench", "show", "s-fail", "syn_sum_range", "--run", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "FAIL" in out
+    assert "read_file → write_file → shell_execute" in out  # 工具序列（事件流）
+    assert "缺少 H1" in out  # 失败检查
+    assert "TOC.md" in out  # 关键产物
+    assert "自述成功=True" in out and "只看自述会被骗" in out  # 自述与判定不一致要点出来
+
+
+def test_cli_bench_show_lists_available_tasks_when_no_match(tmp_path, monkeypatch, capsys):
+    """找不到匹配运行时要给**可操作**的提示（列出可用任务），而不是空白。"""
+    from lab import api as lab_api
+
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: _failed_run_store(tmp_path))
+
+    assert main(["bench", "show", "s-fail", "不存在的任务"]) == 2
+    err = capsys.readouterr().err
+    assert "可用任务" in err and "syn_sum_range" in err
+
+
+def test_cli_bench_sample_failures_points_to_show(tmp_path, monkeypatch, capsys):
+    """`bench sample-failures` 要挑出失败运行，并给出**可直接复制的深挖命令**。"""
+    from lab import api as lab_api
+
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: _failed_run_store(tmp_path))
+
+    assert main(["bench", "sample-failures", "--n", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "syn_sum_range" in out and "缺少 H1" in out
+    assert "bench show s-fail syn_sum_range --run 0" in out
+    assert "too_many_tool_calls:13>12" in out
+
+
 def test_cli_bench_noise_floor_writes_file(tmp_path, monkeypatch):
     """`bench noise-floor` 必须把测出来的地板写盘（`bench gate` 会自动读它）。"""
     from lab import api as lab_api
@@ -334,8 +609,9 @@ def test_cli_bench_noise_floor_writes_file(tmp_path, monkeypatch):
     # --purpose all：本用例测的是"写盘 + 链路"，而假的 suite 里只有 1 个任务，
     # 默认的 regression 口径会把另外 1 个任务也纳入 → 口径与数据不匹配。
     # 口径过滤本身另有专门用例（见 test_noise_floor_filters_non_regression_tasks）。
-    code = main(["bench", "noise-floor", "--runs", "1", "--limit", "2",
-                 "--purpose", "all", "--file", str(target), "--yes"])
+    code = main(
+        ["bench", "noise-floor", "--runs", "1", "--limit", "2", "--purpose", "all", "--file", str(target), "--yes"]
+    )
 
     assert code == 0
     floor = load_noise_floor(target)
@@ -352,11 +628,9 @@ def test_cli_bench_compare_splits_arms_by_flag(tmp_path, monkeypatch):
     store.save_suite(suite)
     monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
 
-    assert main(["bench", "compare", suite.suite_id[:8],
-                 "--arm", "noise-a", "--arm", "noise-b"]) == 0
+    assert main(["bench", "compare", suite.suite_id[:8], "--arm", "noise-a", "--arm", "noise-b"]) == 0
     # 臂名写错 → 必须报错，而不是安静地拆出空集
-    assert main(["bench", "compare", suite.suite_id[:8],
-                 "--arm", "noise-a", "--arm", "typo"]) == 2
+    assert main(["bench", "compare", suite.suite_id[:8], "--arm", "noise-a", "--arm", "typo"]) == 2
 
 
 def _two_arm_suite():
@@ -367,16 +641,31 @@ def _two_arm_suite():
     outcomes = []
     for index in range(1):
         for arm_label in ("noise-a", "noise-b"):
-            outcomes.append(RunOutcome(
-                run_id=f"{arm_label}-{index}", suite_id="s-noise", task_uid=task.uid,
-                task_key=task.key, group=task.group, run_index=index, ok=True,
-                tokens=1000, cost_usd=0.001, elapsed_ms=5000, tool_calls=3, steps_done=1,
-                arm=arm_label,
-            ))
+            outcomes.append(
+                RunOutcome(
+                    run_id=f"{arm_label}-{index}",
+                    suite_id="s-noise",
+                    task_uid=task.uid,
+                    task_key=task.key,
+                    group=task.group,
+                    run_index=index,
+                    ok=True,
+                    tokens=1000,
+                    cost_usd=0.001,
+                    elapsed_ms=5000,
+                    tool_calls=3,
+                    steps_done=1,
+                    arm=arm_label,
+                )
+            )
     return SuiteResult(
-        suite_id="s-noise", label="噪声地板", model_name="fake", runs_per_task=1,
+        suite_id="s-noise",
+        label="噪声地板",
+        model_name="fake",
+        runs_per_task=1,
         arms=[ArmConfig(label="noise-a").to_metadata(), ArmConfig(label="noise-b").to_metadata()],
-        interleaved=True, outcomes=outcomes,
+        interleaved=True,
+        outcomes=outcomes,
         task_summaries=[summarize_task(task, outcomes)],
     )
 
@@ -393,14 +682,43 @@ def test_cli_bench_run_accepts_every_referenced_fault_argument():
     """
     from lab.cli import build_parser
 
-    args = build_parser().parse_args([
-        "bench", "run", "--runs", "1", "--guard", "none",
-        "--fault", "latency_spike", "--fault-tool", "shell_*",
-        "--fault-rate", "0.5", "--fault-latency", "0.01",
-        "--budget-mode", "observe", "--concurrency", "1", "--yes",
-    ])
+    args = build_parser().parse_args(
+        [
+            "bench",
+            "run",
+            "--runs",
+            "1",
+            "--guard",
+            "none",
+            "--fault",
+            "latency_spike",
+            "--fault-tool",
+            "shell_*",
+            "--fault-rate",
+            "0.5",
+            "--fault-latency",
+            "0.01",
+            "--budget-mode",
+            "observe",
+            "--concurrency",
+            "1",
+            "--yes",
+        ]
+    )
 
     # 这些属性都被 _cmd_bench_run 引用过，少一个就会 AttributeError
-    for name in ("guard", "fault", "fault_tool", "fault_rate", "fault_latency",
-                 "budget_mode", "budget_defaults", "concurrency", "runs", "yes", "limit", "task"):
+    for name in (
+        "guard",
+        "fault",
+        "fault_tool",
+        "fault_rate",
+        "fault_latency",
+        "budget_mode",
+        "budget_defaults",
+        "concurrency",
+        "runs",
+        "yes",
+        "limit",
+        "task",
+    ):
         assert hasattr(args, name), f"bench run 缺少参数 {name}，而代码里会引用它"

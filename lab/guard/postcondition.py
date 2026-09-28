@@ -34,7 +34,7 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.tool_result import ToolResult  # noqa: E402
+from app.domain.models.tool_result import ToolResult
 
 # 各工具成功时 data 里**必须**存在的字段。
 # 这就是 `malformed_result` 故障的检测器：字段缺失 = 结果结构损坏。
@@ -83,10 +83,10 @@ def _looks_truncated(data: dict, args: dict, content: str) -> bool:
 
 
 def check_postcondition_content(
-        *,
-        function_name: str,
-        args: Optional[dict],
-        result: ToolResult,
+    *,
+    function_name: str,
+    args: Optional[dict],
+    result: ToolResult,
 ) -> Optional[str]:
     """**内容级**后置校验（可 enforce）：目前做 JSON 结构合法性。
 
@@ -120,8 +120,7 @@ def check_postcondition_content(
         json.loads(content)
     except (json.JSONDecodeError, ValueError) as exc:
         return (
-            f"{function_name} 返回的内容看起来是 JSON 但无法解析"
-            f"（疑似被截断或损坏）：{exc}；长度 {len(content)} 字符"
+            f"{function_name} 返回的内容看起来是 JSON 但无法解析（疑似被截断或损坏）：{exc}；长度 {len(content)} 字符"
         )
     return None
 
@@ -129,14 +128,14 @@ def check_postcondition_content(
 def _digest(content: str) -> str:
     import hashlib
 
-    return hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
 
 
 def check_read_consistency(
-        *,
-        filepath: Optional[str],
-        content: Optional[str],
-        known_writes: Dict[str, tuple],
+    *,
+    filepath: Optional[str],
+    content: Optional[str],
+    known_writes: Dict[str, tuple],
 ) -> Optional[str]:
     """**审计级**校验：读回的内容与最近一次成功写入是否一致。
 
@@ -196,11 +195,11 @@ def _expected_write_content(args: dict) -> Optional[str]:
 
 
 async def check_postcondition(
-        *,
-        function_name: str,
-        args: Optional[dict],
-        result: ToolResult,
-        sandbox: Any = None,
+    *,
+    function_name: str,
+    args: Optional[dict],
+    result: ToolResult,
+    sandbox: Any = None,
 ) -> Optional[str]:
     """校验一次工具调用的结果。返回告警文本，None 表示通过。
 
@@ -265,8 +264,7 @@ async def _verify_written_file(args: dict, data: dict, sandbox: Any) -> Optional
 
     if actual != expected:
         return (
-            f"写入内容与预期不一致: 预期 {len(expected)} 字符，实际 {len(actual)} 字符"
-            f"（疑似部分写入/截断）: {filepath}"
+            f"写入内容与预期不一致: 预期 {len(expected)} 字符，实际 {len(actual)} 字符（疑似部分写入/截断）: {filepath}"
         )
 
     # 字节数申报值也要对得上（工具自己报的数字不能自相矛盾）

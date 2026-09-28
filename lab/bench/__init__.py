@@ -9,6 +9,13 @@ from lab.bench.task import BenchTask, Fixture, ProcessRule, SolutionStep, Verify
 from lab.bench.verifier import CheckResult, evaluate_process, run_checks
 
 __all__ = [
-    "BenchTask", "Fixture", "ProcessRule", "SolutionStep", "VerifyCheck", "load_all_tasks",
-    "CheckResult", "run_checks", "evaluate_process",
+    "BenchTask",
+    "CheckResult",
+    "Fixture",
+    "ProcessRule",
+    "SolutionStep",
+    "VerifyCheck",
+    "evaluate_process",
+    "load_all_tasks",
+    "run_checks",
 ]

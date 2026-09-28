@@ -10,8 +10,7 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from lab.bench.stats import (  # noqa: E402
-    Interval,
+from lab.bench.stats import (
     aggregate,
     compare_paired,
     mean,
@@ -20,14 +19,14 @@ from lab.bench.stats import (  # noqa: E402
     t_critical,
     wilson_interval,
 )
-from lab.bench.task import BenchTask, ProcessRule, VerifyCheck, load_all_tasks, summarize_tasks  # noqa: E402
-from lab.bench.verifier import evaluate_process, normalize_text, run_checks  # noqa: E402
-from lab.infra.local_sandbox import LocalSandbox  # noqa: E402
-from lab.sut.base import StepStats, TaskResult  # noqa: E402
-from lab.usage import Usage  # noqa: E402
-
+from lab.bench.task import BenchTask, ProcessRule, VerifyCheck, load_all_tasks, summarize_tasks
+from lab.bench.verifier import evaluate_process, normalize_text, run_checks
+from lab.infra.local_sandbox import LocalSandbox
+from lab.sut.base import StepStats, TaskResult
+from lab.usage import Usage
 
 # ==================== 1. 统计 ====================
+
 
 def test_mean_and_stdev():
     assert mean([1, 2, 3]) == 2
@@ -52,6 +51,8 @@ def test_mean_ci_requires_two_samples():
 
     multi = mean_ci([1.0, 2.0, 3.0, 4.0, 5.0])
     assert multi.method == "t95"
+    # 先断言区间**存在**再比较：区间缺失时应当响亮地失败，而不是抛 TypeError
+    assert multi.low is not None and multi.high is not None
     assert multi.low < multi.point < multi.high
     assert multi.n == 5
 
@@ -71,8 +72,9 @@ def test_wilson_interval_is_not_absurd_at_extremes():
     assert all_fail.high == pytest.approx(0.434, abs=0.01)
 
     # 区间必须始终落在 [0,1] 内
-    for successes in range(0, 11):
+    for successes in range(11):
         interval = wilson_interval(successes, 10)
+        assert interval.low is not None and interval.high is not None
         assert 0.0 <= interval.low <= interval.point <= interval.high <= 1.0
 
 
@@ -80,6 +82,7 @@ def test_wilson_interval_narrows_with_more_samples():
     """样本越多，区间越窄 —— 这是"n=5 不够"这句话的量化表达。"""
     narrow = wilson_interval(15, 20).half_width
     wide = wilson_interval(3, 4).half_width
+    assert narrow is not None and wide is not None
     assert narrow < wide
 
 
@@ -107,6 +110,7 @@ def test_aggregate_reports_spread_not_just_mean():
 
 
 # ==================== 2. 判定规则 ====================
+
 
 def test_normalize_modes():
     assert normalize_text("  x  ", "strip") == "x"
@@ -139,16 +143,22 @@ async def test_check_contains_not_contains_and_regex(tmp_path):
     sandbox = await _sandbox(tmp_path)
     await sandbox.write_file("/home/ubuntu/a.py", "port = config['port']\n")
 
-    results = await run_checks([
-        VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", contains="config"),
-        VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", not_contains="8080"),
-        VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", matches=r"port\s*=\s*\w+"),
-    ], sandbox)
+    results = await run_checks(
+        [
+            VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", contains="config"),
+            VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", not_contains="8080"),
+            VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", matches=r"port\s*=\s*\w+"),
+        ],
+        sandbox,
+    )
     assert all(r.ok for r in results)
 
-    negative = await run_checks([
-        VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", not_contains="config"),
-    ], sandbox)
+    negative = await run_checks(
+        [
+            VerifyCheck(kind="file_content", path="/home/ubuntu/a.py", not_contains="config"),
+        ],
+        sandbox,
+    )
     assert negative[0].ok is False
 
 
@@ -157,10 +167,13 @@ async def test_check_numeric_and_json(tmp_path):
     await sandbox.write_file("/home/ubuntu/n.txt", "  500500 \n")
     await sandbox.write_file("/home/ubuntu/j.json", '{"status": {"200": 3}}')
 
-    results = await run_checks([
-        VerifyCheck(kind="numeric", path="/home/ubuntu/n.txt", value=500500),
-        VerifyCheck(kind="json_equals", path="/home/ubuntu/j.json", equals='{"status": {"200": 3}}'),
-    ], sandbox)
+    results = await run_checks(
+        [
+            VerifyCheck(kind="numeric", path="/home/ubuntu/n.txt", value=500500),
+            VerifyCheck(kind="json_equals", path="/home/ubuntu/j.json", equals='{"status": {"200": 3}}'),
+        ],
+        sandbox,
+    )
     assert all(r.ok for r in results)
 
     # 非数字内容必须报"无法解析"而不是崩掉
@@ -173,16 +186,28 @@ async def test_check_csv_rows_is_order_sensitive(tmp_path):
     sandbox = await _sandbox(tmp_path)
     await sandbox.write_file("/home/ubuntu/c.csv", "id,item\n2,b\n1,a\n")
 
-    same = await run_checks([VerifyCheck(
-        kind="csv_rows", path="/home/ubuntu/c.csv",
-        rows=[["id", "item"], ["2", "b"], ["1", "a"]],
-    )], sandbox)
+    same = await run_checks(
+        [
+            VerifyCheck(
+                kind="csv_rows",
+                path="/home/ubuntu/c.csv",
+                rows=[["id", "item"], ["2", "b"], ["1", "a"]],
+            )
+        ],
+        sandbox,
+    )
     assert same[0].ok is True
 
-    reordered = await run_checks([VerifyCheck(
-        kind="csv_rows", path="/home/ubuntu/c.csv",
-        rows=[["id", "item"], ["1", "a"], ["2", "b"]],
-    )], sandbox)
+    reordered = await run_checks(
+        [
+            VerifyCheck(
+                kind="csv_rows",
+                path="/home/ubuntu/c.csv",
+                rows=[["id", "item"], ["1", "a"], ["2", "b"]],
+            )
+        ],
+        sandbox,
+    )
     assert reordered[0].ok is False  # 行序有语义时不能放过
 
 
@@ -203,9 +228,9 @@ async def test_check_exceptions_are_contained(tmp_path):
     assert result[0].ok is False and "未知的检查类型" in result[0].detail
 
     # 非法正则 → 也要被兜住
-    result = await run_checks([VerifyCheck(
-        kind="file_content", path="/home/ubuntu/a.txt", matches="[unclosed"
-    )], sandbox)
+    result = await run_checks(
+        [VerifyCheck(kind="file_content", path="/home/ubuntu/a.txt", matches="[unclosed")], sandbox
+    )
     assert result[0].ok is False
 
 
@@ -214,21 +239,28 @@ async def test_check_file_exists_and_dir_count(tmp_path):
     await sandbox.write_file("/home/ubuntu/docs/a.md", "a")
     await sandbox.write_file("/home/ubuntu/docs/b.md", "b")
 
-    results = await run_checks([
-        VerifyCheck(kind="file_exists", path="/home/ubuntu/docs/a.md", exists=True),
-        VerifyCheck(kind="file_exists", path="/home/ubuntu/docs/a.txt", exists=False),
-        VerifyCheck(kind="dir_count", path="/home/ubuntu/docs", count=2),
-        VerifyCheck(kind="no_extra_files", path="/home/ubuntu/docs", allow=["a.md", "b.md"]),
-    ], sandbox)
+    results = await run_checks(
+        [
+            VerifyCheck(kind="file_exists", path="/home/ubuntu/docs/a.md", exists=True),
+            VerifyCheck(kind="file_exists", path="/home/ubuntu/docs/a.txt", exists=False),
+            VerifyCheck(kind="dir_count", path="/home/ubuntu/docs", count=2),
+            VerifyCheck(kind="no_extra_files", path="/home/ubuntu/docs", allow=["a.md", "b.md"]),
+        ],
+        sandbox,
+    )
     assert all(r.ok for r in results)
 
-    extra = await run_checks([
-        VerifyCheck(kind="no_extra_files", path="/home/ubuntu/docs", allow=["a.md"]),
-    ], sandbox)
+    extra = await run_checks(
+        [
+            VerifyCheck(kind="no_extra_files", path="/home/ubuntu/docs", allow=["a.md"]),
+        ],
+        sandbox,
+    )
     assert extra[0].ok is False
 
 
 # ==================== 3. 任务模型与任务集 ====================
+
 
 def test_task_set_shape():
     """任务集形状是**约定**，不能随手变 —— 它直接决定指标的可比性。
@@ -244,8 +276,8 @@ def test_task_set_shape():
     tasks = load_all_tasks()
     summary = summarize_tasks(tasks)
 
-    assert summary["by_group"] == {"semireal": 8, "synthetic": 12, "ci": 2}
-    assert len(tasks) == 22
+    assert summary["by_group"] == {"semireal": 8, "synthetic": 12, "ci": 8}
+    assert len(tasks) == 28
 
 
 def test_ci_tasks_are_capability_not_regression():
@@ -277,6 +309,7 @@ def test_task_keys_are_unique():
 
 
 # ==================== 3.5 判定强度：防“静默失败”的回归测试 ====================
+
 
 async def _workspace_with_fixtures(tmp_path, task):
     """按任务定义铺好 fixtures，返回沙箱。"""
@@ -354,6 +387,7 @@ async def test_rename_task_accepts_the_reference_behavior(tmp_path):
 
 # ==================== 3.6 任务集自检的"牙齿" ====================
 
+
 async def test_task_set_has_no_tautological_validation():
     """所有任务的参考解都不应该"直接把期望值写出来"。
 
@@ -402,12 +436,17 @@ async def test_validation_detects_a_wrong_expectation_in_content_task(tmp_path):
 
 # ==================== 4. 过程规则 ====================
 
+
 def _result_with_guard(guard: dict, **kwargs) -> TaskResult:
     usage = Usage()
     usage.add_llm_call({"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}, 0)
     base = dict(
-        task_id="t", sut_name="fake", ok=True, llm_usage=usage,
-        steps=StepStats(total=1, done=1, succeeded=1), guard=guard,
+        task_id="t",
+        sut_name="fake",
+        ok=True,
+        llm_usage=usage,
+        steps=StepStats(total=1, done=1, succeeded=1),
+        guard=guard,
     )
     base.update(kwargs)
     return TaskResult(**base)
@@ -415,18 +454,25 @@ def _result_with_guard(guard: dict, **kwargs) -> TaskResult:
 
 def test_process_rules_flag_efficiency_security_and_cheating():
     task = BenchTask(
-        key="t", group="synthetic", goal="g",
+        key="t",
+        group="synthetic",
+        goal="g",
         verify=[VerifyCheck(kind="file_exists", path="/x")],
         process=ProcessRule(
-            max_tool_calls=3, max_llm_calls=0, max_steps=0,
-            forbid_path_escape=True, answer_literals=["42"],
+            max_tool_calls=3,
+            max_llm_calls=0,
+            max_steps=0,
+            forbid_path_escape=True,
+            answer_literals=["42"],
         ),
     )
-    result = _result_with_guard({
-        "loop": {"tool_calls": 10.0, "action_diversity": 0.2},
-        "error_types": {"path_escape": 1},
-        "hardcode_suspects": {"/home/ubuntu/a.txt": ["42"]},
-    })
+    result = _result_with_guard(
+        {
+            "loop": {"tool_calls": 10.0, "action_diversity": 0.2},
+            "error_types": {"path_escape": 1},
+            "hardcode_suspects": {"/home/ubuntu/a.txt": ["42"]},
+        }
+    )
 
     flags = evaluate_process(task, result)
 
@@ -440,7 +486,9 @@ def test_process_rules_flag_efficiency_security_and_cheating():
 
 def test_process_rules_are_quiet_on_healthy_runs():
     task = BenchTask(
-        key="t", group="synthetic", goal="g",
+        key="t",
+        group="synthetic",
+        goal="g",
         verify=[VerifyCheck(kind="file_exists", path="/x")],
         process=ProcessRule(max_tool_calls=20, max_llm_calls=20, max_steps=10),
     )
@@ -451,7 +499,9 @@ def test_process_rules_are_quiet_on_healthy_runs():
 def test_process_flags_do_not_change_result_score():
     """过程问题不影响 `ok` —— 结果分与过程分必须分开（handoff 决策 5）。"""
     task = BenchTask(
-        key="t", group="synthetic", goal="g",
+        key="t",
+        group="synthetic",
+        goal="g",
         verify=[VerifyCheck(kind="file_exists", path="/x")],
         process=ProcessRule(max_tool_calls=1),
     )
@@ -464,13 +514,24 @@ def test_process_flags_do_not_change_result_score():
 
 # ==================== 3.7 Step 5：配对对比与 Pareto ====================
 
+
 def _fake_suite(suite_id: str, ok_flags, tokens_list, cost=0.1):
     from lab.bench.runner import RunOutcome, SuiteResult
+
     outcomes = [
         RunOutcome(
-            run_id=f"{suite_id}-{i}", suite_id=suite_id, task_uid=f"synthetic/t{i}", task_key=f"t{i}",
-            group="synthetic", run_index=0, ok=ok_flags[i], tokens=tokens_list[i],
-            cost_usd=cost, elapsed_ms=1000, tool_calls=5, steps_done=1,
+            run_id=f"{suite_id}-{i}",
+            suite_id=suite_id,
+            task_uid=f"synthetic/t{i}",
+            task_key=f"t{i}",
+            group="synthetic",
+            run_index=0,
+            ok=ok_flags[i],
+            tokens=tokens_list[i],
+            cost_usd=cost,
+            elapsed_ms=1000,
+            tool_calls=5,
+            steps_done=1,
         )
         for i in range(len(ok_flags))
     ]
@@ -517,7 +578,7 @@ def test_pareto_only_compares_same_task_set():
     """Pareto 必须按任务集分组 —— 不同任务集/规模的点不可比。"""
     from lab.bench.compare import group_by_task_set
 
-    small = _fake_suite("small", [True], [1000])          # n=1，只有 1 个任务
+    small = _fake_suite("small", [True], [1000])  # n=1，只有 1 个任务
     big = _fake_suite("big", [True, True, True], [1000, 1000, 1000])  # n=3，3 个任务
 
     groups = group_by_task_set([small, big], min_runs=3)
@@ -543,11 +604,13 @@ def test_bootstrap_interval_widens_with_spread():
     tight = bootstrap_ci([100, 101, 99, 100, 100])
     wide = bootstrap_ci([10, 50, 100, 200, 900])
 
+    assert tight.half_width is not None and wide.half_width is not None
     assert tight.half_width < wide.half_width
     assert wide.point > tight.point
 
 
 # ==================== 3.8 任务级指标 pass^k / pass@k ====================
+
 
 def test_pass_k_exposes_instability_that_run_level_rate_dilutes():
     """`pass^k` 的核心价值：把"少数任务不稳定"暴露出来，而不是被平摊掉。
@@ -558,9 +621,13 @@ def test_pass_k_exposes_instability_that_run_level_rate_dilutes():
     from lab.bench.stats import task_level_rates
 
     per_task = {
-        "t1": [True] * 5, "t2": [True] * 5, "t3": [True] * 5,
+        "t1": [True] * 5,
+        "t2": [True] * 5,
+        "t3": [True] * 5,
         "t4": [True, True, True, True, False],  # 4/5
-        "t5": [True] * 5, "t6": [True] * 5, "t7": [True] * 5,
+        "t5": [True] * 5,
+        "t6": [True] * 5,
+        "t7": [True] * 5,
         "t8": [False, True, True, True, True],  # 4/5
     }
     metrics = task_level_rates(per_task)

@@ -18,13 +18,21 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # 价格表：(输入 $/百万token, 输出 $/百万token)
 # 说明：这是"写死的配置"，Step 4 会挪到独立配置文件；查不到就返回 None。
 PRICING: Dict[str, Tuple[float, float]] = {
     "deepseek-chat": (0.28, 0.42),
     "deepseek-reasoner": (0.55, 2.19),
+    # OpenCode Go（$10/月订阅）里的 DeepSeek V4.1 Flash。
+    # ⚠️ 两个口径必须写清，否则"成本"会误导：
+    #   1) 这些是**列表价**（来源：opencode-go 的模型页，input $0.15/M、output $0.60/M），
+    #      而订阅制下**边际成本是 $0** —— 所以本表算出的是"等价成本"，
+    #      用于**横向对比**（任务 A 比任务 B 贵多少），**不能**当成账单金额；
+    #   2) 不补这一条的话，新模型的每一次运行都会把成本静默记成 $0
+    #      —— 那比报错更危险（数字看起来合理，只是全错）。
+    "deepseek-v4.1-flash": (0.15, 0.60),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
 }
@@ -76,7 +84,6 @@ class Usage(BaseModel):
             return 0.0
         in_price, out_price = price
         return round(
-            self.prompt_tokens / 1_000_000 * in_price
-            + self.completion_tokens / 1_000_000 * out_price,
+            self.prompt_tokens / 1_000_000 * in_price + self.completion_tokens / 1_000_000 * out_price,
             6,
         )

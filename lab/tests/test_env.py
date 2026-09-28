@@ -61,7 +61,7 @@ def test_path_does_not_depend_on_launch_context(monkeypatch):
         pytest.skip("固定前缀是 Windows（Git for Windows）特有的问题")
 
     minimal_parent = os.pathsep.join([r"C:\Windows\System32", r"C:\Windows"])
-    monkeypatch.setenv("PATH", minimal_parent)   # ← 关键：先退化父 PATH
+    monkeypatch.setenv("PATH", minimal_parent)  # ← 关键：先退化父 PATH
 
     assert guaranteed_dirs(), (
         "父 PATH 退化后就找不到 Git 了 —— 发现过程本身依赖了要修的那个变量。"
@@ -140,6 +140,23 @@ def test_render_fingerprint_mentions_missing_tools():
     text = render_fingerprint(environment_fingerprint(path=r"C:\definitely\not\real"))
     assert "不可用" in text
     assert "探环境" in text or "测量缺陷" in text
+
+
+def test_render_fingerprint_does_not_warn_for_optional_tools():
+    """**可选**探测工具缺失不该触发 ⚠️ 告警（但仍然要印出来，信息不能丢）。
+
+    为什么值得一条测试：`bc` 在本机不可用，而当前任务集不依赖它。
+    若把它算作"必须"，每次运行都会弹同一条**无法消除**的告警 ——
+    噪声化的告警比没有告警更糟（lab/README「我错在哪 #4」）。
+    """
+    fingerprint = {
+        "digest": "0" * 10,
+        "path": "/usr/bin",
+        "tools": {name: (None if name == "bc" else f"/usr/bin/{name}") for name in TOOL_PROBES},
+    }
+    text = render_fingerprint(fingerprint)
+    assert "bc" in text  # 仍然印出来
+    assert "⚠️" not in text  # 但不告警
 
 
 def test_child_env_uses_deterministic_path(tmp_path: Path):

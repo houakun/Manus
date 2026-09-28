@@ -17,9 +17,10 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.models.memory import Memory  # noqa: E402
-from app.domain.models.session import Session, SessionStatus  # noqa: E402
-from lab.infra.memory_uow import create_uow_factory  # noqa: E402
+from app.domain.models.memory import Memory
+from app.domain.models.session import Session, SessionStatus
+
+from lab.infra.memory_uow import create_uow_factory
 
 
 @pytest.mark.asyncio

@@ -31,9 +31,12 @@ from lab.bootstrap import ensure_sut_on_path
 
 ensure_sut_on_path()
 
-from app.domain.external.llm import LLM  # noqa: E402
-from lab.trace.span import SpanSink, _digest  # noqa: E402
-from lab.usage import Usage  # noqa: E402
+# app 包在运行期由 ensure_sut_on_path() 加进 sys.path（见 lab/bootstrap.py）——
+# 静态检查器看不到这一步，所以这里显式声明。
+from app.domain.external.llm import LLM  # pyright: ignore[reportMissingImports]
+
+from lab.trace.span import SpanSink, _digest
+from lab.usage import Usage
 
 # 附加在返回体上的私有遥测键（下划线前缀，采集后立即摘除）
 _PRIVATE_KEYS = ("_usage", "_latency_ms", "_model")
@@ -42,8 +45,9 @@ _PRIVATE_KEYS = ("_usage", "_latency_ms", "_model")
 class CountingLLM:
     """LLM 协议代理：转发调用 + 采集用量 + 上报 llm span。"""
 
-    def __init__(self, inner: LLM, usage: Usage, sink: Optional[SpanSink] = None,
-                 after_call: Optional[Callable[[], None]] = None) -> None:
+    def __init__(
+        self, inner: LLM, usage: Usage, sink: Optional[SpanSink] = None, after_call: Optional[Callable[[], None]] = None
+    ) -> None:
         self._inner = inner
         self._usage = usage
         # sink 可选：不传也能工作（离线实验 / 单元测试场景）
@@ -69,11 +73,11 @@ class CountingLLM:
         return total
 
     async def invoke(
-            self,
-            messages: List[Dict[str, Any]],
-            tools: List[Dict[str, Any]] = None,
-            response_format: Dict[str, Any] = None,
-            tool_choice: str = None,
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         """转发一次 LLM 调用并累计用量。"""
         # 1.开一个 llm span。注意 begin_span("llm") 默认 **不压栈**：
@@ -85,9 +89,7 @@ class CountingLLM:
             #   prompt_digest  = system prompt + 工具描述 → **稳定**，用来标识"提示词/工具集版本"
             #   context_digest = 全量 messages → **每次都变**，用来标识"这一次的确切上下文"
             # 前者支撑体检第 9 项（prompt 版本），后者支撑可复现性排查（"同一次调用到底喂了什么"）。
-            system_prompt = next(
-                (m.get("content", "") for m in (messages or []) if m.get("role") == "system"), ""
-            )
+            system_prompt = next((m.get("content", "") for m in (messages or []) if m.get("role") == "system"), "")
             handle = self._sink.begin_span(
                 "llm",
                 name=self._inner.model_name,
@@ -107,11 +109,14 @@ class CountingLLM:
             )
 
         try:
+            # 这三个参数直透给 SUT 的 LLM 协议。两侧签名**都已核实为 `Optional[...] = None`**
+            # （`api/app/domain/external/llm.py` 与 `openai_llm.py`）；检查器看到的是旧视图，
+            # 所以这里显式声明“这个透传是有意的”，而不是把参数改成非 Optional（那会骗自己）。
             result = await self._inner.invoke(
                 messages=messages,
-                tools=tools,
-                response_format=response_format,
-                tool_choice=tool_choice,
+                tools=tools,  # pyright: ignore[reportArgumentType]
+                response_format=response_format,  # pyright: ignore[reportArgumentType]
+                tool_choice=tool_choice,  # pyright: ignore[reportArgumentType]
             )
         except Exception as e:
             # 失败也要计数：真实重试率是可靠性工程的核心指标之一

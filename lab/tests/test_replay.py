@@ -27,39 +27,58 @@ def _cache(tmp_path) -> LLMCache:
 
 # ==================== 1. 键的稳定性 ====================
 
+
 def test_cache_key_is_stable_and_order_insensitive():
     """同样的请求 → 同样的键（dict 键序不影响）。"""
-    key_a = cache_key(model="m", temperature=0.0, max_tokens=100,
-                      messages=[{"role": "user", "content": "hi"}],
-                      tools=[{"name": "t", "x": 1, "y": 2}])
-    key_b = cache_key(model="m", temperature=0.0, max_tokens=100,
-                      messages=[{"role": "user", "content": "hi"}],
-                      tools=[{"y": 2, "x": 1, "name": "t"}])
+    key_a = cache_key(
+        model="m",
+        temperature=0.0,
+        max_tokens=100,
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"name": "t", "x": 1, "y": 2}],
+    )
+    key_b = cache_key(
+        model="m",
+        temperature=0.0,
+        max_tokens=100,
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"y": 2, "x": 1, "name": "t"}],
+    )
     assert key_a == key_b
 
 
-@pytest.mark.parametrize("changed", [
-    {"model": "m2"},
-    {"temperature": 0.7},
-    {"max_tokens": 200},
-    {"messages": [{"role": "user", "content": "HI"}]},
-    {"tools": [{"name": "other"}]},
-    {"tool_choice": "required"},
-    {"response_format": {"type": "json_object"}},
-])
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"model": "m2"},
+        {"temperature": 0.7},
+        {"max_tokens": 200},
+        {"messages": [{"role": "user", "content": "HI"}]},
+        {"tools": [{"name": "other"}]},
+        {"tool_choice": "required"},
+        {"response_format": {"type": "json_object"}},
+    ],
+)
 def test_cache_key_changes_with_every_input(changed):
     """**每一个**会影响输出的入参都必须进键。
 
     这条是参数化的：以后加新入参（比如 top_p）时，如果只加进 invoke 却没加进键，
     这里会立刻挂 —— 而不是等到某次回放给出一个属于另一个请求的答案。
     """
-    base = dict(model="m", temperature=0.0, max_tokens=100,
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[{"name": "t"}], tool_choice=None, response_format=None)
+    base = {
+        "model": "m",
+        "temperature": 0.0,
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "t"}],
+        "tool_choice": None,
+        "response_format": None,
+    }
     assert cache_key(**base) != cache_key(**{**base, **changed})
 
 
 # ==================== 2. 四种模式的语义 ====================
+
 
 async def test_record_mode_always_hits_network_and_writes(tmp_path):
     """record 模式**总是**联网（这是它能顺带测非确定性的原因）。"""
@@ -98,11 +117,10 @@ async def test_record_mode_detects_server_nondeterminism(tmp_path):
 async def test_replay_mode_never_touches_network_and_zeroes_latency(tmp_path):
     """严格回放：命中即返回，一次都不调内层；耗时归零、usage 保留。"""
     cache = _cache(tmp_path)
-    recorded = ScriptedLLM([content("cached answer")], model_name="deepseek-chat",
-                           prompt_tokens=42, completion_tokens=7, latency_ms=999)
-    await CachedLLM(recorded, cache, mode=ReplayMode.RECORD).invoke(
-        [{"role": "user", "content": "q"}]
+    recorded = ScriptedLLM(
+        [content("cached answer")], model_name="deepseek-chat", prompt_tokens=42, completion_tokens=7, latency_ms=999
     )
+    await CachedLLM(recorded, cache, mode=ReplayMode.RECORD).invoke([{"role": "user", "content": "q"}])
 
     # 内层 LLM 的 model_name / temperature / max_tokens 都会进键，
     # 所以回放用的替身必须与录制时**完全一致** —— 否则键不同、必然未命中。
@@ -129,8 +147,7 @@ async def test_equivalent_cost_is_zero_when_price_table_misses(tmp_path):
     0 在这里是**有意的**，而不是 bug。
     """
     cache = _cache(tmp_path)
-    llm = CachedLLM(ScriptedLLM([content("x")], model_name="unknown-model-xyz"),
-                    cache, mode=ReplayMode.RECORD)
+    llm = CachedLLM(ScriptedLLM([content("x")], model_name="unknown-model-xyz"), cache, mode=ReplayMode.RECORD)
     await llm.invoke([{"role": "user", "content": "q"}])
     assert llm.stats.equivalent_cost_usd == 0.0
 
@@ -153,9 +170,7 @@ async def test_reuse_mode_is_read_through(tmp_path):
     """reuse：命中就不联网（省钱的原理）；未命中才联网并写入。"""
     cache = _cache(tmp_path)
     first_inner = ScriptedLLM([content("v1")])
-    await CachedLLM(first_inner, cache, mode=ReplayMode.RECORD).invoke(
-        [{"role": "user", "content": "q"}]
-    )
+    await CachedLLM(first_inner, cache, mode=ReplayMode.RECORD).invoke([{"role": "user", "content": "q"}])
 
     hit_inner = ScriptedLLM([])
     llm = CachedLLM(hit_inner, cache, mode=ReplayMode.REUSE)
@@ -176,15 +191,17 @@ async def test_partial_hit_when_only_one_prompt_changed(tmp_path):
     这正是 reuse 模式存在的理由：改提示词时不必为没变的调用重复付费。
     """
     cache = _cache(tmp_path)
-    await CachedLLM(ScriptedLLM([content("s1"), content("s2")]), cache,
-                    mode=ReplayMode.RECORD).invoke([{"role": "system", "content": "sys-OLD"}])
-    await CachedLLM(ScriptedLLM([content("u")]), cache,
-                    mode=ReplayMode.RECORD).invoke([{"role": "user", "content": "same"}])
+    await CachedLLM(ScriptedLLM([content("s1"), content("s2")]), cache, mode=ReplayMode.RECORD).invoke(
+        [{"role": "system", "content": "sys-OLD"}]
+    )
+    await CachedLLM(ScriptedLLM([content("u")]), cache, mode=ReplayMode.RECORD).invoke(
+        [{"role": "user", "content": "same"}]
+    )
 
     inner = ScriptedLLM([content("s1-new")])
     llm = CachedLLM(inner, cache, mode=ReplayMode.REUSE)
-    await llm.invoke([{"role": "system", "content": "sys-NEW"}])   # 未命中
-    await llm.invoke([{"role": "user", "content": "same"}])        # 命中
+    await llm.invoke([{"role": "system", "content": "sys-NEW"}])  # 未命中
+    await llm.invoke([{"role": "user", "content": "same"}])  # 命中
 
     assert len(inner.calls) == 1, "只有变了的那次才该联网"
     assert (llm.stats.hits, llm.stats.writes) == (1, 1)
@@ -192,15 +209,19 @@ async def test_partial_hit_when_only_one_prompt_changed(tmp_path):
 
 # ==================== 3. 模式解析 ====================
 
-@pytest.mark.parametrize("spec,expected", [
-    (None, ReplayMode.OFF),
-    ("", ReplayMode.OFF),
-    ("off", ReplayMode.OFF),
-    ("record", ReplayMode.RECORD),
-    ("reuse", ReplayMode.REUSE),
-    ("on", ReplayMode.REUSE),
-    ("replay", ReplayMode.REPLAY),
-])
+
+@pytest.mark.parametrize(
+    "spec,expected",
+    [
+        (None, ReplayMode.OFF),
+        ("", ReplayMode.OFF),
+        ("off", ReplayMode.OFF),
+        ("record", ReplayMode.RECORD),
+        ("reuse", ReplayMode.REUSE),
+        ("on", ReplayMode.REUSE),
+        ("replay", ReplayMode.REPLAY),
+    ],
+)
 def test_mode_from_spec(spec, expected):
     assert mode_from_spec(spec) is expected
 
@@ -223,17 +244,32 @@ def test_only_strict_replay_is_guaranteed_free():
 
 # ==================== 4. 端到端：连 SUT 一起跑 ====================
 
+
 def _script():
     return [
-        json_content({
-            "title": "回放任务", "goal": "写文件", "language": "中文",
-            "steps": [{"description": "写文件"}], "message": "开始",
-        }),
-        {"role": "assistant", "content": "", "tool_calls": [{
-            "id": "call-1", "type": "function",
-            "function": {"name": "write_file", "arguments":
-                         '{"filepath": "/home/ubuntu/a.txt", "content": "hello"}'},
-        }]},
+        json_content(
+            {
+                "title": "回放任务",
+                "goal": "写文件",
+                "language": "中文",
+                "steps": [{"description": "写文件"}],
+                "message": "开始",
+            }
+        ),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"filepath": "/home/ubuntu/a.txt", "content": "hello"}',
+                    },
+                }
+            ],
+        },
         json_content({"success": True, "attachments": [], "result": "已写入"}),
         json_content({"steps": []}),
         json_content({"message": "任务完成", "attachments": []}),
@@ -260,8 +296,13 @@ def test_end_to_end_record_then_replay_without_api_key(tmp_path, monkeypatch):
     def _fake_llm_config():
         from app.domain.models.app_config import LLMConfig
 
-        return LLMConfig(base_url="http://localhost", api_key=credentials["api_key"],
-                         model_name="fake-model", temperature=0.0, max_tokens=1024)
+        return LLMConfig(
+            base_url="http://localhost",
+            api_key=credentials["api_key"],
+            model_name="fake-model",
+            temperature=0.0,
+            max_tokens=1024,
+        )
 
     class _Factory:
         """每次 new 一个 OpenAILLM 就换成脚本化 LLM。
@@ -295,7 +336,8 @@ def test_end_to_end_record_then_replay_without_api_key(tmp_path, monkeypatch):
     recorded = api_module.run_task_sync(
         "把 hello 写入 /home/ubuntu/a.txt",
         workspace=tmp_path / "r1",
-        replay="record", replay_cache=cache_path,
+        replay="record",
+        replay_cache=cache_path,
     )
     assert recorded.ok, recorded.error
     assert recorded.replay["mode"] == "record"
@@ -314,7 +356,8 @@ def test_end_to_end_record_then_replay_without_api_key(tmp_path, monkeypatch):
     strict = api_module.run_task_sync(
         "把 hello 写入 /home/ubuntu/a.txt",
         workspace=tmp_path / "r2",
-        replay="replay", replay_cache=cache_path,
+        replay="replay",
+        replay_cache=cache_path,
     )
     assert not strict.ok
     assert strict.error_type == "replay_miss"
@@ -330,7 +373,8 @@ def test_end_to_end_record_then_replay_without_api_key(tmp_path, monkeypatch):
     replayed = api_module.run_task_sync(
         "把 hello 写入 /home/ubuntu/a.txt",
         workspace=tmp_path / "r3",
-        replay="replay", replay_cache=cache_path,
+        replay="replay",
+        replay_cache=cache_path,
         replay_ignore_volatile=True,
     )
 
@@ -351,18 +395,28 @@ def test_end_to_end_replay_miss_marks_run_as_replay_miss(tmp_path, monkeypatch):
 
     如果只留 SUT 报出来的 `llm_error`，人会去查模型服务，而真正的原因是"缓存没录全"。
     """
-    import lab.api as api_module
     from app.domain.models.app_config import LLMConfig
 
+    import lab.api as api_module
+
     monkeypatch.setattr(api_module, "OpenAILLM", lambda cfg: ScriptedLLM([]))
-    monkeypatch.setattr(api_module, "load_llm_config", lambda **kwargs: LLMConfig(
-        base_url="http://localhost", api_key="", model_name="fake-model",
-        temperature=0.0, max_tokens=1024,
-    ))
+    monkeypatch.setattr(
+        api_module,
+        "load_llm_config",
+        lambda **kwargs: LLMConfig(
+            base_url="http://localhost",
+            api_key="",
+            model_name="fake-model",
+            temperature=0.0,
+            max_tokens=1024,
+        ),
+    )
 
     result = api_module.run_task_sync(
-        "任何任务", workspace=tmp_path / "w",
-        replay="replay", replay_cache=tmp_path / "empty.db",
+        "任何任务",
+        workspace=tmp_path / "w",
+        replay="replay",
+        replay_cache=tmp_path / "empty.db",
     )
 
     assert not result.ok
@@ -384,9 +438,9 @@ def test_llm_span_records_cache_status(tmp_path):
     from lab.usage import Usage
 
     cache = _cache(tmp_path)
-    asyncio.run(CachedLLM(ScriptedLLM([content("x")]), cache, mode=ReplayMode.RECORD).invoke(
-        [{"role": "user", "content": "q"}]
-    ))
+    asyncio.run(
+        CachedLLM(ScriptedLLM([content("x")]), cache, mode=ReplayMode.RECORD).invoke([{"role": "user", "content": "q"}])
+    )
 
     recorder = TraceRecorder("t-cache-status")
     inner = CachedLLM(ScriptedLLM([]), cache, mode=ReplayMode.REPLAY)
