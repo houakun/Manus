@@ -1,7 +1,7 @@
 llm_config:
-  base_url: https://api.deepseek.com/
-  api_key: sk-724fbed9ce1047a29b0ddbd51c6f685f
-  model_name: deepseek-reasoner
+  base_url: https://opencode.ai/zen/go/v1
+  api_key: ""  # 占位符：真密钥只放 .env / api/config.local.yaml（见 lab/config.py 的「密钥不进版本库」约定）
+  model_name: deepseek-v4.1-flash
   temperature: 0.7
   max_tokens: 8192
 agent_config:
@@ -11,4 +11,4 @@ agent_config:
 mcp_config:
   mcpServers: {}
 a2a_config:
-  a2a_servers: [ ]
+  a2a_servers: []
