@@ -23,7 +23,7 @@ import csv
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from lab.bench.judge import JUDGE_DIMENSIONS, JUDGE_RUBRIC_VERSION
 
@@ -117,8 +117,8 @@ class Calibration:
 
 
 def calibrate(
-    gold: Dict[str, Dict[str, Optional[bool]]],
-    judged: Dict[str, Dict[str, Optional[bool]]],
+    gold: Mapping[str, Mapping[str, Optional[bool]]],
+    judged: Mapping[str, Mapping[str, Optional[bool]]],
     *,
     dimensions: Iterable[str] = JUDGE_DIMENSIONS,
 ) -> Calibration:
@@ -126,6 +126,10 @@ def calibrate(
 
     :param gold: `{sample_id: {dimension: True/False/None}}`（None = 该样本未标注）
     :param judged: `{sample_id: {dimension: True/False/None}}`（None = judge 答 Unknown）
+
+    参数类型用 `Mapping` 而不是 `Dict`：这里**只读不写**，而 `Dict` 的值类型是不变的 ——
+    调用方手里是 `dict[str, dict[str, bool]]`（测试里的金标就是这样）时会被静态检查判为不兼容，
+    于是每个调用点都得加注解。用 `Mapping` 后 `dict[str, dict[str, bool]]` 天然可传。
     """
     items: List[DimensionCalibration] = []
     for dimension in dimensions:
@@ -169,7 +173,7 @@ GOLD_COLUMNS = (
 )
 
 
-def write_label_sheet(rows: List[Dict[str, object]], path: Path) -> int:
+def write_label_sheet(rows: Sequence[Mapping[str, object]], path: Path) -> int:
     """写一份**待人工标注**的 CSV（judge 的结果刻意不写进去，避免锚定）。
 
     为什么不把 judge 的判定放进同一张表：那会让人在"看到机器答案"之后标注，
@@ -210,6 +214,23 @@ def read_gold_csv(path: Path) -> Dict[str, Dict[str, Optional[bool]]]:
     except OSError as exc:
         raise RuntimeError(f"读金标失败 {path}: {exc}") from exc
     return gold
+
+
+def read_gold_rows(path: Path) -> List[Dict[str, str]]:
+    """读回标注表的**原始行**（给“跑 judge”用：它还需要 `task_key` 与 `artifact_dir`）。
+
+    与 `read_gold_csv` 的分工：那个只关心**标签**（用于算 κ）；
+    这个关心**材料从哪里来** —— 没有它就无法把样本还原成“目标 + 产物”。
+    """
+    rows: List[Dict[str, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                if (row.get("sample_id") or "").strip():
+                    rows.append(dict(row))
+    except OSError as exc:
+        raise RuntimeError(f"读标注表失败 {path}: {exc}") from exc
+    return rows
 
 
 def render_calibration(cal: Calibration) -> str:

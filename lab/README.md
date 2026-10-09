@@ -74,7 +74,8 @@ python -m lab trace
 | `lab bench sample-failures` | 从库里挑失败运行逐个展示（读 transcript 的入口） | 免费 |
 | `lab bench recover` | 从工作区 + 轨迹重建一次中断的评测 | 免费 |
 | `lab bench judge-sheet` | 生成 LLM-judge 的**人工标注表**（默认 100 条，失败优先） | 免费 |
-| `lab bench calibrate --gold <csv>` | 算 Cohen's κ + 每维混淆矩阵；κ<0.6 或样本<20 → **拒绝启用** | 免费 |
+| `lab bench judge` | 对标注表跑 LLM-judge，产出判定 JSON（`calibrate` 的输入；默认不跑，`--yes` 才真调模型） | 💰 |
+| `lab bench calibrate --gold <csv> [--judged <json>]` | 算 Cohen's κ + 每维混淆矩阵；κ<0.6 或样本<20 → **拒绝启用** | 免费 |
 | `lab sandbox clean-escapes` | 清理脚本逃逸到工作区外的残留 | 免费 |
 | `lab sandbox env` | **Agent 会看到的环境指纹**（工具面 + 短摘要，`--json` 可机读） | 免费 |
 
@@ -475,7 +476,7 @@ which sqlite3 || (sudo apt-get update -y && sudo apt-get install -y sqlite3)
 | **地板的很大一部分是装置问题，不是模型抖动** | 已定位到五个机制，已修 4 个：✅ CRLF/GBK 乱码（命令**输出**，`cmp` 6→0）；✅ **文件里的 CRLF**（终态 LF，与命令输出/read_file 一致）；✅ **脚本内容里的绝对路径逃逸**（虚拟盘符，重测逃逸 0/42）；✅ **子进程 PATH 不随启动上下文变**（固定前缀 + 环境指纹）；🔴 **"缺 `sqlite3`" 已证伪**（从命令文本误推） |
 | **成功率的地板是 ±0.00pt，但那是假象** | 离散指标在"无任务翻转"时配对区间会塔成 0；它**不能**用来判小幅度成功率差异 |
 | 任务集 8 个半真实任务 | `pass^k` 的样本量是**任务数**，区间较宽 |
-| 判定器不支持开放式任务 | LLM-judge **骨架已就位**（`bench judge-sheet` / `bench calibrate`：按维度独立调用、`Unknown` 不计入 κ），但**尚未校准** —— 真实 κ 要等人工标完 100 条金标（`lab/runs/judge_gold.csv`）才算；在那之前 `calibrate` 如实报“无法计算”并**拒绝启用** |
+| 判定器不支持开放式任务 | LLM-judge **骨架已就位**（`bench judge-sheet` / **`bench judge`** / `bench calibrate`：按维度独立调用、`Unknown` 不计入 κ），但**尚未校准** —— 真实 κ 要等人工标完 100 条金标（`lab/runs/judge_gold.csv`）**并跑一次 `bench judge`** 才有对照；在那之前 `calibrate` 如实报“无法计算”并**拒绝启用** |
 | fast mode 沙箱**曾经**可被脚本逃逸 | 已修：每次运行分配一个 `subst` 虚拟盘，脚本里的 `/home/ubuntu/...` 会落回工作区（见 `docs/step8-device-fixes.md` §4）。残留风险：`subst` 不可用（组策略/盘符占满）时会**告警式退化**回旧行为 —— 所以仍只能跑可信内容 |
 | Pareto 只有 2 个取舍点 | 画不出曲线，需要跑多组有意取舍的配置 |
 | SUT 提示词里带随机 UUID | 精确回放必然未命中；需 `--replay-ignore-volatile`（已可事后开启） |

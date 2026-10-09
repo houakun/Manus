@@ -1154,6 +1154,133 @@ def _cmd_bench_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bench_judge(args: argparse.Namespace) -> int:
+    """`lab bench judge`：对标注表里的样本跑 LLM-judge，产出判定 JSON（T14 收尾，💰）。
+
+    为什么要有它：`calibrate` 要算 κ 就必须有"judge 的判定"，而在它之前**没有任何入口**
+    能生成这份判定 —— 于是 κ 永远算不出来（只能手写一次性脚本，不可审计）。
+    这条命令把链路闭合：`judge-sheet`（抽样本）→ **`judge`（跑判定）** → `calibrate`（算 κ）。
+
+    为什么默认不跑：每条样本要按 3 个维度**各调一次**模型（98 条 = 294 次调用）。
+    按项目纪律，付费动作必须先打印预估，`--yes` 才真跑。
+    """
+    import asyncio
+
+    from lab.bench.calibrate import read_gold_rows
+    from lab.bench.judge import (
+        ARTIFACT_MAX_TOTAL_CHARS,
+        JUDGE_DIMENSIONS,
+        JUDGE_RUBRIC_VERSION,
+        collect_artifacts,
+        judge_entries,
+    )
+    from lab.bench.task import load_all_tasks
+    from lab.config import load_llm_config
+
+    gold_path = Path(args.gold) if args.gold else ensure_runs_dir() / "judge_gold.csv"
+    if not gold_path.exists():
+        print(f"[lab] 找不到标注表 {gold_path}", file=sys.stderr)
+        print("  先跑：python -m lab bench judge-sheet", file=sys.stderr)
+        return 2
+    rows = read_gold_rows(gold_path)
+    if args.limit:
+        rows = rows[: args.limit]
+    if not rows:
+        print(f"[lab] {gold_path} 里没有可用的样本", file=sys.stderr)
+        return 2
+
+    # 目标（goal）从任务集读，**不给期望值**：judge 的判断依据只有"目标 + 产物"。
+    # 给了期望值，κ 量的就不再是"judge 会不会判"，而是"judge 会不会抄"。
+    goals = {task.key: task.goal for task in load_all_tasks()}
+    entries: List[dict] = []
+    unknown_tasks: List[str] = []
+    for row in rows:
+        key = (row.get("task_key") or "").strip()
+        goal = goals.get(key)
+        if goal is None:
+            unknown_tasks.append(key)
+            continue
+        entries.append(
+            {
+                "sample_id": row["sample_id"].strip(),
+                "goal": goal,
+                "artifacts": collect_artifacts(row.get("artifact_dir") or ""),
+            }
+        )
+    if unknown_tasks:
+        print(f"[lab] 这些任务的 goal 找不到（任务集改过？）：{sorted(set(unknown_tasks))}", file=sys.stderr)
+    if not entries:
+        return 2
+
+    llm_config = load_llm_config(temperature=args.temperature)
+    calls = len(entries) * len(JUDGE_DIMENSIONS)
+    out_path = Path(args.out) if args.out else ensure_runs_dir() / "judge_judged.json"
+
+    print(f"judge 预估（rubric {JUDGE_RUBRIC_VERSION}）：")
+    print(f"  样本 {len(entries)} 条 × 维度 {len(JUDGE_DIMENSIONS)} 个 = **{calls} 次 LLM 调用**")
+    print(
+        f"  材料总量 {sum(len(e['artifacts']) for e in entries)} 字符"
+        f"（每条上限 {ARTIFACT_MAX_TOTAL_CHARS}；进 prompt 前 judge 还会再截到 6000）"
+    )
+    print(f"  模型 {llm_config.model_name}，温度 {llm_config.temperature}")
+    print(f"  输出 {out_path}")
+    if not args.yes:
+        print("\n这是**付费**动作（每条 3 次调用）。建议先冒烟 3 条：")
+        print(f"  python -m lab bench judge --limit 3 --yes --out {out_path}")
+        print("确认整批再跑：加 `--yes`。")
+        return 2
+
+    from app.infrastructure.external.llm.openai_llm import OpenAILLM
+
+    llm = OpenAILLM(llm_config)
+    print()
+
+    def _progress(done: int, total: int) -> None:
+        # 逐条报进度：294 次调用要几分钟，没有进度会让人以为卡死
+        print(f"  [{done}/{total}] 已完成", flush=True)
+
+    judged = asyncio.run(judge_entries(llm, entries, concurrency=args.concurrency, on_progress=_progress))
+
+    payload = {
+        # `__meta__` 不会被 `calibrate` 当成样本：它遍历的是**金标**里的 sample_id，
+        # 取判定用 `judged.get(sample_id)`。写在这里是为了让这份判定可审计
+        # （哪个 rubric、哪个模型、什么时候跑的）。
+        "__meta__": {
+            "rubric_version": JUDGE_RUBRIC_VERSION,
+            "model_name": llm_config.model_name,
+            "temperature": llm_config.temperature,
+            "samples": len(entries),
+            "dimensions": list(JUDGE_DIMENSIONS),
+            "gold_csv": str(gold_path),
+        },
+        **judged,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 逐维度统计：Unknown 比例高说明 judge 比人更保守（材料不足时不敢下结论）。
+    # 那不是错误，但它会直接减少参与 κ 的对照样本 —— 所以必须看得见。
+    print()
+    print("各维度判定分布：")
+    for dimension in JUDGE_DIMENSIONS:
+        n_true = n_false = n_unknown = 0
+        for sample_id in judged:
+            value = (judged.get(sample_id) or {}).get(dimension)
+            # 三态必须分开数：judge 答 Unknown（None）**不等于** false。
+            # 先判 None 再判真值，而不是写 `value is True` —— 后者是合法惯用法，
+            # 但会撞上 ast-grep 的 `no-identity-literal`（那条规则针对 `x is 1` 这种真 bug）。
+            if value is None:
+                n_unknown += 1
+            elif value:
+                n_true += 1
+            else:
+                n_false += 1
+        print(f"  {dimension:22} true={n_true:3}  false={n_false:3}  unknown={n_unknown:3}")
+    print(f"\n判定已写入 {out_path}")
+    print(f"算 κ：python -m lab bench calibrate --gold {gold_path} --judged {out_path}")
+    return 0
+
+
 def _cmd_bench_list(args: argparse.Namespace) -> int:
     """`lab bench list`：列出历史评测。"""
     from lab.api import default_trace_store
@@ -1793,6 +1920,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--judged", default=None, help="judge 的判定 JSON（可选；缺它就只报「无法计算」，不会编数字）"
     )
     bench_cal.set_defaults(func=_cmd_bench_calibrate)
+
+    bench_judge = bench_sub.add_parser("judge", help="对标注表跑 LLM-judge，产出判定 JSON（calibrate 的输入；💰）")
+    bench_judge.add_argument("--gold", default=None, help="标注表 CSV（默认 lab/runs/judge_gold.csv）")
+    bench_judge.add_argument("--out", default=None, help="判定 JSON 输出路径（默认 lab/runs/judge_judged.json）")
+    bench_judge.add_argument("--limit", type=int, default=None, help="只跑前 N 条（冒烟用）")
+    bench_judge.add_argument("--concurrency", type=int, default=4, help="并发数（默认 4）")
+    bench_judge.add_argument("--temperature", type=float, default=0.0, help="judge 的温度（默认 0.0：要可复现）")
+    bench_judge.add_argument("--yes", action="store_true", help="确认付费（不带它只打印预估）")
+    bench_judge.set_defaults(func=_cmd_bench_judge)
 
     bench_show = bench_sub.add_parser("show", help="读一次具体运行的轨迹（工具序列 + 失败检查 + 关键产物 + 轨迹树）")
     bench_show.add_argument("suite", help="suite（支持短 id 或 label 片段）")

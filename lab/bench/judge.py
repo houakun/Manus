@@ -23,10 +23,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 # rubric 版本：**改提示词就必须改它**（否则不同版本的人工金标会被混在一起算 κ）。
 JUDGE_RUBRIC_VERSION = "v1"
@@ -115,7 +117,12 @@ def parse_verdict(dimension: str, text: str) -> JudgeVerdict:
                             error="输出里找不到 JSON 对象")
     try:
         payload = json.loads(match.group(0))
-    except (TypeError, ValueError) as exc:
+    # 下面这行被 ast-grep 的 `no-boolean-in-except` 报为 error，但它**是误报**：
+    # 该规则想抓的是 `except (A or B)`（`or` 会先求值 → 抓不到异常），而它实现里的
+    # `stopBy: end` 会连 except **体**一起扫，于是命中体里的 `text or ""`。
+    # 这里 `(TypeError, ValueError)` 是合法的异常元组，所以按项目惯例（见 ruff.toml 对 S608
+    # 的处理）**记录误报**而不是为迁就工具去改正确的代码。
+    except (TypeError, ValueError) as exc:  # pi-lens-ignore: no-boolean-in-except
         return JudgeVerdict(dimension=dimension, verdict=None, raw=text or "",
                             error=f"JSON 解析失败: {exc}")
     value = payload.get("verdict")
@@ -148,3 +155,98 @@ async def judge_run(
         verdicts.append(await judge_dimension(llm, goal=goal, artifacts=artifacts,
                                               dimension=dimension))
     return JudgeReport(verdicts=verdicts)
+
+
+# ==================== 跑 judge：从工作区收集材料（T14 收尾） ====================
+
+# 为什么不能复用 `bench show` 的产物渲染：两者**目的**不同。
+# `bench show` 是给人看"Agent 交了什么"，所以排除 `input/`（那是题目素材）；
+# 而 judge 要判断"目标有没有达成"，需要工作区**全貌** —— 例如
+# `sem_refactor_config` 要求改写题目给的 `input/service.py`，排除它 judge 就无从判断。
+# 代价是 prompt 变长，所以下面三个上限必须存在（judge 的成本要可预估）。
+ARTIFACT_MAX_FILES = 40
+ARTIFACT_MAX_CHARS_PER_FILE = 1500
+ARTIFACT_MAX_TOTAL_CHARS = 12000
+
+
+def collect_artifacts(
+    workspace: str,
+    *,
+    max_files: int = ARTIFACT_MAX_FILES,
+    max_chars_per_file: int = ARTIFACT_MAX_CHARS_PER_FILE,
+    max_total_chars: int = ARTIFACT_MAX_TOTAL_CHARS,
+) -> str:
+    """把工作区里的文本材料拼成 judge 的输入（**材料不足时要如实说**）。
+
+    - 排除 `__pycache__`；二进制按 NUL 字节识别（否则会把 `.pyc` 打成乱码进 prompt）；
+    - `input/` **保留**并标注来源（有的任务要求改写题目给的源文件）；
+    - 逐文件 + 总量双重截断：没有上界的 prompt 会让成本不可预估。
+    """
+    root = Path(workspace) / "home" / "ubuntu"
+    if not root.is_dir():
+        return "（工作区不存在：没有可判断的产物）"
+    files = sorted(f for f in root.rglob("*") if f.is_file() and "__pycache__" not in f.parts)
+    if not files:
+        return "（工作区里没有任何文件）"
+
+    parts: List[str] = []
+    used = 0
+    for path in files[:max_files]:
+        rel = path.relative_to(root).as_posix()
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        tag = "（题目输入，可能被 Agent 改写）" if rel.startswith("input/") else ""
+        if b"\x00" in raw[:2048]:
+            parts.append(f"--- {rel} {tag}({len(raw)}B，二进制，未展开)")
+            continue
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+        body = text[:max_chars_per_file]
+        suffix = "…（截断）" if len(text) > len(body) else ""
+        block = f"--- {rel} {tag}\n{body}{suffix}"
+        if used + len(block) > max_total_chars:
+            parts.append("…（其余文件因总量上限未展开）")
+            break
+        parts.append(block)
+        used += len(block)
+    if len(files) > max_files:
+        parts.append(f"…（另有 {len(files) - max_files} 个文件未列出）")
+    return "\n\n".join(parts)
+
+
+async def judge_entries(
+    llm: Any,
+    entries: List[Dict[str, str]],
+    *,
+    dimensions: Optional[List[str]] = None,
+    concurrency: int = 4,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> Dict[str, Dict[str, Optional[bool]]]:
+    """对多条样本跑 judge，返回 `{sample_id: {dimension: bool | None}}`。
+
+    - 每个维度**独立调用**（复用 `judge_run`，不合并 prompt）；
+    - 返回 `None` 而不是省略键：`calibrate` 的契约是"None = Unknown"；
+    - 单条样本失败不会毁掉整批（`judge_dimension` 已把异常转成 Unknown）。
+    """
+    dims = list(dimensions or JUDGE_DIMENSIONS)
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    out: Dict[str, Dict[str, Optional[bool]]] = {}
+    done = 0
+
+    async def _one(entry: Dict[str, str]) -> None:
+        nonlocal done
+        async with semaphore:
+            report = await judge_run(
+                llm,
+                goal=entry.get("goal", ""),
+                artifacts=entry.get("artifacts", ""),
+                dimensions=dims,
+            )
+            out[entry["sample_id"]] = {v.dimension: v.verdict for v in report.verdicts}
+            done += 1
+            if on_progress is not None:
+                on_progress(done, len(entries))
+
+    await asyncio.gather(*(_one(entry) for entry in entries))
+    return out

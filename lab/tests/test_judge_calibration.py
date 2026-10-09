@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from typing import Dict, Optional
 
 import pytest
 
@@ -57,7 +58,9 @@ def test_kappa_is_none_when_gold_has_single_class():
 def test_unknown_is_excluded_from_kappa_denominator():
     """judge 答 Unknown 的样本不进配对，但**要单独计数**（可见性）。"""
     gold = {f"s{i}": {d: True for d in JUDGE_DIMENSIONS} for i in range(30)}
-    judged = {sid: {d: True for d in JUDGE_DIMENSIONS} for sid in gold}
+    # 显式标注三态：`{d: None ...}` 要能赋值回去，否则静态检查会因为
+    # `dict[str, bool]` 的值类型**不变**而报错（运行时没问题，但注解该说真话）。
+    judged: Dict[str, Dict[str, Optional[bool]]] = {sid: {d: True for d in JUDGE_DIMENSIONS} for sid in gold}
     for sid in list(judged)[:10]:
         judged[sid] = {d: None for d in JUDGE_DIMENSIONS}  # 10 条 Unknown
 
@@ -136,3 +139,94 @@ def test_label_sheet_does_not_leak_judge_verdicts(tmp_path):
     # 空单元格读回时必须是 None（未标注 ≠ 判为 False）
     gold = read_gold_csv(path)
     assert gold["s1"]["task_completion"] is None
+
+
+# ==================== 跑 judge（`bench judge`）的材料收集与批量执行 ====================
+
+
+def test_collect_artifacts_keeps_input_and_skips_noise(tmp_path):
+    """收集材料的三条口径：排除 `__pycache__`、二进制只列不展开、`input/` 要**保留并标注**。
+
+    为什么 `input/` 要保留：`sem_refactor_config` 要求改写题目给的 `input/service.py` ——
+    排除它 judge 就无从判断。（`bench show` 排除它是因为那里的目的是"给人看产物"。）
+    """
+    from lab.bench.judge import collect_artifacts
+
+    root = tmp_path / "home" / "ubuntu"
+    (root / "input").mkdir(parents=True)
+    (root / "__pycache__").mkdir(parents=True)
+    (root / "out.txt").write_text("385\n", encoding="utf-8")
+    (root / "input" / "service.py").write_text("port = 8080\n", encoding="utf-8")
+    (root / "__pycache__" / "x.pyc").write_bytes(b"\x00\x01\x02")
+    (root / "blob.bin").write_bytes(b"\x00\xff\x00")
+
+    text = collect_artifacts(str(tmp_path))
+    assert "out.txt" in text and "385" in text
+    assert "input/service.py" in text and "题目输入" in text
+    assert "__pycache__" not in text
+    # 二进制要**列出来**（否则"少了一个文件"看不出来），但不展开内容
+    assert "blob.bin" in text and "二进制" in text
+
+
+def test_collect_artifacts_says_so_when_nothing_to_judge(tmp_path):
+    """没有材料时必须**如实说**，不能返回空串 —— 空串会被 judge 当成"材料里没提"。"""
+    from lab.bench.judge import collect_artifacts
+
+    assert "工作区不存在" in collect_artifacts(str(tmp_path / "nope"))
+    (tmp_path / "home" / "ubuntu").mkdir(parents=True)
+    assert "没有任何文件" in collect_artifacts(str(tmp_path))
+
+
+def test_judge_entries_tristate_and_failure_isolation():
+    """批量跑 judge：返回三态，且**单条失败不炸整批**（失败的样本仍留下 None 键）。"""
+    import asyncio
+
+    from lab.bench.judge import judge_entries
+
+    class _FakeLLM:
+        async def invoke(self, messages, **kwargs):
+            prompt = messages[-1]["content"]
+            if "boom" in prompt:
+                raise RuntimeError("上游 500")
+            if "不确定" in prompt:
+                return {"content": '{"verdict": "unknown"}'}
+            return {"content": '{"verdict": true, "reason": "ok"}'}
+
+    entries = [
+        {"sample_id": "s-ok", "goal": "写文件", "artifacts": "内容"},
+        {"sample_id": "s-unknown", "goal": "写文件 不确定", "artifacts": "内容"},
+        {"sample_id": "s-boom", "goal": "写文件 boom", "artifacts": "内容"},
+    ]
+    judged = asyncio.run(judge_entries(_FakeLLM(), entries, concurrency=2))
+
+    assert set(judged) == {"s-ok", "s-unknown", "s-boom"}
+    assert all(v is True for v in judged["s-ok"].values())
+    assert all(v is None for v in judged["s-unknown"].values())
+    # 抛异常的那条也必须**留下键**：省略键会让 calibrate 当它不存在，
+    # 而"judge 崩了"和"judge 说不知道"对 κ 的影响不同，必须可见。
+    assert all(v is None for v in judged["s-boom"].values())
+
+
+def test_read_gold_rows_keeps_material_columns(tmp_path):
+    """`read_gold_rows` 必须带出 `task_key` / `artifact_dir` —— 否则无法还原"目标 + 产物"。"""
+    from lab.bench.calibrate import read_gold_rows
+
+    path = tmp_path / "g.csv"
+    path.write_text(
+        "sample_id,task_key,artifact_dir,human_task_completion\n"
+        "s1,syn_sum_range,/tmp/ws,true\n"
+        "s2,syn_sum_range,/tmp/ws2,\n",
+        encoding="utf-8",
+    )
+    rows = read_gold_rows(path)
+    assert [row["sample_id"] for row in rows] == ["s1", "s2"]
+    assert rows[0]["task_key"] == "syn_sum_range"
+    assert rows[0]["artifact_dir"] == "/tmp/ws"
+
+
+def test_meta_key_in_judged_json_does_not_disturb_calibration():
+    """`bench judge` 写的 `__meta__` 不能污染 κ（calibrate 只按**金标**的 sample_id 取判定）。"""
+    gold = {f"s{i}": {d: bool(i % 2) for d in JUDGE_DIMENSIONS} for i in range(40)}
+    payload = {"__meta__": {"rubric_version": "v1", "model_name": "m"}, **gold}
+    cal = calibrate(gold, payload)
+    assert cal.enabled is True

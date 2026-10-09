@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from lab.bench.runner import RunOutcome, SuiteResult, summarize_task
 from lab.bench.task import load_all_tasks
@@ -105,6 +106,76 @@ def test_cli_bench_run_refuses_expensive_run_without_yes(tmp_path, monkeypatch):
 
     assert code == 2
     assert called["n"] == 0  # 一步都没跑
+
+
+def test_cli_bench_judge_dry_run_writes_nothing(tmp_path, monkeypatch):
+    """`bench judge` 不带 `--yes`：只打印预估，**不调模型、不写判定文件**。
+
+    为什么钉住它：每条样本要花 3 次调用（98 条 = 294 次），"先看一眼命令"
+    若直接开跑就是一次付费评测 —— 项目纪律是付费动作必须显式确认
+    （与 `bench run` 同一套约定）。
+    """
+    monkeypatch.setattr("lab.cli.ensure_runs_dir", lambda: tmp_path)
+    gold = tmp_path / "judge_gold.csv"
+    gold.write_text(
+        "sample_id,task_key,artifact_dir\ns1,syn_sum_range,/nonexistent\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "judged.json"
+
+    code = main(["bench", "judge", "--gold", str(gold), "--out", str(out)])
+
+    assert code == 2  # 未确认 → 拒绝执行
+    assert not out.exists()  # 一个字节都没写
+
+
+def test_cli_bench_judge_reports_missing_gold(tmp_path, monkeypatch):
+    """标注表不存在时要**说清是哪一步缺**（并给出下一步命令），而不是抛裸异常。"""
+    monkeypatch.setattr("lab.cli.ensure_runs_dir", lambda: tmp_path)
+    code = main(["bench", "judge", "--gold", str(tmp_path / "nope.csv"), "--yes"])
+    assert code == 2
+
+
+def test_cli_bench_judge_writes_judged_json(tmp_path, monkeypatch):
+    """`bench judge --yes` 的完整链路（用假 LLM）：判定 JSON 的**形状**要能被 calibrate 直接用。
+
+    这一条守的是接口契约：`{sample_id: {维度: 三态}}` —— 键少了、维度少了、
+    或把 `None` 写成 `false`，都会让下游的 κ 静默算错。
+    """
+    import app.infrastructure.external.llm.openai_llm as sut_llm
+
+    from lab.bench.judge import JUDGE_DIMENSIONS
+
+    class _FakeLLM:
+        def __init__(self, config, **kwargs) -> None:
+            self.config = config
+
+        async def invoke(self, messages, **kwargs):
+            return {"content": '{"verdict": true, "reason": "ok"}'}
+
+    monkeypatch.setattr(sut_llm, "OpenAILLM", _FakeLLM)
+    monkeypatch.setattr("lab.cli.ensure_runs_dir", lambda: tmp_path)
+
+    workspace = tmp_path / "ws"
+    (workspace / "home" / "ubuntu").mkdir(parents=True)
+    (workspace / "home" / "ubuntu" / "sum.txt").write_text("500500\n", encoding="utf-8")
+
+    gold = tmp_path / "judge_gold.csv"
+    gold.write_text(
+        f"sample_id,task_key,artifact_dir\ns1,syn_sum_range,{workspace}\ns2,syn_sum_range,{workspace}\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "judged.json"
+
+    code = main(["bench", "judge", "--gold", str(gold), "--out", str(out), "--yes"])
+
+    assert code == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert set(payload) == {"__meta__", "s1", "s2"}
+    assert payload["__meta__"]["samples"] == 2
+    for sample_id in ("s1", "s2"):
+        assert set(payload[sample_id]) == set(JUDGE_DIMENSIONS)
+        assert all(value is True for value in payload[sample_id].values())
 
 
 def test_cli_bench_list_and_report(tmp_path, monkeypatch):
