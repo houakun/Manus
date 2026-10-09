@@ -62,23 +62,31 @@ def kind_of(check: Any) -> str:
     return f"其它({kind})"
 
 
-def rule_labels(kinds: Mapping[str, int]) -> Tuple[bool, bool]:
-    """现行规则 → `(instruction_following, output_quality)`。
+def rule_labels(kinds: Mapping[str, int]) -> Tuple[bool, bool, bool]:
+    """现行规则 → `(task_completion, instruction_following, output_quality)`。
 
-    - **IF 只看形状**：形状坏了 → false；内容错**不影响** IF。
-    - **OQ 看"有没有一个可接受的产物"**：**任何失败都算 false**。
+    - **TC**：任何失败 → false（“**交付物完整性**”读法：要求的产物没按要求交出来，就是没完成）。
+    - **IF 只看形式**：形状坏了 → false；内容错**不影响** IF。
+    - **OQ 看“有没有一个可接受的产物”**：**任何失败都算 false**。
       ⚠️ 反过来不成立：OQ 还能看到**判定器看不见的内容错**（那正是 judge 存在的理由）——
-      所以"判据全过但人/judge 说 OQ=false"是**合法**的，不是规则违反。
+      所以“判据全过但人/judge 说 OQ=false”是**合法**的，不是规则违反。
+
+    ⚠️ **TC 也要比**：实测踩过 —— 审计只比 IF/OQ 时，我把 16 条 `ci_*`（诊断没点出正确模块、
+    但代码修好、CI 通过）标成 TC=true，**违背了本函数写的规则，却没有工具报出来**。
     """
     if not kinds:
-        return True, True
-    return (not any(k == "形状" for k in kinds)), False
+        return True, True, True
+    return False, (not any(k == "形状" for k in kinds)), False
 
 
-def _tri(row: Mapping[str, str], prefix: str) -> Optional[Tuple[bool, bool]]:
-    """从一行里取 `(IF, OQ)`；任一为空 → `None`（未标注/Unknown）。"""
+def _tri(row: Mapping[str, str], prefix: str) -> Optional[Tuple[bool, bool, bool]]:
+    """从一行里取 `(TC, IF, OQ)`；任一为空 → `None`（未标注/Unknown）。"""
     values = []
-    for column in (f"{prefix}instruction_following", f"{prefix}output_quality"):
+    for column in (
+        f"{prefix}task_completion",
+        f"{prefix}instruction_following",
+        f"{prefix}output_quality",
+    ):
         raw = (row.get(column) or "").strip().lower()
         if raw in ("true", "1", "yes", "y"):
             values.append(True)
@@ -86,22 +94,22 @@ def _tri(row: Mapping[str, str], prefix: str) -> Optional[Tuple[bool, bool]]:
             values.append(False)
         else:
             return None
-    return values[0], values[1]
+    return values[0], values[1], values[2]
 
 
-def _judge_tri(verdict: Mapping[str, Optional[bool]]) -> Optional[Tuple[bool, bool]]:
-    """judge 判定里的 `(IF, OQ)`；**任一项是 None（Unknown）→ 整体返回 None**。
+def _judge_tri(verdict: Mapping[str, Optional[bool]]) -> Optional[Tuple[bool, bool, bool]]:
+    """judge 判定里的 `(TC, IF, OQ)`；**任一项是 None（Unknown）→ 整体返回 None**。
 
     与 `_tri` 分开：金标里的值是从 CSV 读出来的**字符串**，judge 判定里是真正的 `bool`/`None`。
     把两者合成一个函数就得写一堆宽容判断，而那种"宽容"恰恰是这类工具最不该有的东西。
     """
     values: List[bool] = []
-    for dimension in ("instruction_following", "output_quality"):
+    for dimension in ("task_completion", "instruction_following", "output_quality"):
         value = verdict.get(dimension)
         if value is None:
             return None
         values.append(bool(value))
-    return values[0], values[1]
+    return values[0], values[1], values[2]
 
 
 @dataclass
@@ -111,9 +119,9 @@ class AuditRow:
     sample_id: str
     task_key: str
     failed: str  # 失败分类的可读描述（如 `形状×2、内容×1`）
-    rule: Tuple[bool, bool]
-    human: Optional[Tuple[bool, bool]] = None
-    judge: Optional[Tuple[bool, bool]] = None
+    rule: Tuple[bool, bool, bool]
+    human: Optional[Tuple[bool, bool, bool]] = None
+    judge: Optional[Tuple[bool, bool, bool]] = None
     notes: List[str] = field(default_factory=list)
 
     @property
@@ -187,8 +195,9 @@ def render_audit(rows: Sequence[AuditRow], *, limit: int = 20) -> List[str]:
             key = "；".join(
                 f"{name} 规则={rule_value} judge={judge_value}"
                 for name, rule_value, judge_value in (
-                    ("IF", item.rule[0], judge[0]),
-                    ("OQ", item.rule[1], judge[1]),
+                    ("TC", item.rule[0], judge[0]),
+                    ("IF", item.rule[1], judge[1]),
+                    ("OQ", item.rule[2], judge[2]),
                 )
                 if rule_value != judge_value
             )
