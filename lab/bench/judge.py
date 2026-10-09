@@ -36,6 +36,23 @@ JUDGE_RUBRIC_VERSION = "v1"
 # 三个维度：各自独立调用，互不牵连。
 JUDGE_DIMENSIONS = ("task_completion", "instruction_following", "output_quality")
 
+# ==================== 维度边界：实测定下来的，不是猜的 ====================
+#
+# `instruction_following` 与 `output_quality` 的边界最容易糊 —— 两轮校准里**绝大多数分歧
+# 都集中在这里**：111 条样本中有 **28 条**是“人工判 instruction_following=true 而 judge 判 false”，
+# 而原因都是同一件：**judge 把“内容错”读成了“约束没遵守”**
+# （例如诊断说明里写错了数字、配置里的端口号写错 —— 那些属于 output_quality）。
+#
+# 本项目采用的边界（供人工标注与未来的 rubric 版本对齐）：
+#   - `instruction_following` = **显式约束的“形状”**：要求的文件在不在、路径/文件名对不对、
+#     结构/字段名/表头顺序对不对、有没有碰不该碰的冻结文件。**不看内容对不对**。
+#   - `output_quality` = **内容正确性**：数值对不对、文字是不是事实、有没有残缺或占位。
+#   - 归因规则：**内容错但形状对 → `output_quality=false`、`instruction_following=true`**。
+#
+# ⚠️ 这段只是**文档**：下面 `RUBRIC` 里**喂给模型的文本一个字没改**，所以版本仍是 v1，
+# 现有金标仍可与 v1 的判定混算。若要把这条边界**写进提示词**（让 judge 也照它判），
+# 就必须把 `JUDGE_RUBRIC_VERSION` 升到 v2 并**重新标注 + 重跑**（旧金标不得与 v2 混算）——
+# 那件事本轮**刻意没做**，理由写在 `docs/judge-labeling-guide.md`。
 RUBRIC: Dict[str, str] = {
     "task_completion": "目标的**核心要求**是否真的完成了（产物能不能证明它完成了）",
     "instruction_following": "格式/路径/命名等**显式约束**是否遵守（例如要求的输出文件、字段名）",
