@@ -1361,7 +1361,12 @@ def _cmd_bench_calibrate(args: argparse.Namespace) -> int:
             )
             return 2
 
-    calibration = calibrate(gold, judged)
+    # 报告头必须写**产生这批判定的那个版本**（而不是当前默认版本）—— 否则
+    # “跨版本不得混算”这条纪律就没有依据可查（实测踩过：用 v3 跑的判定，报告头却写 v2）。
+    meta = judged.get("__meta__")
+    if not isinstance(meta, dict):  # 没写 meta / 写坏了 → 当没有，不猜
+        meta = {}
+    calibration = calibrate(gold, judged, rubric_version=str(meta.get("rubric_version") or "") or None)
     print(render_calibration(calibration))
     print()
     if calibration.enabled:

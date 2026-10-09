@@ -88,7 +88,27 @@ _RUBRIC_V2: Dict[str, str] = {
     ),
 }
 
-RUBRIC_BY_VERSION: Dict[str, Dict[str, str]] = {"v1": _RUBRIC_V1, "v2": _RUBRIC_V2}
+# v3：把 v2 里“命名 / 字段名”的范围**再收窄**。
+#
+# 依据：v2 之后仍有 **11 条**偏离，而且全是同一个形状 —— **某个字段的“值”写错了**
+# （典型：`diagnosis.json` 的 `"file": "XXXXXXXX"`）。judge 把“值错”读成了
+# “命名没按要求”；而 v2 的描述里确实写着“结构/字段名…对不对” —— 它**有文本依据**。
+# 所以 v3 明说：**任何字段的“值”错都算内容问题**，即使那个字段装的就是个名字。
+_RUBRIC_V3: Dict[str, str] = {
+    "task_completion": "目标的**核心要求**是否真的完成了（产物能不能证明它完成了）",
+    "instruction_following": (
+        "**显式约束的“形式”**是否遵守 —— 只看这些：要求的文件在不在、"
+        "文件本身的路径/文件名对不对、结构/键名/表头顺序对不对、有没有碰不该碰的文件。"
+        "**任何字段的“值”写错都算内容问题**（包括那个字段装的就是文件名、符号名、测试名）——"
+        "值错一律属于 output_quality，**不算这一维的违反**。这一维只看形式，不读值的内容。"
+    ),
+    "output_quality": (
+        "**内容正确性**：数值对不对、文字是不是事实、字段的“值”对不对、有没有残缺或占位。"
+        "只判内容，不判形式（路径/文件名/键名/表头那些属于 instruction_following）。"
+    ),
+}
+
+RUBRIC_BY_VERSION: Dict[str, Dict[str, str]] = {"v1": _RUBRIC_V1, "v2": _RUBRIC_V2, "v3": _RUBRIC_V3}
 JUDGE_RUBRIC_VERSIONS = tuple(RUBRIC_BY_VERSION)
 
 

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from lab.bench.judge import JUDGE_DIMENSIONS, JUDGE_RUBRIC_VERSION
+from lab.bench.judge import JUDGE_DIMENSIONS, JUDGE_RUBRIC_VERSION, active_rubric_version
 
 # 启用门槛：κ < 0.6 视为"一致性不足"，**拒绝启用**。
 # 为什么是 0.6：这是"substantial agreement"的常用下界；本项目所有阈值都要求有来源，
@@ -121,11 +121,16 @@ def calibrate(
     judged: Mapping[str, Mapping[str, Optional[bool]]],
     *,
     dimensions: Iterable[str] = JUDGE_DIMENSIONS,
+    rubric_version: Optional[str] = None,
 ) -> Calibration:
     """用人工金标校准 judge。
 
     :param gold: `{sample_id: {dimension: True/False/None}}`（None = 该样本未标注）
     :param judged: `{sample_id: {dimension: True/False/None}}`（None = judge 答 Unknown）
+    :param rubric_version: **产生这批判定的 rubric 版本**。不传就取当前生效版本 ——
+        但调用方（CLI）应当从判定文件的 `__meta__` 里取，否则报告头会写出”“当前默认版本”
+        而不是“这批数据到底是哪个版本跑的”，跨版本混算的判断依据就没了（实测踩过：
+        用 v3 跑的判定，报告头却写 `rubric v2`）。
 
     参数类型用 `Mapping` 而不是 `Dict`：这里**只读不写**，而 `Dict` 的值类型是不变的 ——
     调用方手里是 `dict[str, dict[str, bool]]`（测试里的金标就是这样）时会被静态检查判为不兼容，
@@ -154,7 +159,7 @@ def calibrate(
                 confusion=confusion(pairs),
             )
         )
-    return Calibration(dimensions=items)
+    return Calibration(dimensions=items, rubric_version=rubric_version or active_rubric_version())
 
 
 # ==================== 标注清单（给人工填） ====================
