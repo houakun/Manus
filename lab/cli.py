@@ -1162,7 +1162,7 @@ def _print_level_distribution(samples: List[Any]) -> None:
 
 async def _materialize_synthetic(samples: List[Any], by_key: dict, positives: dict) -> None:
     """把构造样本真正写进磁盘（mild 是"复制 + 扰动"，其余走 validate 的物化器）。"""
-    from lab.bench.sampling import LEVEL_MILD, derive_mild, materialize, product_paths_from_verify
+    from lab.bench.sampling import LEVEL_MILD, derive_mild, materialize
 
     for sample in samples:
         task = by_key.get(sample.task_key)
@@ -1171,9 +1171,9 @@ async def _materialize_synthetic(samples: List[Any], by_key: dict, positives: di
         if sample.level == LEVEL_MILD:
             source = positives.get(sample.task_key)
             if source:
-                # 扰动目标必须是**判定器检查的产物**（见 product_paths_from_verify）：
-                # 用“最大文件”会改到冻结的测试文件或 agent 的辅助脚本 —— 那样样本名不副实。
-                derive_mild(source, sample.artifact_dir, product_paths_from_verify(task))
+                # **定向降级**：按 verify 的期望值构造违反，并回跑判定器确认它**真的失败**。
+                # 返回 False 时不会落盘 —— 宁可少一条，也不给“轻微错”挂空名。
+                await derive_mild(task, source, sample.artifact_dir)
             continue
         await materialize(sample, task, level=sample.level)
 

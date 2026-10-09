@@ -190,30 +190,133 @@ def product_paths_from_verify(task) -> List[str]:
     return preferred + [rel for rel in fallback if rel not in preferred]
 
 
-def derive_mild(source_workspace: str, dest_workspace: str, targets: Sequence[str]) -> bool:
-    """从**正确产物**派生一个"轻微扰动"样本（复制目录 + 改一个数字）。
+def _ordered_checks(task) -> list:
+    """`verify` 的检查按"**非 fixture 路径优先**"排序（与 `product_paths_from_verify` 同一规矩）。"""
+    fixtures = {_relative_to_home(f.path) for f in (getattr(task, "fixtures", None) or [])}
+    preferred, fallback = [], []
+    for check in getattr(task, "verify", None) or []:
+        if not getattr(check, "path", None) and getattr(check, "value", None) is None:
+            continue
+        rel = _relative_to_home(getattr(check, "path", None))
+        bucket = fallback if rel in fixtures else preferred
+        bucket.append(check)
+    return preferred + fallback
 
-    `targets` 必须是**被判定器检查的产物路径**（见 `product_paths_from_verify`）。
-    找不到任何一个可扰动的目标 → 返回 False（**放弃这条，不伪造**）。
-    """
-    source = Path(source_workspace)
-    root = source / "home" / "ubuntu"
-    if not root.is_dir():
+
+def _wrong_number(value) -> str:
+    """把期望值改成一个**不同的**数字（整数给 ±1，浮点给 +1）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    if number.is_integer():
+        return str(int(number) + 1)
+    return repr(number + 1)
+
+
+def _mutate_json(node):
+    """就地改掉 JSON 里第一个标量叶子（返回是否改到）。"""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, bool) or value is None:
+                continue
+            if isinstance(value, str):
+                node[key] = value + "X"
+                return True
+            if isinstance(value, (int, float)):
+                node[key] = value + 1
+                return True
+            if isinstance(value, (dict, list)) and _mutate_json(value):
+                return True
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, bool) or value is None:
+                continue
+            if isinstance(value, str):
+                node[index] = value + "X"
+                return True
+            if isinstance(value, (int, float)):
+                node[index] = value + 1
+                return True
+            if isinstance(value, (dict, list)) and _mutate_json(value):
+                return True
+    return False
+
+
+def _violate(check, root: Path) -> bool:
+    """按**一条 check 的期望值**把对应产物改坏（返回是否改动成功）。"""
+    import json as _json
+
+    rel = _relative_to_home(getattr(check, "path", None))
+    kind = getattr(check, "kind", "") or ""
+    value = getattr(check, "value", None)
+
+    # 纯数值型：直接把数字写错（不依赖文件是否已存在）
+    if kind == "numeric" or (value is not None and not rel):
+        if not rel:
+            return False
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_wrong_number(value), encoding="utf-8")
+        return True
+
+    if not rel:
         return False
+    target = root / rel
+    if not target.is_file():
+        return False
+    text = target.read_text(encoding="utf-8", errors="replace")
 
-    chosen: str | None = None
-    for rel in targets:
-        candidate = root / rel
-        if not candidate.is_file():
-            continue
+    # "禁止出现"类：追加它 → 直接违反
+    if getattr(check, "not_contains", None):
+        target.write_text(text + "\n" + check.not_contains + "\n", encoding="utf-8")
+        return True
+    # "必须出现"类：把它抹掉
+    if getattr(check, "contains", None):
+        needle = check.contains
+        if needle not in text:
+            return False
+        target.write_text(text.replace(needle, "X" * len(needle)), encoding="utf-8")
+        return True
+    # JSON 相等：改一个叶子
+    if kind == "json_equals" and getattr(check, "equals", None):
         try:
-            if b"\x00" in candidate.read_bytes()[:2048]:
-                continue  # 二进制产物不扰动（改一个字节不是"轻微错"，是损坏）
-        except OSError:
-            continue
-        chosen = rel
-        break
-    if chosen is None:
+            payload = _json.loads(check.equals)
+        except (TypeError, ValueError):
+            return False
+        if not _mutate_json(payload):
+            return False
+        target.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return True
+    # CSV 行集：少一行（或改一格）
+    if kind == "csv_rows" and getattr(check, "rows", None):
+        rows = [list(map(str, row)) for row in check.rows]
+        if len(rows) <= 1:
+            return False
+        rows = rows[:-1]
+        target.write_text("\n".join(",".join(row) for row in rows) + "\n", encoding="utf-8")
+        return True
+    if kind == "numeric" and value is not None:
+        target.write_text(_wrong_number(value), encoding="utf-8")
+        return True
+    # 其余（file_content equals 等）：扰动一个字符
+    if getattr(check, "equals", None) or kind == "file_content":
+        target.write_text(perturb_text(text), encoding="utf-8")
+        return True
+    return False
+
+
+async def derive_mild(task, source_workspace: str, dest_workspace: str) -> bool:
+    """从**正确产物**派生一个"轻微错"样本，并**保证它真的会让判定失败**。
+
+    与旧的"改第一个数字"的关键区别：改完**回跑判定器**；没坏就删掉副本返回 False。
+    所以返回 True 的每一条都是**名副其实的负样本** —— "轻微错"不再是名义上的。
+    """
+    from lab.bench.verifier import run_checks
+    from lab.infra.local_sandbox import LocalSandbox
+
+    source = Path(source_workspace)
+    if not (source / "home" / "ubuntu").is_dir():
         return False
 
     dest = Path(dest_workspace)
@@ -221,15 +324,20 @@ def derive_mild(source_workspace: str, dest_workspace: str, targets: Sequence[st
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, dest)
+    dest_root = dest / "home" / "ubuntu"
 
-    product = dest / "home" / "ubuntu" / chosen
-    try:
-        text = product.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        shutil.rmtree(dest, ignore_errors=True)
-        return False
-    product.write_text(perturb_text(text), encoding="utf-8")
-    return True
+    for check in _ordered_checks(task):
+        if not _violate(check, dest_root):
+            continue
+        checks = await run_checks(task.verify, LocalSandbox(dest))
+        # `run_checks` 会就地改工作区吗？不会 —— 它只读产物并执行 exec_script。
+        if not (all(item.ok for item in checks) and bool(checks)):
+            return True  # 确实改坏了 → 这才是负样本
+    # 改不动，或改了判定照样过 → **不伪造**（宁可少一条）
+    shutil.rmtree(dest, ignore_errors=True)
+    return False
+
+
 async def materialize(sample: Sample, task, *, level: str) -> bool:
     """把一条构造样本真正写进磁盘（复用 `bench validate` 的物化器，不重写）。
 

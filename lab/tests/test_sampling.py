@@ -24,6 +24,7 @@ from lab.bench.sampling import (
     LEVEL_POSITIVE,
     LEVEL_WRONG,
     Candidate,
+    _violate,
     derive_mild,
     perturb_text,
     plan_synthetic,
@@ -91,42 +92,83 @@ def test_perturb_text_changes_the_first_digit():
     assert perturb_text("") == ""
 
 
-def test_derive_mild_copies_and_perturbs(tmp_path):
-    """`mild` 必须真的从**正确产物**派生（复制整目录 + 改一处），而不是凭空造。"""
-    source = tmp_path / "src"
-    product = source / "home" / "ubuntu" / "out.txt"
-    product.parent.mkdir(parents=True)
-    product.write_text("385", encoding="utf-8")
-    (source / "home" / "ubuntu" / "input").mkdir()
-    (source / "home" / "ubuntu" / "input" / "data.txt").write_text("素材", encoding="utf-8")
+def _task(key: str):
+    from lab.bench.task import load_all_tasks
 
-    dest = tmp_path / "dst" / "workspace"
-    assert derive_mild(str(source), str(dest), ["out.txt"]) is True
-
-    assert (dest / "home" / "ubuntu" / "input" / "data.txt").read_text(encoding="utf-8") == "素材"
-    assert (dest / "home" / "ubuntu" / "out.txt").read_text(encoding="utf-8") == "085"
-    # 源目录不能被改动（派生不是破坏）
-    assert product.read_text(encoding="utf-8") == "385"
+    return next(t for t in load_all_tasks() if t.key == key)
 
 
-def test_derive_mild_only_touches_the_graded_product(tmp_path):
-    """扰动目标必须**只**来自 `targets`（判定器检查的产物）—— 不能碰其它文件。
+def _correct_workspace(tmp_path, value: str = "500500"):
+    """造一个**正确**的 syn_sum_range 产物目录（真值 500500）。"""
+    ws = tmp_path / "src"
+    root = ws / "home" / "ubuntu"
+    (root / "input").mkdir(parents=True)
+    (root / "sum.txt").write_text(value, encoding="utf-8")
+    return ws
 
-    实测踩过：用“最大的文本文件”时，18 条 mild 里有 **4 条改到了
-    `repo/tests/run_tests.py`**（CI-FROZEN，任务禁止修改），另有 5 条改到了
-    agent 自己写的 verify 脚本 —— 那些样本其实**依然是对的**，标为负样本就是编数据。
+
+def test_derive_mild_guarantees_a_real_failure(tmp_path):
+    """`mild` 必须是**名副其实的负样本**：改完判定器**真的失败**，否则不返回 True。
+
+    这是与旧实现的关键区别 —— 旧版"改第一个数字"在 `ci_*` 上只改到说明文本里，
+    判定照样通过（18 条里只有 10 条真变错）。新版改完回跑判定器，没坏就删掉副本。
     """
-    source = tmp_path / "src2"
-    root = source / "home" / "ubuntu"
-    root.mkdir(parents=True)
-    (root / "graded.txt").write_text("123", encoding="utf-8")
-    # 一个很大、但**不是**被判定产物的文件：绝不能被扰动
-    (root / "aux_report.md").write_text("x" * 5000, encoding="utf-8")
+    import asyncio
 
-    dest = tmp_path / "dst2"
-    assert derive_mild(str(source), str(dest), ["graded.txt"]) is True
-    assert (dest / "home" / "ubuntu" / "graded.txt").read_text(encoding="utf-8") == "023"
-    assert (dest / "home" / "ubuntu" / "aux_report.md").read_text(encoding="utf-8") == "x" * 5000
+    from lab.bench.verifier import run_checks
+    from lab.infra.local_sandbox import LocalSandbox
+
+    task = _task("syn_sum_range")
+    source = _correct_workspace(tmp_path)
+    dest = tmp_path / "dst"
+
+    assert asyncio.run(derive_mild(task, str(source), str(dest))) is True
+
+    checks = asyncio.run(run_checks(task.verify, LocalSandbox(dest)))
+    assert not (all(c.ok for c in checks) and bool(checks)), "mild 样本必须让判定器失败"
+    # 源目录不能被改动（派生不是破坏）
+    assert (source / "home" / "ubuntu" / "sum.txt").read_text(encoding="utf-8") == "500500"
+
+
+def test_derive_mild_is_targeted_by_the_expected_value(tmp_path):
+    """定向：按 `verify` 的期望值构造违反（500500 → 500501），**不是**随便改一位。
+
+    "随便改一位"会让"轻微错"变成"随机错" —— 可能改到无关字段，任务其实仍然合格。
+    """
+    import asyncio
+
+    task = _task("syn_sum_range")
+    dest = tmp_path / "dst"
+    assert asyncio.run(derive_mild(task, str(_correct_workspace(tmp_path)), str(dest))) is True
+    written = (dest / "home" / "ubuntu" / "sum.txt").read_text(encoding="utf-8").strip()
+    assert written == "500501", f"应当写成期望值+1，实际 {written!r}"
+
+
+def test_derive_mild_leaves_no_copy_when_it_cannot_break_the_check(tmp_path):
+    """改不出"真失败"时返回 False 且**不留副本** —— 宁可少一条，不伪造负样本。"""
+    import asyncio
+
+    task = _task("syn_sum_range")
+    empty = tmp_path / "empty"
+    (empty / "home" / "ubuntu").mkdir(parents=True)
+    dest = tmp_path / "dst"
+
+    # syn_sum_range 的判定是 numeric：总能写出错数字 → 这条会成功
+    assert asyncio.run(derive_mild(task, str(empty), str(dest))) is True
+    # 源目录不存在 → 直接 False
+    assert asyncio.run(derive_mild(task, str(tmp_path / "nope"), str(tmp_path / "dst2"))) is False
+    assert not (tmp_path / "dst2").exists()
+
+
+def test_violate_returns_false_when_the_needle_is_absent(tmp_path):
+    """`contains` 检查里那个子串本来就不在文件里 → 改不动，返回 False（**不猜**）。"""
+    from lab.bench.task import VerifyCheck
+
+    root = tmp_path / "home" / "ubuntu"
+    root.mkdir(parents=True)
+    (root / "out.json").write_text("{}", encoding="utf-8")
+    check = VerifyCheck(kind="file_content", path="/home/ubuntu/out.json", contains="does-not-exist")
+    assert _violate(check, root) is False
 
 
 def test_product_paths_from_verify_strips_the_sandbox_prefix(tmp_path):
@@ -135,18 +177,6 @@ def test_product_paths_from_verify_strips_the_sandbox_prefix(tmp_path):
 
     task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
     assert product_paths_from_verify(task) == ["sum.txt"]
-
-
-def test_derive_mild_refuses_when_no_graded_product_is_present(tmp_path):
-    """`targets` 里一个都不存在 → 返回 False，且**不留下副本**（不伪造样本）。"""
-    source = tmp_path / "src3"
-    (source / "home" / "ubuntu").mkdir(parents=True)
-    (source / "home" / "ubuntu" / "other.txt").write_text("内容", encoding="utf-8")
-    dest = tmp_path / "dst3"
-    assert derive_mild(str(source), str(dest), ["sum.txt"]) is False
-    assert not dest.exists(), "派生失败时不能留下副本（否则就是一条伪装的 mild 样本）"
-    assert derive_mild(str(tmp_path / "nope"), str(tmp_path / "dst4"), ["sum.txt"]) is False
-    assert not (tmp_path / "dst4").exists()
 
 
 # ==================== 端到端：生成出来的表必须满足三条约束 ====================
