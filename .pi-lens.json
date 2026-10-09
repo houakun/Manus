@@ -1,0 +1,19 @@
+{
+  "//": [
+    "为什么关掉自动排版（format.enabled: false）：",
+    "",
+    "pi-lens 每次编辑后都会把被编辑文件里的**原有代码**按 ruff-format 风格重排",
+    "（实测一次改动波及 13 行无关代码：多行的 `return JudgeVerdict(...)` 被折成一行、",
+    "`judge_run` 签名被合并等）。而本仓库**刻意没有采用** ruff format ——",
+    "`ruff format --check lab/` 显示还有 12 个文件会被改，理由写在 ruff.toml 里：",
+    "批量改写风格对测量台零收益，却会把真正的改动埋进噪声（lab/README「我错在哪」第 11 条",
+    "就是这么一次事故）。",
+    "",
+    "后果：每次提交前都得手工剥离这些无关改动，否则 diff 不可审查。",
+    "所以按项目级配置关掉它 —— 只影响本仓库，不影响其它项目。",
+    "",
+    "注：autofix.enabled 保持默认（它走本仓库的 ruff.toml，规则集是项目自己钉住的），",
+    "actionableWarnings.autoFix 本来就是默认关。"
+  ],
+  "format": { "enabled": false }
+}
