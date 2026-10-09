@@ -31,7 +31,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 # rubric 版本：**改提示词就必须改它**（否则不同版本的人工金标会被混在一起算 κ）。
-JUDGE_RUBRIC_VERSION = "v1"
+#
+# **v2 起成为默认**：把 `instruction_following` / `output_quality` 的**边界**写进提示词。
+# 依据是**对照实验**（同一批 111 条、同一份金标、**同一份代码**，只切 rubric 版本）：
+#
+#   instruction_following κ  0.208 → **0.556**（“人✓judge✗” 32 → 11）
+#   output_quality       κ  0.978 → **0.842**（1+0 → 4+3）
+#   task_completion      κ  0.977 → 0.977（不变）
+#
+# → 这是**转移、不是白拿**：总分歧 33 → 15，但两维都有代价；**且 v2 仍不达标**
+#   （0.556 < 0.6）。采纳的理由是“消除了真实存在的规格歧义 + 总分歧更少”，
+#   而不是“它把指标顶上去了”。完整记录：`docs/step14-judge-rubric-v2-experiment.md`。
+JUDGE_RUBRIC_VERSION = "v2"
 
 # 三个维度：各自独立调用，互不牵连。
 JUDGE_DIMENSIONS = ("task_completion", "instruction_following", "output_quality")
@@ -49,15 +60,56 @@ JUDGE_DIMENSIONS = ("task_completion", "instruction_following", "output_quality"
 #   - `output_quality` = **内容正确性**：数值对不对、文字是不是事实、有没有残缺或占位。
 #   - 归因规则：**内容错但形状对 → `output_quality=false`、`instruction_following=true`**。
 #
-# ⚠️ 这段只是**文档**：下面 `RUBRIC` 里**喂给模型的文本一个字没改**，所以版本仍是 v1，
-# 现有金标仍可与 v1 的判定混算。若要把这条边界**写进提示词**（让 judge 也照它判），
-# 就必须把 `JUDGE_RUBRIC_VERSION` 升到 v2 并**重新标注 + 重跑**（旧金标不得与 v2 混算）——
-# 那件事本轮**刻意没做**，理由写在 `docs/judge-labeling-guide.md`。
-RUBRIC: Dict[str, str] = {
+# ⚠️ v1 下这段只是**注释级约定**（喂给模型的文本里没写边界）。
+# `LAB_JUDGE_RUBRIC=v2` 会启用把边界**写进提示词**的版本 —— 用来做对照实验：
+# 它到底**判得更对**，还是只是**更合人意**？
+#
+# 为什么用**环境变量**而不是改代码：两个臂必须跑在**同一份代码**上，否则
+# “差异来自提示词”这句话就不成立。（对照组用 `LAB_JUDGE_RUBRIC=v1` 重跑即可。）
+RUBRIC_VERSION_ENV = "LAB_JUDGE_RUBRIC"
+
+_RUBRIC_V1: Dict[str, str] = {
     "task_completion": "目标的**核心要求**是否真的完成了（产物能不能证明它完成了）",
     "instruction_following": "格式/路径/命名等**显式约束**是否遵守（例如要求的输出文件、字段名）",
     "output_quality": "产物本身的质量（内容是否正确、是否明显残缺或占位）",
 }
+
+# v2：把"形状 vs 内容"的边界写死在**给模型看的文本**里。
+_RUBRIC_V2: Dict[str, str] = {
+    "task_completion": "目标的**核心要求**是否真的完成了（产物能不能证明它完成了）",
+    "instruction_following": (
+        "**显式约束的“形状”**是否遵守 —— 只看这些：要求的文件在不在、路径/文件名对不对、"
+        "结构/字段名/表头顺序对不对、有没有碰不该碰的文件（如冻结的测试文件）。"
+        "**不要判断内容对不对**：数值/文字/事实错了属于 output_quality，**不算这一维的违反**。"
+    ),
+    "output_quality": (
+        "**内容正确性**：数值对不对、文字是不是事实、有没有残缺或占位。"
+        "只判内容，不判路径/命名（那些属于 instruction_following）。"
+    ),
+}
+
+RUBRIC_BY_VERSION: Dict[str, Dict[str, str]] = {"v1": _RUBRIC_V1, "v2": _RUBRIC_V2}
+JUDGE_RUBRIC_VERSIONS = tuple(RUBRIC_BY_VERSION)
+
+
+def rubric_for(version: str) -> Dict[str, str]:
+    """取某个版本的 rubric（未知版本→**响亮地失败**，而不是悄悄回退到 v1）。"""
+    if version not in RUBRIC_BY_VERSION:
+        raise ValueError(f"未知 rubric 版本 {version!r}（可选：{JUDGE_RUBRIC_VERSIONS}）")
+    return RUBRIC_BY_VERSION[version]
+
+
+def active_rubric_version() -> str:
+    """当前生效的版本（`LAB_JUDGE_RUBRIC` 可覆盖，默认 v1）。"""
+    import os
+
+    version = (os.environ.get(RUBRIC_VERSION_ENV) or JUDGE_RUBRIC_VERSION).strip()
+    rubric_for(version)  # 值非法就当场报错
+    return version
+
+
+# 默认版本的 rubric（兼容既有引用；实际取用走 `rubric_for(active_rubric_version())`）
+RUBRIC: Dict[str, str] = _RUBRIC_V1
 
 _SYSTEM = """你是一个严格但保守的评审。只根据**给出的材料**判断，不要猜测没看到的东西。
 
@@ -110,7 +162,7 @@ def build_prompt(goal: str, artifacts: str, dimension: str) -> List[Dict[str, st
         {
             "role": "user",
             "content": (
-                f"评审维度：{dimension} —— {RUBRIC.get(dimension, '')}\n\n"
+                f"评审维度：{dimension} —— {rubric_for(active_rubric_version()).get(dimension, '')}\n\n"
                 f"【任务目标】\n{goal.strip()}\n\n"
                 f"【实际产物（截断）】\n{artifacts.strip()[:6000]}\n\n"
                 "请只输出那个 JSON 对象。"
@@ -171,7 +223,7 @@ async def judge_run(
     for dimension in dimensions or list(JUDGE_DIMENSIONS):
         verdicts.append(await judge_dimension(llm, goal=goal, artifacts=artifacts,
                                               dimension=dimension))
-    return JudgeReport(verdicts=verdicts)
+    return JudgeReport(verdicts=verdicts, rubric_version=active_rubric_version())
 
 
 # ==================== 跑 judge：从工作区收集材料（T14 收尾） ====================

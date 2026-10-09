@@ -1357,7 +1357,7 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
     from lab.bench.judge import (
         ARTIFACT_MAX_TOTAL_CHARS,
         JUDGE_DIMENSIONS,
-        JUDGE_RUBRIC_VERSION,
+        active_rubric_version,
         collect_artifacts,
         judge_entries,
     )
@@ -1436,7 +1436,7 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
     calls = len(entries) * len(JUDGE_DIMENSIONS)
     out_path = Path(args.out) if args.out else ensure_runs_dir() / "judge_judged.json"
 
-    print(f"judge 预估（rubric {JUDGE_RUBRIC_VERSION}）：")
+    print(f"judge 预估（rubric {active_rubric_version()}）：")
     print(f"  样本 {len(entries)} 条 × 维度 {len(JUDGE_DIMENSIONS)} 个 = **{calls} 次 LLM 调用**")
     print(
         f"  材料总量 {sum(len(e['artifacts']) for e in entries)} 字符"
@@ -1476,7 +1476,7 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
             # 取判定用 `judged.get(sample_id)`。写在这里是为了让这份判定可审计
             # （哪个 rubric、哪个模型、跑了多少条、花了多少）。
             "__meta__": {
-                "rubric_version": JUDGE_RUBRIC_VERSION,
+                "rubric_version": active_rubric_version(),
                 "model_name": llm_config.model_name,
                 "temperature": llm_config.temperature,
                 "samples": len(entries),

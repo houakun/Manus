@@ -101,10 +101,14 @@ def test_parse_verdict_treats_garbage_as_unknown():
 
 
 def test_judge_run_calls_each_dimension_independently():
-    """按维度**独立调用**：三次调用，每次的提示里只出现一个维度。
+    """按维度**独立调用**：三次调用，每次只判一个维度（且只带**该维度**的 rubric 正文）。
 
     为什么钉住它：把三件事塞进一个 prompt，会让不同维度的错误混在一起，
-    校准就分不清"哪一维不可信" —— 而恰恰是某些维度不可信。
+    校准就分不清“哪一维不可信” —— 而恰恰是某些维度不可信。
+
+    ⚠️ 不能断言“提示里不出现其他维度的**名字**”：rubric v2 正是**故意提及**
+    `output_quality` 来划清边界（“内容错属于 output_quality”）——
+    所以这里改成断言“只带本维度的 **rubric 正文**”，那才是“分开判”的真正含义。
     """
     import asyncio
 
@@ -116,16 +120,19 @@ def test_judge_run_calls_each_dimension_independently():
             self.prompts.append(json.dumps(messages, ensure_ascii=False))
             return {"content": '{"verdict": true, "reason": "ok"}'}
 
-    from lab.bench.judge import judge_run
+    from lab.bench.judge import active_rubric_version, judge_run, rubric_for
 
+    rubric = rubric_for(active_rubric_version())
     llm = _FakeLLM()
     report = asyncio.run(judge_run(llm, goal="把结果写入 out.txt", artifacts="内容"))
     assert len(llm.prompts) == len(JUDGE_DIMENSIONS)
     for dimension, prompt in zip(JUDGE_DIMENSIONS, llm.prompts):
-        assert dimension in prompt
-        others = [d for d in JUDGE_DIMENSIONS if d != dimension]
-        assert not any(other in prompt for other in others)
+        assert f"评审维度：{dimension}" in prompt
+        assert rubric[dimension] in prompt  # 本维度的 rubric 正文在
+        for other in (d for d in JUDGE_DIMENSIONS if d != dimension):
+            assert rubric[other] not in prompt, f"{dimension} 的提示里混进了 {other} 的 rubric"
     assert len(report.decided) == len(JUDGE_DIMENSIONS)
+    assert report.rubric_version == active_rubric_version()
 
 
 def test_label_sheet_does_not_leak_judge_verdicts(tmp_path):
