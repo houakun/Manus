@@ -222,12 +222,16 @@ async def judge_entries(
     dimensions: Optional[List[str]] = None,
     concurrency: int = 4,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    on_sample: Optional[Callable[[str, Dict[str, Optional[bool]]], None]] = None,
 ) -> Dict[str, Dict[str, Optional[bool]]]:
     """对多条样本跑 judge，返回 `{sample_id: {dimension: bool | None}}`。
 
     - 每个维度**独立调用**（复用 `judge_run`，不合并 prompt）；
     - 返回 `None` 而不是省略键：`calibrate` 的契约是"None = Unknown"；
-    - 单条样本失败不会毁掉整批（`judge_dimension` 已把异常转成 Unknown）。
+    - 单条样本失败不会毁掉整批（`judge_dimension` 已把异常转成 Unknown）；
+    - `on_sample` 每完成一条就回调一次 —— 294 次调用要跑十几分钟，
+      被中断的途径很多（Ctrl-C / 休眠 / 断网），**每条就落盘**才能做到
+      "最坏情况只丢一条"而不是"丢掉整批"（与评测的增量落库同一个理由）。
     """
     dims = list(dimensions or JUDGE_DIMENSIONS)
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -243,8 +247,11 @@ async def judge_entries(
                 artifacts=entry.get("artifacts", ""),
                 dimensions=dims,
             )
-            out[entry["sample_id"]] = {v.dimension: v.verdict for v in report.verdicts}
+            verdicts = {v.dimension: v.verdict for v in report.verdicts}
+            out[entry["sample_id"]] = verdicts
             done += 1
+            if on_sample is not None:
+                on_sample(entry["sample_id"], verdicts)
             if on_progress is not None:
                 on_progress(done, len(entries))
 

@@ -173,6 +173,9 @@ def test_cli_bench_judge_writes_judged_json(tmp_path, monkeypatch):
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert set(payload) == {"__meta__", "s1", "s2"}
     assert payload["__meta__"]["samples"] == 2
+    # 计量代理必须接上：2 条样本 × 3 维度 = 6 次调用。
+    # （假 LLM 不返回 usage，所以只断言调用次数 —— 与 Usage 的约定一致：不猜 token）
+    assert payload["__meta__"]["llm_calls"] == 6
     for sample_id in ("s1", "s2"):
         assert set(payload[sample_id]) == set(JUDGE_DIMENSIONS)
         assert all(value is True for value in payload[sample_id].values())

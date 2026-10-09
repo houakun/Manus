@@ -207,6 +207,33 @@ def test_judge_entries_tristate_and_failure_isolation():
     assert all(v is None for v in judged["s-boom"].values())
 
 
+def test_judge_entries_calls_on_sample_incrementally():
+    """`on_sample` 必须**每完成一条就回调** —— 它是增量落盘的基础。
+
+    为什么钉住它：294 次调用要跑十几分钟，只在最后写一次的话，第 293 条断掉
+    就是"整批白跑"；有回调才能做到"最坏只丢一条"。
+    """
+    import asyncio
+
+    from lab.bench.judge import judge_entries
+
+    class _FakeLLM:
+        async def invoke(self, messages, **kwargs):
+            return {"content": '{"verdict": true}'}
+
+    seen = []
+    entries = [{"sample_id": f"s{i}", "goal": "g", "artifacts": "a"} for i in range(4)]
+    asyncio.run(
+        judge_entries(
+            _FakeLLM(),
+            entries,
+            concurrency=2,
+            on_sample=lambda sample_id, verdicts: seen.append(sample_id),
+        )
+    )
+    assert sorted(seen) == ["s0", "s1", "s2", "s3"]
+
+
 def test_read_gold_rows_keeps_material_columns(tmp_path):
     """`read_gold_rows` 必须带出 `task_key` / `artifact_dir` —— 否则无法还原"目标 + 产物"。"""
     from lab.bench.calibrate import read_gold_rows

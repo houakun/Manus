@@ -24,7 +24,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from lab.api import LabConfigError, default_trace_store, fault_rules_from_spec, run_task_sync
 from lab.bootstrap import ensure_runs_dir
@@ -1231,32 +1231,78 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
         return 2
 
     from app.infrastructure.external.llm.openai_llm import OpenAILLM
+    from lab.infra.counting_llm import CountingLLM
+    from lab.usage import Usage, price_of
 
-    llm = OpenAILLM(llm_config)
+    # 用与评测**同一套**计量代理：judge 的成本必须可报 —— 否则"跑完记录实际花费"
+    # 这条纪律在这里就是空话，而这条命令恰恰是唯一要跑几百次调用的地方。
+    usage = Usage()
+    llm = CountingLLM(OpenAILLM(llm_config), usage)
     print()
 
     def _progress(done: int, total: int) -> None:
         # 逐条报进度：294 次调用要几分钟，没有进度会让人以为卡死
         print(f"  [{done}/{total}] 已完成", flush=True)
 
-    judged = asyncio.run(judge_entries(llm, entries, concurrency=args.concurrency, on_progress=_progress))
-
-    payload = {
-        # `__meta__` 不会被 `calibrate` 当成样本：它遍历的是**金标**里的 sample_id，
-        # 取判定用 `judged.get(sample_id)`。写在这里是为了让这份判定可审计
-        # （哪个 rubric、哪个模型、什么时候跑的）。
-        "__meta__": {
-            "rubric_version": JUDGE_RUBRIC_VERSION,
-            "model_name": llm_config.model_name,
-            "temperature": llm_config.temperature,
-            "samples": len(entries),
-            "dimensions": list(JUDGE_DIMENSIONS),
-            "gold_csv": str(gold_path),
-        },
-        **judged,
-    }
+    # 增量落盘：每完成一条就写一次。294 次调用要跑十几分钟，
+    # 而中断的途径很多（Ctrl-C / 休眠 / 断网）—— 只在最后写一次的话，
+    # 第 293 条断掉就是"整批白跑"（与评测的增量落库同一个理由）。
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    collected: Dict[str, Dict[str, Optional[bool]]] = {}
+
+    def _write() -> None:
+        payload = {
+            # `__meta__` 不会被 `calibrate` 当成样本：它遍历的是**金标**里的 sample_id，
+            # 取判定用 `judged.get(sample_id)`。写在这里是为了让这份判定可审计
+            # （哪个 rubric、哪个模型、跑了多少条、花了多少）。
+            "__meta__": {
+                "rubric_version": JUDGE_RUBRIC_VERSION,
+                "model_name": llm_config.model_name,
+                "temperature": llm_config.temperature,
+                "samples": len(entries),
+                "completed": len(collected),
+                "dimensions": list(JUDGE_DIMENSIONS),
+                "gold_csv": str(gold_path),
+                # 实际用量落进判定文件：没有它，"这次 judge 花了多少"事后只能靠猜。
+                "llm_calls": usage.llm_calls,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+                "cost_usd_equivalent": usage.cost_usd(llm_config.model_name),
+                "price_known": price_of(llm_config.model_name) is not None,
+            },
+            **collected,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _on_sample(sample_id: str, verdicts: Dict[str, Optional[bool]]) -> None:
+        collected[sample_id] = verdicts
+        _write()
+
+    judged = asyncio.run(
+        judge_entries(
+            llm,
+            entries,
+            concurrency=args.concurrency,
+            on_progress=_progress,
+            on_sample=_on_sample,
+        )
+    )
+
+    cost = usage.cost_usd(llm_config.model_name)
+    print()
+    print(
+        f"实际用量：{usage.llm_calls} 次调用，"
+        f"输入 {usage.prompt_tokens} + 输出 {usage.completion_tokens} = {usage.total_tokens} tokens"
+    )
+    if price_of(llm_config.model_name) is None:
+        # 价格表查不到时必须**说出来**，否则成本会静默记成 $0 ——
+        # 那比报错更危险（数字看起来合理，只是全错）。
+        print(f"  ⚠️ 价格表里没有 {llm_config.model_name} → 成本按 0 记（**不是**真的免费）")
+    else:
+        print(f"  等价成本 ${cost:.4f}（按列表价算；订阅制下边际成本为 $0，这个数字用于横向对比，**不是**账单金额）")
+
+    _write()  # 最终落盘（与逐条增量写的是同一个函数，避免两份逻辑走偏）
 
     # 逐维度统计：Unknown 比例高说明 judge 比人更保守（材料不足时不敢下结论）。
     # 那不是错误，但它会直接减少参与 κ 的对照样本 —— 所以必须看得见。
