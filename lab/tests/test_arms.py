@@ -240,6 +240,9 @@ def test_noise_floor_flags_a_single_task_dominating():
     suite = _arm_suite(ok_pattern=lambda arm, index: not (arm == "b" and index == 0))
     floor = measure_noise_floor(suite)
     success = floor.get("success_pt")
+    # 前置条件写出来：该指标必须存在。顺带给类型检查器一个收窄点 ——
+    # 否则失败时看到的是 `AttributeError: 'NoneType'`，而不是“这个指标没算出来”。
+    assert success is not None
     assert abs(success.worst_task) > 0
 
 
@@ -385,6 +388,7 @@ def test_legacy_suite_without_new_columns_still_loads(tmp_path):
     suite.env_fingerprint = '{"digest": "deadbeef01", "tools": {}}'
     migrated.save_suite(suite)
     reloaded = migrated.load_suite(suite.suite_id)
+    assert reloaded is not None  # 前置条件：刚存进去的 suite 必须读得回来
     assert reloaded.env_digest == "deadbeef01"
     assert reloaded.env_fingerprint == suite.env_fingerprint
 
@@ -596,8 +600,11 @@ def test_noise_floor_excludes_capability_tasks_without_rerunning():
     without = measure_noise_floor(suite, include_uids=[task.uid for task in regression])
 
     # 含 capability 任务时，地板被那个任务的波动抬起来
-    assert abs(with_capability.get("success_pt").worst_task) > 0
-    assert without.get("success_pt").worst_task == 0
+    with_metric = with_capability.get("success_pt")
+    without_metric = without.get("success_pt")
+    assert with_metric is not None and without_metric is not None  # 前置条件
+    assert abs(with_metric.worst_task) > 0
+    assert without_metric.worst_task == 0
     assert without.task_count == 1
     assert any("排除了 1 个任务" in note for note in without.notes)
 
@@ -614,6 +621,29 @@ def test_success_rate_resolution_zero_comes_with_a_warning():
     floor = measure_noise_floor(_arm_suite(runs=2))
     assert floor.resolution("success_pt") == 0
     assert any("塔成 0" in note or "不要" in note for note in floor.notes)
+
+
+def test_recover_scans_both_workspace_layouts(tmp_path):
+    """`recover` 必须同时认**旧布局**与**新布局**（地基修复后工作区多了一层 suite）。
+
+    为什么不能只认新布局：历史工作区**不迁移**（仍在旧布局里），而 recover 的全部价值
+    就是“从既有工作区重建被中断的评测” —— 只认新布局等于把历史数据判了死刑。
+
+    两种布局的层数不同（3 层 vs 4 层），glob 互不重叠，所以同一次运行不会被扫两遍；
+    而 group / task 在两种布局下都位于 `workspace.parents[2]` / `[1]`，解析逻辑共用。
+    """
+    from lab.bench.recover import _workspace_layout
+
+    root = tmp_path / "bench"
+    # 旧布局：<group>/<task>/run*/workspace
+    (root / "synthetic" / "syn_sum_range" / "run0" / "workspace").mkdir(parents=True)
+    # 新布局：<suite>/<group>/<task>/run*/workspace
+    (root / "abc123def" / "synthetic" / "syn_sum_range" / "run1-guard-none" / "workspace").mkdir(
+        parents=True
+    )
+
+    layout = _workspace_layout(root, group="synthetic")
+    assert sorted((index, arm) for _, index, arm, _ in layout) == [(0, ""), (1, "guard-none")]
 
 
 def test_recover_parses_arm_suffixed_run_directories(tmp_path):

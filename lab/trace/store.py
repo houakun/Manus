@@ -149,6 +149,10 @@ _TASKS_GUARD_COLUMNS = {
     # 而过滤一个 JSON 字段要么用 LIKE 猜、要么全表读进内存。
     "replay_mode": "TEXT",
     "replay_stats": "TEXT",
+    # 产物摘要（地基修复）：判定前算一次落库，事后可重算比对 —— “这个目录还是判定时那份吗”。
+    # 为什么不只靠 mtime：mtime 会被复制/恢复/时钟调整骗过，内容摘要不会。
+    # ⚠️ 历史行**无法回填**（当时没算），所以它们永远是 NULL → 校验结果只能是“未知”。
+    "artifact_digest": "TEXT",
 }
 
 # bench_runs 的后加列（同样的迁移理由）
@@ -321,6 +325,9 @@ _TASK_INSERT_COLUMNS = (
     "started_at",
     "workspace",
     "tool_sequence",
+    # 产物摘要（地基修复）：与 _TASKS_GUARD_COLUMNS / save_run 的 dict / INSERT 四处必须同步，
+    # 否则 save_run 开头那道一致性检查会当场报错（它就是为防这个而写的）。
+    "artifact_digest",
     "budget_violated_metrics",
     "budget_would_stop",
     "action_diversity",
@@ -368,6 +375,9 @@ class SpanStore:
 
     def save_run(self, result: "TaskResult", spans: List[Span], *, goal: str = "") -> None:
         """写入一次完整运行（任务行 + 全部 span）。同 task_id 重复写入会覆盖，保证幂等。"""
+        # 局部导入：与 `from lab.bench.runner import ...` 同一个理由（避免 import 环）。
+        from lab.bench.workspace import artifact_digest
+
         guard = result.guard or {}
         budget = guard.get("budget") or {}
         loop = guard.get("loop") or {}
@@ -399,6 +409,9 @@ class SpanStore:
             "started_at": datetime.now().isoformat(timespec="seconds"),  # noqa: DTZ005
             "workspace": result.workspace,
             "tool_sequence": json.dumps(result.tool_sequence, ensure_ascii=False),
+            # 产物摘要：这里算（SUT 已跑完、产物已定稿，而判定只读不写）——
+            # 不放在判定之后，是因为 tasks 行是在 run_task 里就写好的。
+            "artifact_digest": artifact_digest(result.workspace) or "",
             # ---- Step 3 加固层字段 ----
             "budget_violated_metrics": json.dumps(budget.get("violated_metrics") or [], ensure_ascii=False),
             "budget_would_stop": 1 if budget.get("would_stop") else 0,
@@ -429,6 +442,7 @@ class SpanStore:
                        steps_total, steps_done, steps_succeeded, steps_failed,
                        llm_calls, llm_errors, prompt_tokens, completion_tokens, total_tokens,
                        tool_calls, cost_usd, elapsed_ms, started_at, workspace, tool_sequence,
+                       artifact_digest,
                        budget_violated_metrics, budget_would_stop, action_diversity,
                        postcondition_warnings, faults_injected, replay_mode, replay_stats)
                    VALUES (
@@ -436,6 +450,7 @@ class SpanStore:
                        :steps_total, :steps_done, :steps_succeeded, :steps_failed,
                        :llm_calls, :llm_errors, :prompt_tokens, :completion_tokens, :total_tokens,
                        :tool_calls, :cost_usd, :elapsed_ms, :started_at, :workspace, :tool_sequence,
+                       :artifact_digest,
                        :budget_violated_metrics, :budget_would_stop, :action_diversity,
                        :postcondition_warnings, :faults_injected, :replay_mode, :replay_stats)""",
                 columns,
@@ -650,6 +665,27 @@ class SpanStore:
                     datetime.now().isoformat(timespec="seconds"),  # noqa: DTZ005
                 ),
             )
+
+    def run_created_at(
+        self, suite_id: str, task_key: str, run_index: int, arm: str = ""
+    ) -> Optional[str]:
+        """按**运行身份**（suite + task + run + arm）取该次运行的落库时间。
+
+        为什么不能按 workspace 反查（`load_task_by_workspace`）：**工作区路径正是会被后来
+        的 suite 覆盖的那个东西**，覆盖之后按路径反查拿到的是**后来那次**的行 —— 于是
+        "基准时间"也跟着漂到后面去，stale 永远检不出来。
+        实测：同一批 100 条样本，按路径查只报 **1** 条 stale，按运行身份查报 **39** 条。
+        基准必须锚在运行身份上，而不是锚在那个可能已被污染的目录上。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT created_at FROM bench_runs
+                   WHERE suite_id LIKE :suite || '%' AND task_key = :task
+                     AND run_index = :run AND coalesce(arm, '') = :arm
+                   ORDER BY created_at DESC LIMIT 1""",
+                {"suite": suite_id, "task": task_key, "run": run_index, "arm": arm},
+            ).fetchone()
+        return row["created_at"] if row else None
 
     def load_task_by_workspace(self, workspace: str) -> Optional[Dict[str, Any]]:
         """根据工作区路径反查运行记录。
@@ -940,7 +976,8 @@ class SpanStore:
         """
         sql = """
             SELECT b.suite_id, b.task_key, b.group_name AS group_name, b.run_index, b.arm,
-                   b.self_reported_ok, b.ok, t.workspace AS workspace, t.goal AS goal
+                   b.self_reported_ok, b.ok, b.created_at,
+                   t.workspace AS workspace, t.goal AS goal
             FROM bench_runs b LEFT JOIN tasks t ON b.task_id = t.task_id
             WHERE b.ok = :ok
             ORDER BY b.created_at DESC
@@ -972,7 +1009,8 @@ class SpanStore:
                 SELECT b.suite_id, b.task_key, b.task_uid, b.run_index, b.arm, b.task_id,
                        b.error_type, b.error, b.failed_checks, b.process_flags, b.cost_usd,
                        b.created_at, b.self_reported_ok, b.tool_calls,
-                       t.workspace AS workspace, t.tool_sequence AS tool_sequence
+                       t.workspace AS workspace, t.tool_sequence AS tool_sequence,
+                       t.artifact_digest AS artifact_digest
                 FROM bench_runs b LEFT JOIN tasks t ON b.task_id = t.task_id
                 WHERE b.ok = 0
                   AND (:pattern IS NULL OR b.suite_id LIKE :pattern)

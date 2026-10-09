@@ -28,6 +28,13 @@ from typing import Any, Dict, List, Optional
 
 from lab.api import LabConfigError, default_trace_store, fault_rules_from_spec, run_task_sync
 from lab.bootstrap import ensure_runs_dir
+from lab.bench.workspace import (
+    UNKNOWN,
+    check_freshness,
+    compare_digest,
+    render_digest_check,
+    render_freshness,
+)
 from lab.sut.base import TaskResult
 from lab.trace.view import render_trace
 
@@ -753,16 +760,34 @@ def _cmd_bench_recover(args: argparse.Namespace) -> int:
 # 也不能"从库里挑几条失败来读"。而失败归因靠的就是把轨迹摊开看。
 
 
-def _render_artifacts(workspace: str, *, max_files: int = 4, max_chars: int = 300) -> List[str]:
+def _render_artifacts(
+    workspace: str,
+    *,
+    run_time: Optional[str] = None,
+    stored_digest: Optional[str] = None,
+    max_files: int = 4,
+    max_chars: int = 300,
+) -> List[str]:
     """列出该次运行工作区里的**关键产物**（读轨迹时用来核对 Agent 到底交了什么）。
 
     只看 `home/ubuntu` 下、排除 `input/`：那是 fixtures（题面输入），不是产物。
+
+    给了 `run_time` 就先做**新鲜度检查**：工作区可能已被后来的运行覆盖
+    （见 `lab/bench/workspace.py`），此时读到的产物属于**另一次运行**。
+    必须喊出来 —— 否则“判定通过 + 产物是别人的”会被当成正常结果一路读下去。
     """
+    head: List[str] = []
+    if run_time:
+        head.extend(render_freshness(check_freshness(workspace, run_time)))
+    if stored_digest is not None:
+        # 内容摘要比 mtime 可靠：mtime 会被复制/恢复/时钟调整骗过，摘要不会。
+        # 历史行没存过摘要（空串）→ 只能报“无法校验”，不能当成“一致”。
+        head.extend(render_digest_check(compare_digest(workspace, stored_digest)))
     if not workspace:
-        return ["    （未记录工作区路径 —— 旧数据可能没有）"]
+        return head + ["    （未记录工作区路径 —— 旧数据可能没有）"]
     root = Path(workspace) / "home" / "ubuntu"
     if not root.is_dir():
-        return [f"    （工作区不存在：{root}）"]
+        return head + [f"    （工作区不存在：{root}）"]
     files = sorted(
         p
         for p in root.rglob("*")
@@ -771,9 +796,9 @@ def _render_artifacts(workspace: str, *, max_files: int = 4, max_chars: int = 30
         if p.is_file() and "input" not in p.parts and "__pycache__" not in p.parts
     )
     if not files:
-        return ["    （工作区里没有产物）"]
+        return head + ["    （工作区里没有产物）"]
 
-    lines: List[str] = []
+    lines: List[str] = list(head)
     for path in files[:max_files]:
         try:
             size = path.stat().st_size
@@ -831,6 +856,8 @@ def _run_digest_lines(
     tool_sequence: Optional[str] = None,
     self_reported_ok: Optional[bool] = None,
     workspace: str = "",
+    run_time: Optional[str] = None,
+    stored_digest: Optional[str] = None,
     artifacts: int = 4,
     top: int = 6,
 ) -> List[str]:
@@ -851,7 +878,9 @@ def _run_digest_lines(
         lines.append(f"  过程问题：{', '.join(str(flag) for flag in process_flags[:top])}")
     lines.append(f"  工具序列：{_render_tool_sequence(tool_sequence, top=top * 2)}")
     lines.append("  关键产物：")
-    lines.extend(_render_artifacts(workspace, max_files=artifacts))
+    lines.extend(
+        _render_artifacts(workspace, run_time=run_time, stored_digest=stored_digest, max_files=artifacts)
+    )
     return lines
 
 
@@ -932,6 +961,9 @@ def _cmd_bench_show(args: argparse.Namespace) -> int:
             # 所以 `load_suite` 重建出来的 outcome.workspace 是空串 ——
             # 直接用它会让"关键产物"永远显示"未记录工作区路径"。
             workspace=str((task or {}).get("workspace") or outcome.workspace),
+            # 运行时间用于新鲜度检查（`started_at` 实际是**结果落库**的时刻，在 SUT 跑完之后）
+            run_time=str((task or {}).get("started_at") or ""),
+            stored_digest=str((task or {}).get("artifact_digest") or ""),
             artifacts=args.artifacts,
             top=args.top,
         ):
@@ -989,6 +1021,8 @@ def _cmd_bench_sample_failures(args: argparse.Namespace) -> int:
             tool_sequence=row.get("tool_sequence"),
             self_reported_ok=bool(row.get("self_reported_ok")) if row.get("self_reported_ok") is not None else None,
             workspace=str(row.get("workspace") or ""),
+            run_time=str(row.get("created_at") or ""),
+            stored_digest=str(row.get("artifact_digest") or ""),
             artifacts=args.artifacts,
             top=args.top,
         ):
@@ -1088,32 +1122,184 @@ def _cmd_bench_purpose_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stale_flag(workspace: str, run_time: Optional[str]) -> str:
+    """新鲜度的**三态**标记：`"1"` 被覆盖 / `"0"` 新鲜 / `""` 无法判断。
+
+    为什么留空而不是写 `"0"`：`""` 与 `"0"` 是两件事 —— 前者是"没验证过"，
+    后者是"验过且没问题"。把它们混成一个值，就等于把未验证写成已验证
+    （本项目自纠 #1/#8 都是这类错误的变体）。
+    """
+    freshness = check_freshness(workspace, run_time)
+    if freshness.state == UNKNOWN:
+        return ""
+    return "1" if freshness.stale else "0"
+
+
+# 已修缺陷的两个任务（见 `docs/task-ambiguity-lint.md` §8）：它们的**历史运行是在旧 goal 下
+# 产生的**，对本任务已作废。分级抽样默认排除它们，否则金标里会混进"回答旧问题"的样本。
+DEFAULT_EXCLUDED_TASKS = ("sem_markdown_toc", "syn_date_diff")
+
+
+def _sample_id_of(row: dict) -> str:
+    return (
+        f"{str(row.get('suite_id'))[:8]}:{row.get('task_key')}:"
+        f"{row.get('run_index')}:{row.get('arm') or '-'}"
+    )
+
+
+def _print_level_distribution(samples: List[Any]) -> None:
+    """把级别分布与"负样本覆盖了几个任务"打出来 —— 抽样设计的可读性就是它的一半价值。"""
+    from collections import Counter
+
+    from lab.bench.sampling import LEVEL_POSITIVE
+
+    by_level = Counter(sample.level for sample in samples)
+    negative_tasks = Counter(sample.task_key for sample in samples if sample.level != LEVEL_POSITIVE)
+    print("  级别分布：" + "、".join(f"{k}={v}" for k, v in sorted(by_level.items())))
+    preview = "、".join(f"{k}({v})" for k, v in sorted(negative_tasks.items())[:8])
+    print(f"  负样本覆盖 {len(negative_tasks)} 个任务：{preview}" + ("…" if len(negative_tasks) > 8 else ""))
+
+
+async def _materialize_synthetic(samples: List[Any], by_key: dict, positives: dict) -> None:
+    """把构造样本真正写进磁盘（mild 是"复制 + 扰动"，其余走 validate 的物化器）。"""
+    from lab.bench.sampling import LEVEL_MILD, derive_mild, materialize, product_paths_from_verify
+
+    for sample in samples:
+        task = by_key.get(sample.task_key)
+        if task is None:
+            continue
+        if sample.level == LEVEL_MILD:
+            source = positives.get(sample.task_key)
+            if source:
+                # 扰动目标必须是**判定器检查的产物**（见 product_paths_from_verify）：
+                # 用“最大文件”会改到冻结的测试文件或 agent 的辅助脚本 —— 那样样本名不副实。
+                derive_mild(source, sample.artifact_dir, product_paths_from_verify(task))
+            continue
+        await materialize(sample, task, level=sample.level)
+
+
+def _balanced_sheet_rows(args: argparse.Namespace, store: Any) -> List[dict]:
+    """分级抽样（P3a）：剔 stale + 排缺陷任务 + **跨任务的分级负样本**。
+
+    为什么要造负样本而不只靠库里现成的失败：逐条核对过库里的 23 条失败样本 ——
+    15 条人工认为"做完了"（10 条是任务期望值写错的假失败、3 条工作区被覆盖、2 条归因分歧）。
+    也就是说"多抽失败"抽到的主要是**测量缺陷**，不是坏产物。
+    """
+    import asyncio
+
+    from lab.bench.sampling import (
+        LEVEL_POSITIVE,
+        SYNTHETIC_LEVELS,
+        Candidate,
+        plan_synthetic,
+        select_from_runs,
+    )
+    from lab.bench.task import load_all_tasks
+    from lab.bench.workspace import check_freshness
+
+    exclude = list(args.exclude_task) if args.exclude_task is not None else list(DEFAULT_EXCLUDED_TASKS)
+    # 多取候选：stale 与被排除的任务会在下面被剔掉
+    runs = store.sample_runs_for_judging(limit=max(args.n * 4, 200))
+    candidates = []
+    for row in runs:
+        workspace = row.get("workspace") or ""
+        freshness = check_freshness(workspace, row.get("created_at"))
+        candidates.append(
+            Candidate(
+                sample_id=_sample_id_of(row),
+                task_key=row.get("task_key") or "",
+                group=row.get("group_name") or "",
+                ok=bool(row.get("ok")),
+                stale=freshness.stale,
+                workspace=workspace,
+            )
+        )
+    stale_dropped = sum(1 for candidate in candidates if candidate.stale)
+    samples = select_from_runs(candidates, exclude_tasks=exclude, per_task=args.per_task)
+
+    tasks = {task.key: task for task in load_all_tasks()}
+    levels = list(args.level) if args.level else list(SYNTHETIC_LEVELS)
+    synthetic = plan_synthetic(
+        tasks, exclude_tasks=exclude, root=str(ensure_runs_dir() / "judge_samples"), levels=levels
+    )
+    positives = {s.task_key: s.artifact_dir for s in samples if s.level == LEVEL_POSITIVE}
+    asyncio.run(_materialize_synthetic(synthetic, tasks, positives))
+
+    # 物化可能失败（典型：某任务没有可派生的**正样本** → `mild` 造不出来）。
+    # **宁可少一条，也不要在表里留一条指向不存在目录的样本** —— 那种“幽灵样本”
+    # 会让 judge 去评空材料、让人去标看不见的东西，把噪声直接混进 κ。
+    kept = [s for s in synthetic if Path(s.artifact_dir).is_dir()]
+    dropped = [s for s in synthetic if not Path(s.artifact_dir).is_dir()]
+    if dropped:
+        tasks_dropped = sorted({s.task_key for s in dropped})
+        print(
+            f"  ⚠️ 丢弃 {len(dropped)} 条**物化失败**的构造样本（目录不存在）："
+            f"{tasks_dropped[:6]}{'…' if len(tasks_dropped) > 6 else ''}"
+        )
+        print("     （`mild` 是从正样本产物派生的；库里没有该任务的正样本时就造不出来）")
+    synthetic = kept
+
+    print(
+        f"分级抽样：候选 {len(candidates)} 条 → 剔掉 stale {stale_dropped} 条"
+        f"、排除任务 {sorted(exclude)} → 真实运行 {len(samples)} 条 + 构造样本 {len(synthetic)} 条"
+    )
+    samples.extend(synthetic)
+    _print_level_distribution(samples)
+
+    return [
+        {
+            "sample_id": sample.sample_id,
+            "task_key": sample.task_key,
+            "group": sample.group,
+            "suite_id": "" if sample.sample_id.startswith("synthetic:") else sample.sample_id.split(":")[0],
+            "run_index": "",
+            "arm": "",
+            "self_reported_ok": "",
+            "artifact_dir": sample.artifact_dir,
+            "workspace_stale": "0",  # 已经过滤过了：剩下的都是新鲜的
+            "level": sample.level,
+            "notes": sample.note,
+        }
+        for sample in samples
+    ]
+
+
 def _cmd_bench_judge_sheet(args: argparse.Namespace) -> int:
     """`lab bench judge-sheet`：生成**待人工标注**的 CSV（T14，$0）。
 
     为什么要有这条命令（而不是一次性脚本）：标注表是可复现的产物 ——
     样本怎么抽的必须能被重跑，否则"κ 是多少"就不可审计。
+
+    两种口径：
+    - 默认（旧）：**失败优先，再补成功** —— 保留它是为了能复现历史金标；
+    - `--balanced`（P3a）：剔 stale 工作区 + 按任务配额 + 造**跨任务分级负样本**。
+      为什么必须换：旧口径产出的 100 条里 89 条三维度全 true，所有反例都来自同一个任务。
     """
     from lab.api import default_trace_store
     from lab.bench.calibrate import write_label_sheet
 
     store = default_trace_store()
-    runs = store.sample_runs_for_judging(limit=args.n)
-    rows = [
-        {
-            "sample_id": (
-                f"{str(row.get('suite_id'))[:8]}:{row.get('task_key')}:{row.get('run_index')}:{row.get('arm') or '-'}"
-            ),
-            "task_key": row.get("task_key") or "",
-            "group": row.get("group_name") or "",
-            "suite_id": str(row.get("suite_id") or "")[:8],
-            "run_index": row.get("run_index"),
-            "arm": row.get("arm") or "",
-            "self_reported_ok": row.get("self_reported_ok"),
-            "artifact_dir": row.get("workspace") or "",
-        }
-        for row in runs
-    ]
+    if args.balanced:
+        rows = _balanced_sheet_rows(args, store)
+    else:
+        runs = store.sample_runs_for_judging(limit=args.n)
+        rows = [
+            {
+                "sample_id": _sample_id_of(row),
+                "task_key": row.get("task_key") or "",
+                "group": row.get("group_name") or "",
+                "suite_id": str(row.get("suite_id") or "")[:8],
+                "run_index": row.get("run_index"),
+                "arm": row.get("arm") or "",
+                "self_reported_ok": row.get("self_reported_ok"),
+                "artifact_dir": row.get("workspace") or "",
+                # 抽样时就把新鲜度算出来：标注/跑 judge 之前就该知道"这条产物是不是那次的"
+                "workspace_stale": _stale_flag(row.get("workspace") or "", row.get("created_at")),
+                "level": "positive" if row.get("ok") else "db_negative",
+            }
+            for row in runs
+        ]
+
     path = Path(args.out) if args.out else ensure_runs_dir() / "judge_gold.csv"
     count = write_label_sheet(rows, path)
     print(f"已写入 {count} 条待标注样本：{path}")
@@ -1166,6 +1352,7 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
     """
     import asyncio
 
+    from lab.api import default_trace_store
     from lab.bench.calibrate import read_gold_rows
     from lab.bench.judge import (
         ARTIFACT_MAX_TOTAL_CHARS,
@@ -1192,23 +1379,56 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
     # 目标（goal）从任务集读，**不给期望值**：judge 的判断依据只有"目标 + 产物"。
     # 给了期望值，κ 量的就不再是"judge 会不会判"，而是"judge 会不会抄"。
     goals = {task.key: task.goal for task in load_all_tasks()}
+    store = default_trace_store()
     entries: List[dict] = []
     unknown_tasks: List[str] = []
+    stale: List[str] = []
     for row in rows:
         key = (row.get("task_key") or "").strip()
         goal = goals.get(key)
         if goal is None:
             unknown_tasks.append(key)
             continue
+        sample_id = row["sample_id"].strip()
+        workspace = row.get("artifact_dir") or ""
+        # 新鲜度：产物可能已被后来的运行覆盖（见 `lab/bench/workspace.py`）。
+        # 新表在抽样时就算好了（`workspace_stale`）；旧表没那一列 → 用库里的运行时间现算。
+        flag = (row.get("workspace_stale") or "").strip()
+        if not flag and workspace:
+            # 基准必须按**运行身份**查，不能按 workspace 查 —— 后者正是被覆盖的那个东西，
+            # 反查会拿到“后来那次”的时间，于是 stale 永远检不出来（实测 1 条 vs 39 条）。
+            arm = (row.get("arm") or "").strip()
+            try:
+                run_index = int(row.get("run_index") or -1)
+            except (TypeError, ValueError):
+                run_index = -1
+            run_time = store.run_created_at(
+                (row.get("suite_id") or "").strip(),
+                key,
+                run_index,
+                "" if arm == "-" else arm,
+            )
+            flag = _stale_flag(workspace, run_time)
+        if flag == "1":
+            stale.append(sample_id)
         entries.append(
             {
-                "sample_id": row["sample_id"].strip(),
+                "sample_id": sample_id,
                 "goal": goal,
-                "artifacts": collect_artifacts(row.get("artifact_dir") or ""),
+                "artifacts": collect_artifacts(workspace),
             }
         )
     if unknown_tasks:
         print(f"[lab] 这些任务的 goal 找不到（任务集改过？）：{sorted(set(unknown_tasks))}", file=sys.stderr)
+    if stale:
+        # 必须**显式喊出来**：这些样本的产物不是它要评的那一次，
+        # 而 judge 会把它们当正常样本评下去（“判定通过 + 产物是别人的”可以同时成立）。
+        print(f"⚠️  {len(stale)}/{len(entries)} 条样本的工作区已被后来的运行覆盖 —— 产物不是那次运行的：")
+        for sample_id in stale[:5]:
+            print(f"      {sample_id}")
+        if len(stale) > 5:
+            print(f"      …（另有 {len(stale) - 5} 条）")
+        print("    judge 看到的产物因此不是它该评的那一次 —— 这些样本**不该**进 κ 的对照。")
     if not entries:
         return 2
 
@@ -1261,6 +1481,7 @@ def _cmd_bench_judge(args: argparse.Namespace) -> int:
                 "temperature": llm_config.temperature,
                 "samples": len(entries),
                 "completed": len(collected),
+                "stale_workspaces": len(stale),
                 "dimensions": list(JUDGE_DIMENSIONS),
                 "gold_csv": str(gold_path),
                 # 实际用量落进判定文件：没有它，"这次 judge 花了多少"事后只能靠猜。
@@ -1958,6 +2179,25 @@ def build_parser() -> argparse.ArgumentParser:
     bench_sheet = bench_sub.add_parser("judge-sheet", help="生成待人工标注的 CSV（LLM-judge 校准用；$0）")
     bench_sheet.add_argument("--n", type=int, default=100, help="抽多少条（失败优先，再补成功）")
     bench_sheet.add_argument("--out", default=None, help="输出路径（默认 lab/runs/judge_gold.csv）")
+    # P3a 分级抽样：排除 stale / 缺陷任务，并补上跨任务的分级负样本
+    bench_sheet.add_argument(
+        "--balanced",
+        action="store_true",
+        help="分级抽样：剔 stale 工作区 + 按任务配额 + 造分级负样本（默认：旧的“失败优先”）",
+    )
+    bench_sheet.add_argument(
+        "--exclude-task",
+        action="append",
+        default=None,
+        help="排除某个任务（可重复；--balanced 下默认排除两个已修缺陷的任务）",
+    )
+    bench_sheet.add_argument("--per-task", type=int, default=2, help="每个任务最多取几条正/负样本（--balanced）")
+    bench_sheet.add_argument(
+        "--level",
+        action="append",
+        default=None,
+        help="造哪几级负样本（可重复：mild / wrong_solution / empty；--balanced）",
+    )
     bench_sheet.set_defaults(func=_cmd_bench_judge_sheet)
 
     bench_cal = bench_sub.add_parser("calibrate", help="用人工金标算 judge 的 Cohen's κ（不达标就拒绝启用；$0）")

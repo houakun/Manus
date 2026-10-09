@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -162,6 +163,83 @@ def test_suite_isolates_workspaces_between_runs(tmp_path, monkeypatch, no_sleep)
     workspaces = {outcome.workspace for outcome in suite.outcomes}
     assert len(workspaces) == 2  # 两次运行落在两个不同目录
     assert all(outcome.ok for outcome in suite.outcomes)
+
+
+def test_two_suites_never_share_a_workspace(tmp_path, monkeypatch, no_sleep):
+    """两个 suite 跑同一 task/arm/run 必须落在**不同**工作区（地基修复）。
+
+    实测过的真事故：工作区路径里没有 `suite_id`，于是所有用同一 arm + 同一 run 编号的
+    suite 写同一个目录，后跑的**静默覆盖**先跑的 —— 100 条校准样本里 **39 条**的产物
+    因此属于另一次运行。判定是当场做的（正确），但事后读产物的人（`bench show` /
+    `judge` / 人工标注）全都在读别人的产物，而且不报任何错。
+
+    这里同时钉住两件事：
+    1. suite 之间隔离（上面的 bug 不会复发）；
+    2. run 目录名**仍然是 `run<N>` 形态** —— `bench recover` 靠它反推运行序号，
+       不能因为加了隔离就把那个约定改掉。
+    """
+    script = planner_react_script(
+        tool_name="write_file",
+        tool_args={"filepath": "/home/ubuntu/sum.txt", "content": "500500"},
+        final_message="done",
+    )
+    _wire_fake_llm(monkeypatch, tmp_path, script + script)
+
+    def _one_suite():
+        return asyncio.run(
+            run_suite(
+                runs_per_task=1,
+                keys=["syn_sum_range"],
+                bench_root=tmp_path / "bench",
+                progress=False,
+            )
+        )
+
+    first, second = _one_suite(), _one_suite()
+
+    assert first.suite_id != second.suite_id
+    first_ws = first.outcomes[0].workspace
+    second_ws = second.outcomes[0].workspace
+    assert first_ws != second_ws
+    # 两个目录都要真实存在 —— 光路径不同但只有一个被写过，隔离就只是字面上的
+    assert Path(first_ws).is_dir() and Path(second_ws).is_dir()
+    # suite_id 必须出现在路径里（这就是隔离本身）
+    assert first.suite_id in first_ws and second.suite_id in second_ws
+    # `run<N>` 命名约定不能变（recover 依赖它）
+    assert Path(first_ws).parent.name == "run0"
+
+
+def test_new_runs_persist_an_artifact_digest(tmp_path, monkeypatch, no_sleep):
+    """新运行必须把**产物摘要**真的落库，且事后重算能对上。
+
+    这是“事后可校验”的端到端证据：写路径（`save_run`）与读路径（`compare_digest`）
+    必须说同一件事。只单测 `compare_digest` 是不够的 —— 它可能永远没被喂过真摘要，
+    那样“校验”就是个永远返回 unknown 的摆设。
+    """
+    from lab.bench.workspace import DIGEST_MATCH, compare_digest
+
+    script = planner_react_script(
+        tool_name="write_file",
+        tool_args={"filepath": "/home/ubuntu/sum.txt", "content": "500500"},
+        final_message="done",
+    )
+    db_path = _wire_fake_llm(monkeypatch, tmp_path, script)
+    suite = asyncio.run(
+        run_suite(
+            runs_per_task=1,
+            keys=["syn_sum_range"],
+            bench_root=tmp_path / "bench",
+            progress=False,
+        )
+    )
+    outcome = suite.outcomes[0]
+    assert outcome.workspace
+
+    row = SpanStore(db_path).load_task(outcome.task_id)
+    assert row is not None
+    stored = row.get("artifact_digest")
+    assert stored, "新运行必须落库产物摘要（否则事后校验永远只能是 unknown）"
+    assert compare_digest(outcome.workspace, stored) == DIGEST_MATCH
 
 
 def test_recover_rebuilds_suite_from_workspaces(tmp_path, monkeypatch, no_sleep):

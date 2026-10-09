@@ -597,7 +597,15 @@ async def run_once(
     # 交错 A/B 时两个臂的 run_index 是一样的，共用目录会让两个臂写同一份产物 ——
     # 实验污染，而且不会报错，只会让成功率虚高。
     arm_suffix = f"-{arm.slug()}" if (arm is not None and arm_in_workspace) else ""
-    workspace = bench_root / task.group / task.key / f"run{run_index}{arm_suffix}" / "workspace"
+    # 工作区路径必须**按 suite 隔离**（地基修复）。
+    # 曾经的写法 `bench/<group>/<task>/run<N><arm>/workspace` 里**没有 suite_id**，
+    # 于是所有用同一 arm + 同一 run 编号的 suite 写同一个目录，后跑的**静默覆盖**先跑的。
+    # 实测后果：100 条校准样本里 **39 条**的产物已被后来的运行覆盖 —— 判定是当场做的
+    # （正确），但事后读到的产物属于另一次运行，于是 bench show / judge / 人工标注
+    # 全都在读别人的产物，而且不报任何错（这类“静默污染”正是本项目最想防的东西）。
+    # 用**完整** suite_id 而不是短 id：目录名撞车的后果就是上面这个 bug，
+    # 8 位十六进制在几千个 suite 下仍有非零碰撞概率，不值得省那几个字符。
+    workspace = bench_root / suite_id / task.group / task.key / f"run{run_index}{arm_suffix}" / "workspace"
     _reset_workspace(workspace)
 
     outcome = RunOutcome(

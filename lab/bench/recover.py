@@ -49,7 +49,18 @@ def _workspace_layout(bench_root: Path, group: Optional[str] = None) -> List[tup
     """
     found: List[tuple] = []
     pattern = re.compile(r"^run(\d+)(?:-(.+))?$")
-    for workspace in sorted(bench_root.glob("*/*/run*/workspace")):
+    # 两种布局都要扫（地基修复后加了 suite 层，而**历史目录仍留在旧布局里**）：
+    #   旧：<group>/<task>/run<N><arm>/workspace
+    #   新：<suite>/<group>/<task>/run<N><arm>/workspace
+    # 两者层数不同（3 层 vs 4 层），glob 互不重叠 —— 所以同一次运行不会被扫两遍。
+    # 注意：两种布局下 group 都是 `workspace.parents[2]`（[0]=run 目录、[1]=task、
+    # [2]=group、[3]=suite），所以下面的解析逻辑**不用改**。
+    candidates = sorted(
+        path
+        for layout_glob in ("*/*/run*/workspace", "*/*/*/run*/workspace")
+        for path in bench_root.glob(layout_glob)
+    )
+    for workspace in candidates:
         if not workspace.is_dir():
             continue
         group_name = workspace.parents[2].name
