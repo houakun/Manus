@@ -168,6 +168,15 @@ GOLD_COLUMNS = (
     "arm",
     "self_reported_ok",
     "artifact_dir",
+    # 新鲜度标记（读产物前算好，见 `lab/bench/workspace.py`）：
+    # "1" = 工作区已被后来的运行覆盖（产物**不是**这次运行的）
+    # "0" = 新鲜　"" = 无法判断（旧数据没记运行时间）
+    # 它不进 κ，只影响“这条样本该不该信” —— 所以与 human_* 列分开。
+    "workspace_stale",
+    # 样本来源元数据（P3a 分级抽样）：positive / db_negative / mild / wrong_solution / empty。
+    # ⚠️ 它**不是标签** —— 金标只有 human_* 三列。一个 “mild” 样本完全可能仍然合格
+    # （那就该标 true）。把 level 当标签用，等于用抽样设计伪造结论。
+    "level",
     *[f"human_{dimension}" for dimension in JUDGE_DIMENSIONS],
     "notes",
 )
