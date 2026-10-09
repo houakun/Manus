@@ -39,7 +39,13 @@ LEVEL_WRONG = "wrong_solution"  # 任务自带的错误解（明显错）
 LEVEL_EMPTY = "empty"  # 只铺 fixtures、不产出（完全没做）
 
 # 造负样本时默认用哪几级（顺序即难度递进）
-SYNTHETIC_LEVELS = (LEVEL_MILD, LEVEL_WRONG, LEVEL_EMPTY)
+# 造负样本时默认用哪几级（顺序即难度递进）。
+#
+# ⚠️ **不再默认包含 `empty`**（2026-10-09）：它的 26 条里 judge 绝大多数答 **Unknown**
+# （“没材料就不判”是合法答案）→ 它们**不计入 κ 的分母**，只贡献“空材料前会不会老实说不知道”
+# 这一个能力点。要测那个点仍可显式 `--level empty`；但作为**校准样本**它不划算。
+# 腾出来的配额给 `mild`（定向降级）—— 它才是“内容错、形状对”，正好落在要校准的那条边界上。
+SYNTHETIC_LEVELS = (LEVEL_MILD, LEVEL_WRONG)
 
 
 @dataclass
@@ -64,6 +70,9 @@ class Sample:
     level: str
     artifact_dir: str
     note: str = ""
+    # 同一 (任务, 级别) 的第几个变体（0 起）。`mild` 用它选中**不同的**检查去违反 ——
+    # 否则同一个任务的多条 mild 会是同一处改动，等于把同一个样本数了多遍。
+    variant: int = 0
 
 
 def select_from_runs(
@@ -116,26 +125,35 @@ def plan_synthetic(
     exclude_tasks: Iterable[str] = (),
     root: str,
     levels: Sequence[str] = SYNTHETIC_LEVELS,
+    mild_per_task: int = 1,
 ) -> List[Sample]:
     """为每个任务造**分级负样本**（纯规划，不碰文件系统；物化见 `materialize`）。
 
     这样负样本的来源就从"库里碰巧有失败"变成"每个任务都有" —— 跨任务覆盖是
     success criteria 明写的一条（`负样本跨多个任务`）。
+
+    `mild_per_task`：每个任务造几条 `mild`。>1 时它们会选中**不同的**检查去违反（见 `derive_mild`），
+    所以不是“同一个样本数多遍”。
     """
     excluded = set(exclude_tasks)
     out: List[Sample] = []
     for task_key in sorted(set(task_keys) - excluded):
         for level in levels:
-            out.append(
-                Sample(
-                    sample_id=f"synthetic:{task_key}:{level}",
-                    task_key=task_key,
-                    group="synthetic",
-                    level=level,
-                    artifact_dir=str(Path(root) / task_key / level / "workspace"),
-                    note=f"构造样本（{level}）—— 来源是任务定义，不是某次真实运行",
+            copies = max(1, mild_per_task) if level == LEVEL_MILD else 1
+            for variant in range(copies):
+                suffix = "" if copies == 1 else f":{variant + 1}"
+                subdir = level if copies == 1 else f"{level}-{variant + 1}"
+                out.append(
+                    Sample(
+                        sample_id=f"synthetic:{task_key}:{level}{suffix}",
+                        task_key=task_key,
+                        group="synthetic",
+                        level=level,
+                        artifact_dir=str(Path(root) / task_key / subdir / "workspace"),
+                        note=f"构造样本（{level}）—— 来源是任务定义，不是某次真实运行",
+                        variant=variant,
+                    )
                 )
-            )
     return out
 
 
@@ -306,8 +324,13 @@ def _violate(check, root: Path) -> bool:
     return False
 
 
-async def derive_mild(task, source_workspace: str, dest_workspace: str) -> bool:
+async def derive_mild(
+    task, source_workspace: str, dest_workspace: str, *, variant: int = 0
+) -> bool:
     """从**正确产物**派生一个"轻微错"样本，并**保证它真的会让判定失败**。
+
+    `variant`：要违反**第几条可违反的检查**（0 起）。同一个任务造多条 `mild` 时用它选**不同**的检查 ——
+    否则多条会是同一处改动，等于把同一个样本数了多遍。
 
     与旧的"改第一个数字"的关键区别：改完**回跑判定器**；没坏就删掉副本返回 False。
     所以返回 True 的每一条都是**名副其实的负样本** —— "轻微错"不再是名义上的。
@@ -320,14 +343,27 @@ async def derive_mild(task, source_workspace: str, dest_workspace: str) -> bool:
         return False
 
     dest = Path(dest_workspace)
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, dest)
-    dest_root = dest / "home" / "ubuntu"
 
+    def _fresh_copy() -> Path:
+        """（重新）铺一份源副本，返回它的 `home/ubuntu`。
+
+        将就着用“改完再改回去”会漏掉一件事：`_violate` 可能改的是**多个**位置
+        （如 `not_contains` 只改一处，但 `contains` 要抹掉所有出现）。重铺一份最稳。
+        """
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, dest)
+        return dest / "home" / "ubuntu"
+
+    dest_root = _fresh_copy()
+    skipped = 0
     for check in _ordered_checks(task):
         if not _violate(check, dest_root):
+            continue
+        if skipped < variant:
+            skipped += 1  # 这一条能改，但本轮要的是“另一条” → 重铺后试下一条
+            dest_root = _fresh_copy()
             continue
         checks = await run_checks(task.verify, LocalSandbox(dest))
         # `run_checks` 会就地改工作区吗？不会 —— 它只读产物并执行 exec_script。

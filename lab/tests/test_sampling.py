@@ -21,6 +21,7 @@ import pytest
 
 from lab.bench.sampling import (
     LEVEL_EMPTY,
+    LEVEL_MILD,
     LEVEL_POSITIVE,
     LEVEL_WRONG,
     Candidate,
@@ -77,9 +78,26 @@ def test_plan_synthetic_spans_many_tasks():
 
 
 def test_plan_synthetic_default_levels_are_graded():
-    """默认级别是**分层**的：轻微扰动 → 明显错 → 完全没做。"""
+    """默认级别是**分层**的，且**不再包含 `empty`**。
+
+    实测：26 条 `empty` 里 judge 绝大多数答 **Unknown**（“没材料就不判”是合法答案）→
+    它们**不计入 κ 的分母**，作为校准样本不划算。腾出的额度给 `mild`（定向降级）——
+    它才是“内容错、形状对”，正好落在要校准的那条边界上。
+    """
     samples = plan_synthetic(["task_a"], root="/tmp/root")
-    assert [s.level for s in samples] == ["mild", "wrong_solution", "empty"]
+    assert [s.level for s in samples] == ["mild", "wrong_solution"]
+    assert "empty" not in {s.level for s in samples}
+
+
+def test_plan_synthetic_multiple_mild_variants_use_distinct_paths():
+    """`mild_per_task>1` 时：每条任务的多条 mild 必须落在**不同目录**、带**不同 variant**。
+
+    否则“多条 mild”只是把同一个样本数了多遍 —— 那比少抽几条更糟。
+    """
+    samples = plan_synthetic(["task_a"], root="/tmp/root", levels=[LEVEL_MILD], mild_per_task=3)
+    assert [s.variant for s in samples] == [0, 1, 2]
+    assert len({s.artifact_dir for s in samples}) == 3
+    assert len({s.sample_id for s in samples}) == 3
 
 
 # ==================== 构造材料本身要正确 ====================

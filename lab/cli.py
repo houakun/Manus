@@ -1173,7 +1173,8 @@ async def _materialize_synthetic(samples: List[Any], by_key: dict, positives: di
             if source:
                 # **定向降级**：按 verify 的期望值构造违反，并回跑判定器确认它**真的失败**。
                 # 返回 False 时不会落盘 —— 宁可少一条，也不给“轻微错”挂空名。
-                await derive_mild(task, source, sample.artifact_dir)
+                # `variant` 让同一任务的多条 mild 选中**不同**的检查（否则就是同一个样本数了多遍）。
+                await derive_mild(task, source, sample.artifact_dir, variant=sample.variant)
             continue
         await materialize(sample, task, level=sample.level)
 
@@ -1220,7 +1221,11 @@ def _balanced_sheet_rows(args: argparse.Namespace, store: Any) -> List[dict]:
     tasks = {task.key: task for task in load_all_tasks()}
     levels = list(args.level) if args.level else list(SYNTHETIC_LEVELS)
     synthetic = plan_synthetic(
-        tasks, exclude_tasks=exclude, root=str(ensure_runs_dir() / "judge_samples"), levels=levels
+        tasks,
+        exclude_tasks=exclude,
+        root=str(ensure_runs_dir() / "judge_samples"),
+        levels=levels,
+        mild_per_task=args.mild_per_task,
     )
     positives = {s.task_key: s.artifact_dir for s in samples if s.level == LEVEL_POSITIVE}
     asyncio.run(_materialize_synthetic(synthetic, tasks, positives))
@@ -2229,6 +2234,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="排除某个任务（可重复；--balanced 下默认排除两个已修缺陷的任务）",
     )
     bench_sheet.add_argument("--per-task", type=int, default=2, help="每个任务最多取几条正/负样本（--balanced）")
+    bench_sheet.add_argument(
+        "--mild-per-task",
+        type=int,
+        default=2,
+        help="每个任务造几条定向降级的 mild（各自违反**不同**的检查；--balanced）",
+    )
     bench_sheet.add_argument(
         "--level",
         action="append",
