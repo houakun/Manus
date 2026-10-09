@@ -75,6 +75,7 @@ python -m lab trace
 | `lab bench recover` | 从工作区 + 轨迹重建一次中断的评测 | 免费 |
 | `lab bench judge-sheet` | 生成 LLM-judge 的**人工标注表**（默认 100 条，失败优先） | 免费 |
 | `lab bench judge` | 对标注表跑 LLM-judge，产出判定 JSON（`calibrate` 的输入；默认不跑，`--yes` 才真调模型） | 💰 |
+| `lab bench audit-labels --gold <csv> [--judged <json>]` | **标注审计**：把维度边界编码成规则，与人 / judge 逐条对账（把 κ 还原成具体条目） | 免费 |
 | `lab bench calibrate --gold <csv> [--judged <json>]` | 算 Cohen's κ + 每维混淆矩阵；κ<0.6 或样本<20 → **拒绝启用** | 免费 |
 | `lab sandbox clean-escapes` | 清理脚本逃逸到工作区外的残留 | 免费 |
 | `lab sandbox env` | **Agent 会看到的环境指纹**（工具面 + 短摘要，`--json` 可机读） | 免费 |

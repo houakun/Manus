@@ -1309,6 +1309,38 @@ def _cmd_bench_judge_sheet(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bench_audit_labels(args: argparse.Namespace) -> int:
+    """`lab bench audit-labels`：把标注边界**编码成规则**，与人给的标签 / judge 判定逐条对账（$0）。
+
+    为什么需要它：两轮 κ 的分歧**全在** `instruction_following` / `output_quality` 的边界上。
+    这个命令把那套边界变成**可执行的明文**，于是分歧会以"**违反明文**"的形式暴露出来，
+    而不是"两个人直觉不同"；同时也把聚合的 κ **还原成具体条目**（哪几条、朝哪个方向错）。
+    """
+    import asyncio
+
+    from lab.bench.calibrate import read_gold_rows
+    from lab.bench.label_audit import audit, render_audit
+    from lab.bench.task import load_all_tasks
+
+    gold_path = Path(args.gold)
+    if not gold_path.exists():
+        print(f"[lab] 找不到金标 {gold_path}", file=sys.stderr)
+        return 2
+    judged = None
+    if args.judged:
+        try:
+            judged = json.loads(Path(args.judged).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"[lab] 读 judge 判定失败 {args.judged}: {exc}", file=sys.stderr)
+            return 2
+        judged.pop("__meta__", None)  # 元数据不是样本
+
+    tasks = {task.key: task for task in load_all_tasks()}
+    report = asyncio.run(audit(read_gold_rows(gold_path), tasks, judged))
+    print("\n".join(render_audit(report, limit=args.limit)))
+    return 0
+
+
 def _cmd_bench_calibrate(args: argparse.Namespace) -> int:
     """`lab bench calibrate`：人工金标 → Cohen's κ（**低于阈值就拒绝启用**，T14，$0）。"""
     from lab.bench.calibrate import calibrate, read_gold_csv, render_calibration
@@ -2215,6 +2247,16 @@ def build_parser() -> argparse.ArgumentParser:
     bench_judge.add_argument("--temperature", type=float, default=0.0, help="judge 的温度（默认 0.0：要可复现）")
     bench_judge.add_argument("--yes", action="store_true", help="确认付费（不带它只打印预估）")
     bench_judge.set_defaults(func=_cmd_bench_judge)
+
+    bench_audit_labels = bench_sub.add_parser(
+        "audit-labels", help="把标注边界编码成规则，与人/judge 逐条对账（$0）"
+    )
+    bench_audit_labels.add_argument("--gold", required=True, help="金标 CSV")
+    bench_audit_labels.add_argument(
+        "--judged", default=None, help="judge 判定 JSON（可选；给了就同时报 judge 相对规则的偏离）"
+    )
+    bench_audit_labels.add_argument("--limit", type=int, default=20, help="每组最多列几条")
+    bench_audit_labels.set_defaults(func=_cmd_bench_audit_labels)
 
     bench_show = bench_sub.add_parser("show", help="读一次具体运行的轨迹（工具序列 + 失败检查 + 关键产物 + 轨迹树）")
     bench_show.add_argument("suite", help="suite（支持短 id 或 label 片段）")
