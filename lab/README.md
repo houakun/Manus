@@ -476,7 +476,7 @@ which sqlite3 || (sudo apt-get update -y && sudo apt-get install -y sqlite3)
 | **地板的很大一部分是装置问题，不是模型抖动** | 已定位到五个机制，已修 4 个：✅ CRLF/GBK 乱码（命令**输出**，`cmp` 6→0）；✅ **文件里的 CRLF**（终态 LF，与命令输出/read_file 一致）；✅ **脚本内容里的绝对路径逃逸**（虚拟盘符，重测逃逸 0/42）；✅ **子进程 PATH 不随启动上下文变**（固定前缀 + 环境指纹）；🔴 **"缺 `sqlite3`" 已证伪**（从命令文本误推） |
 | **成功率的地板是 ±0.00pt，但那是假象** | 离散指标在"无任务翻转"时配对区间会塔成 0；它**不能**用来判小幅度成功率差异 |
 | 任务集 8 个半真实任务 | `pass^k` 的样本量是**任务数**，区间较宽 |
-| 判定器不支持开放式任务 | LLM-judge **骨架已就位**（`bench judge-sheet` / **`bench judge`** / `bench calibrate`：按维度独立调用、`Unknown` 不计入 κ），但**尚未校准** —— 真实 κ 要等人工标完 100 条金标（`lab/runs/judge_gold.csv`）**并跑一次 `bench judge`** 才有对照；在那之前 `calibrate` 如实报“无法计算”并**拒绝启用** |
+| 判定器不支持开放式任务 | LLM-judge **已按 rubric v1 实测校准过**（`bench judge-sheet` → `bench judge` → `bench calibrate`）：κ = `task_completion` **1.000** / `instruction_following` **0.419** / `output_quality` **0.693**（100 条金标、300 次调用、**$0.149 等价**）→ **不达标，拒绝启用**（`instruction_following` < 0.6）。⚠️ 但这份金标**测不出总体可信度**：89/100 条三个维度全 true，而**所有**反例都来自同一个（目标有歧义的）任务 `sem_markdown_toc` —— 去掉它，前两维的 κ 直接退化成“无法计算”。详见 `docs/step11-judge-calibration.md` |
 | fast mode 沙箱**曾经**可被脚本逃逸 | 已修：每次运行分配一个 `subst` 虚拟盘，脚本里的 `/home/ubuntu/...` 会落回工作区（见 `docs/step8-device-fixes.md` §4）。残留风险：`subst` 不可用（组策略/盘符占满）时会**告警式退化**回旧行为 —— 所以仍只能跑可信内容 |
 | Pareto 只有 2 个取舍点 | 画不出曲线，需要跑多组有意取舍的配置 |
 | SUT 提示词里带随机 UUID | 精确回放必然未命中；需 `--replay-ignore-volatile`（已可事后开启） |
@@ -521,6 +521,7 @@ lab/
 - `docs/step9b-silent-wrong-2x2.md` —— `silent_wrong_result` 2×2（**负结果**）+ 三次实验的统一机制
 - `docs/step9c-stable-corruption.md` —— **稳定损坏 2×2**（`--fault-stable`）：负结果，但给出机制层级的解释（Agent 有**独立执行通道**），并修了一个"命中却零改动"的真 bug
 - `docs/step10-ci-baseline.md` —— `ci` 组 capability 基线（8 任务 × 3 次）
+- `docs/step11-judge-calibration.md` —— **LLM-judge 首次校准**：κ = 1.000 / 0.419 / 0.693 → 拒绝启用；并记录一个更重要的限制：金标 89% 全 true、反例全部来自同一个歧义任务（测不出总体可信度）
 - `docs/task-ambiguity-lint.md` —— 任务歧义 lint 的告警清单与假阳性分析
 - `docs/noise-floor-measured.md` —— **噪声地板实测**：同配置两臂差 ±24%，它由什么构成，以及"修了一处但地板没降"的自纠
 - `../README.md` —— 被测系统（MoocManus）本身的部署文档
