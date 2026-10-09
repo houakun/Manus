@@ -32,7 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 # rubric 版本：**改提示词就必须改它**（否则不同版本的人工金标会被混在一起算 κ）。
 #
-# **v2 起成为默认**：把 `instruction_following` / `output_quality` 的**边界**写进提示词。
+# **v2 曾短暂作为默认**（已被下面的 v3 取代）：把 `instruction_following` / `output_quality` 的**边界**写进提示词。
 # 依据是**对照实验**（同一批 111 条、同一份金标、**同一份代码**，只切 rubric 版本）：
 #
 #   instruction_following κ  0.208 → **0.556**（“人✓judge✗” 32 → 11）
@@ -42,7 +42,25 @@ from typing import Any, Callable, Dict, List, Optional
 # → 这是**转移、不是白拿**：总分歧 33 → 15，但两维都有代价；**且 v2 仍不达标**
 #   （0.556 < 0.6）。采纳的理由是“消除了真实存在的规格歧义 + 总分歧更少”，
 #   而不是“它把指标顶上去了”。完整记录：`docs/step14-judge-rubric-v2-experiment.md`。
-JUDGE_RUBRIC_VERSION = "v2"
+# ==================== v3 起成为默认 ====================
+#
+# 在 v2 的“边界”之上，再把“命名”收窄：**任何字段的「值」写错都算内容问题**
+# （哪怕那个字段装的就是文件名 / 符号名）。
+#
+# 三臂对照（同一批 111 条、同一份金标、**同一份代码**，只切 `LAB_JUDGE_RUBRIC`）：
+#   `instruction_following` κ  0.208 → 0.556 → **1.000**
+#   `output_quality`       κ  0.978 → 0.842 → **0.912**   ← **仍低于 v1**
+#   `task_completion`      κ  0.977 → 0.977 → 0.978
+#   judge 相对显式规则的偏离：  33 → 18 → **4**；门禁：❌ → ❌ → **✅ 达标**
+#
+# ⚠️ **这个“达标”是 provisional**：金标是“agent 给结论 + 用户复核”，**不是盲标** ——
+#   它说明“judge 与 {用户+agent} 的判断一致”，**不等于**“与独立人类一致”。
+#   在拿到**独立标注**的金标复测之前，**不得**把 judge 当成“已验证可靠的裁判”；
+#   它始终只是**辅助信号**（本来也不进确定性基线）。
+# ⚠️ 另：v3 **不是全面更好**（它用 OQ 换了 IF），而且三轮改动一轮比一轮高、
+#   最后一次刚好跨线 —— 这个形状本身是风险。
+#   完整记录：`docs/step15-judge-rubric-v3.md`。
+JUDGE_RUBRIC_VERSION = "v3"
 
 # 三个维度：各自独立调用，互不牵连。
 JUDGE_DIMENSIONS = ("task_completion", "instruction_following", "output_quality")
