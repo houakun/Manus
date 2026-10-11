@@ -35,6 +35,42 @@ python -m lab trace
 
 ---
 
+## 提交前：本地复现 CI 的三条门禁
+
+CI（`.github/workflows/ci.yml`）跑的就是这三条 —— **本地跑通它们，CI 就不会红**：
+
+```bash
+ruff check lab/                # ① lint（版本钉在 lab/requirements.txt）
+python -m pytest -q            # ② 全量单测
+python -m lab bench validate   # ③ 任务集自检（28/28）
+```
+
+⚠️ **两个坑（都踩过）**：
+
+1. **ruff 必须装在“能跑 `python -m ruff` 的那个 Python”里。**
+   本仓库的 `.venv` 可能是 `uv venv` 建的、**没有 pip**（`python -m pip` → `No module named pip`），
+   这时 `pip install ruff` 会装到**系统 Python**，而 `python -m ruff` 在 venv 里依旧找不到
+   （报 `No module named ruff`，很容易误以为“没装”）。两种可行做法：
+
+   ```bash
+   # a) 直接用系统 Python 的 ruff —— ruff 不依赖项目依赖，够用
+   "$LOCALAPPDATA/Programs/Python/Python313/Scripts/ruff.exe" check lab/
+   # b) 或者用 uv 装进 venv
+   uv pip install --python .venv/Scripts/python.exe ruff==0.16.8
+   ```
+
+2. **版本必须钉住**（`ruff==0.16.8`，写在 `lab/requirements.txt` 里）。
+   ruff 的默认规则集会随版本变（实测同一份代码从 2 条变 47 条）——
+   不钉版本的话，“门禁口径”会跟着上游漂移，而不是跟着本项目走。
+
+> 为什么值得单独写一节：本项目的 lint 门禁曾经**只存在于 CI 里**，
+> 于是“本地改完看不出问题、CI 才报”成了常态；而更早一次事故是
+> `ruff check lab/ --fix` 的规则集比预期宽得多，**误伤了约 40 个文件**
+> （见「我错在哪」第 11 条）—— 先在本机跑一遍 `ruff check lab/`（不带 `--fix`）
+> 就能看到影响面。
+
+---
+
 ## 为什么要有这个 lab
 
 `api/` 里的 Agent 已经能跑通了，但**"能跑通"不等于"知道它有多可靠"**。
