@@ -122,7 +122,8 @@ async def test_correction_prompt_lists_required_fields(tmp_path):
     from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser
 
     agent = BaseAgent(
-        uow_factory=lambda: None,
+        # 这个用例只测两个纯函数（`_expected_schema` / `_parse_structured`），不需要真 UoW
+        uow_factory=lambda: None,  # pyright: ignore[reportArgumentType]
         session_id="s",
         agent_config=AgentConfig(max_iterations=4, max_retries=2, max_search_results=3),
         llm=ScriptedLLM([]),
@@ -341,7 +342,9 @@ async def test_malformed_tool_arguments_are_fed_back():
     assert events
     # 2.产出了一对 CALLING/CALLED 事件，且结果是 invalid_arguments
     called = [e for e in events if isinstance(e, ToolEvent) and e.status == ToolEventStatus.CALLED]
-    assert called and called[0].function_result.error_type == "invalid_arguments"
+    assert called
+    assert called[0].function_result is not None
+    assert called[0].function_result.error_type == "invalid_arguments"
     # 3.失败被回灌给模型
     tool_messages = [m for m in fake.calls[1]["messages"] if m.get("role") == "tool"]
     assert tool_messages and "合法 JSON" in tool_messages[-1]["content"]
@@ -396,4 +399,41 @@ async def test_summarize_failure_without_results_still_reports_error(tmp_path, n
     result = await sut.run("一个没有产出的任务")
 
     assert result.ok is False
+    assert result.error_type == "agent_error"
+
+
+# ==================== D11：success=false 不能记成“完成” ====================
+
+
+async def test_step_reported_unsuccessful_is_not_marked_completed(tmp_path):
+    """D11 的验收：模型在 Step 结果里写 `success=false` → 必须是失败，不能虚报成功。
+
+    修复前：`react.execute_step` 在 `holder.ok` 时**无条件**把 `step.status` 置成
+    COMPLETED（而且是**两处重复赋值**），于是“模型自己承认没做成”的步骤
+    在轨迹上显示“完成”、`steps_done` 计入 1，流继续走到收尾并以“任务成功”结束
+    （`self_reported_ok=True`）—— 而产物根本不存在。
+    只有外部判定器（不看自述）靠“产物不存在”才能发现。
+
+    实测（2026-10-10，216 次运行）：**16 次失败全部是这种形态**，
+    且 **94% 自述成功**。见 `docs/step17-resolution-budget.md` §十六。
+    """
+    recorder = TraceRecorder("t-d11")
+    script = [
+        # 1) create_plan：合法计划，1 步
+        json_content(_valid_plan([{"description": "读取 CSV 并筛选"}])),
+        # 2) react：**一个工具都没调**，直接在结构化结果里承认没做成
+        json_content({"success": False, "result": "", "attachments": []}),
+        # 3) update_plan
+        json_content({"steps": []}),
+        # 4) summarize
+        json_content(VALID_SUMMARY),
+    ]
+    sut, _ = _build(tmp_path, recorder, script)
+
+    result = await sut.run("读取并筛选")
+
+    assert result.tool_sequence == [], "这个用例的前提是模型一个工具都没调"
+    assert result.steps.succeeded == 0
+    assert result.steps.failed >= 1, "success=false 的步骤没有被记成 failed"
+    assert result.ok is False, "所有步骤都没做成，却被当成了任务完成（虚报成功）"
     assert result.error_type == "agent_error"

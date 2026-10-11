@@ -28,7 +28,9 @@ class ReActAgent(BaseAgent):
     """基于ReAct架构的执行Agent"""
     name: str = "react"
     _system_prompt: str = SYSTEM_PROMPT + REACT_SYSTEM_PROMPT
-    _format: str = "json_object"  # format控制的是content、工具调用控制的是tool_calls两者不冲突
+    # pyright: ignore[reportIncompatibleVariableOverride] —— 父类声明是 `str | None`，
+    # 这里赋的是具体值（**既有**注解不一致，运行时无影响）
+    _format: str = "json_object"  # pyright: ignore[reportIncompatibleVariableOverride]  # format控制的是content、工具调用控制的是tool_calls两者不冲突
 
     async def execute_step(self, plan: Plan, step: Step, message: Message) -> AsyncGenerator[BaseEvent, None]:
         """根据传递的消息+规划+子步骤，执行相应的子步骤"""
@@ -78,25 +80,34 @@ class ReActAgent(BaseAgent):
 
         # 8.拿到结构化结果 → 更新子步骤的数据
         if holder.ok:
-            new_step: Step = holder.value
+            # holder.ok 保证 value 非 None（**既有**注解问题，运行时无影响）
+            new_step: Step = holder.value  # pyright: ignore[reportAssignmentType]
             step.success = new_step.success
             step.result = new_step.result
             step.attachments = new_step.attachments
-            step.status = ExecutionStatus.COMPLETED
 
-            # 11.返回步骤完成事件
-            yield StepEvent(step=step, status=StepEventStatus.COMPLETED)
+            # [lab/D11] 模型**可以在 Step 结构里诚实地写 `success=false`**（承认这一步没做成）。
+            #   原代码无条件置 COMPLETED（而且下面还有一处重复赋值）→
+            #   “失败的步骤”被当成“完成的步骤” → 流程以“任务成功”结束
+            #   （`self_reported_ok=True`），而产物根本不存在。
+            #   实测（2026-10-10，216 次运行）：**16 次失败全部是这种形态** ——
+            #   `tool_calls=0`、answer 是计划文本、自述成功（假阳性率 94%）；
+            #   只有外部判定器（不看自述）靠“产物不存在”才能发现。
+            #   注意 `Step.done` 把 FAILED 也算“已结束”，所以这里改成 FAILED
+            #   **不会**让流程卡在该步骤上（只是不再谎报完成）。
+            step.status = ExecutionStatus.COMPLETED if new_step.success else ExecutionStatus.FAILED
+            if not new_step.success:
+                step.error = step.error or "模型在步骤结果里报告 success=false：这一步没有做成"
+
+            # 11.返回步骤事件（成功 / 失败要如实反映）
+            yield StepEvent(
+                step=step,
+                status=StepEventStatus.COMPLETED if new_step.success else StepEventStatus.FAILED,
+            )
 
             # 12.如果子步骤拿到了结果，还需要返回一段消息给用户(将结果返回给用户)
             if step.result:
                 yield MessageEvent(role="assistant", message=step.result)
-
-            # 16.循环迭代完成后代表子步骤已实现，需要更新状态
-            #   注意：这里只在**解析成功**时才置 COMPLETED。
-            #   原代码把这一行放在循环外面无条件执行，会把上面刚设好的 FAILED
-            #   又覆盖成 COMPLETED —— 结果是步骤统计里的 failed 永远是 0，
-            #   失败只在 step.error 里看得到，轨迹上却显示"完成"。
-            step.status = ExecutionStatus.COMPLETED
 
     async def summarize(self) -> AsyncGenerator[BaseEvent, None]:
         """调用Agent汇总历史的消息并生成最终回复+附件"""
@@ -112,8 +123,8 @@ class ReActAgent(BaseAgent):
         if not holder.ok:
             return
 
-        # 5.拿到解析好的 Message
-        message: Message = holder.value
+        # 5.拿到解析好的 Message（holder.ok 保证非 None）
+        message: Message = holder.value  # pyright: ignore[reportAssignmentType]
 
         # 6.提取消息中的附件信息
         attachments = [File(filepath=filepath) for filepath in message.attachments]

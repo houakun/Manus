@@ -147,7 +147,7 @@ class PlannerReActFlow(BaseFlow):
                 self.status = FlowStatus.PLANNING
             elif self.status == FlowStatus.PLANNING:
                 # 10.流状态为规划中，则调用规划Agent
-                logger.info(f"Planner&ReAct流开始创建计划/Plan")
+                logger.info("Planner&ReAct流开始创建计划/Plan")
                 async for event in self.planner.create_plan(message):
                     # 11.判断规划Agent是否返回规划事件
                     if isinstance(event, PlanEvent) and event.status == PlanEventStatus.CREATED:
@@ -175,13 +175,24 @@ class PlannerReActFlow(BaseFlow):
                 #   靠"产物不存在"才能发现（Step 4 的 SUT 自述 vs 独立判定交叉校验就是为此）。
                 #   空计划意味着任务根本没做，必须作为错误事件上报。
                 if not self.plan or len(self.plan.steps) == 0:
-                    logger.info(f"Planner&ReAct流创建计划失败或无子步骤")
+                    logger.info("Planner&ReAct流创建计划失败或无子步骤")
                     yield ErrorEvent(
                         error="Agent未能生成任何可执行的计划步骤（Plan 为空），任务未执行"
                     )
                     self.status = FlowStatus.COMPLETED
             elif self.status == FlowStatus.EXECUTING:
                 # 17.流的状态为执行中，先将计划状态调整为运行中，同时调用执行Agent完成每个子步骤
+                # [lab/D11-typing] 进入执行前必须有可执行的 plan。
+                #   第 4 步有一条“会话处于 WAITING → 直接置 EXECUTING”的路径，
+                #   它**不经过 PLANNING**；若此时 `session.get_latest_plan()` 返回 None
+                #   （或计划为空），下面 `self.plan.status = ...` 会抛 AttributeError ——
+                #   把“没有可执行的计划”变成“进程崩溃”。类型上这里也一直是 `Plan | None`。
+                if self.plan is None or len(self.plan.steps) == 0:
+                    logger.warning("Planner&ReAct流进入执行阶段但计划为空，转为失败")
+                    yield ErrorEvent(error="进入执行阶段时没有可执行的计划（Plan 为空），任务未执行")
+                    self.status = FlowStatus.COMPLETED
+                    continue
+
                 self.plan.status = ExecutionStatus.RUNNING
 
                 # 18.获取当前计划的下一个需要执行的子步骤
@@ -206,7 +217,16 @@ class PlannerReActFlow(BaseFlow):
                 self.status = FlowStatus.UPDATING
             elif self.status == FlowStatus.UPDATING:
                 # 23.流状态为更新表示需要更新计划
-                logger.info(f"Planner&ReAct流开始更新计划")
+                # [lab/D11-typing] 进入 UPDATING 的唯一入口是 EXECUTING 里 `step` 非空的分支，
+                #   但类型上两者仍是 `Plan | None` / `Step | None`。这里用**显式守卫**而不是 assert：
+                #   生产代码里的 assert 会被 `-O` 移除，而“进入更新阶段却没有计划/步骤”
+                #   应该是结构化错误事件，不是崩溃。
+                if self.plan is None or step is None:
+                    logger.warning("Planner&ReAct流进入更新阶段但计划或步骤为空，转为失败")
+                    yield ErrorEvent(error="进入更新阶段时没有计划或步骤（状态不一致），任务未执行")
+                    self.status = FlowStatus.COMPLETED
+                    continue
+                logger.info("Planner&ReAct流开始更新计划")
                 async for event in self.planner.update_plan(self.plan, step):
                     yield event
 
@@ -215,7 +235,7 @@ class PlannerReActFlow(BaseFlow):
                 self.status = FlowStatus.EXECUTING
             elif self.status == FlowStatus.SUMMARIZING:
                 # 25.流状态为总结中，则意味着所有子步骤都执行完成
-                logger.info(f"Planner&ReAct流开始总结")
+                logger.info("Planner&ReAct流开始总结")
 
                 # [lab/兜底] 收尾阶段失败**不应把已经做完的工作报成失败**。
                 #   实测 4/40 次运行属于"活干完了但收尾失败"：
@@ -260,15 +280,28 @@ class PlannerReActFlow(BaseFlow):
                 if self.plan is None or len(self.plan.steps) == 0:
                     # 计划为空：上面第16步已经报过 ErrorEvent 了，这里不再重复一个
                     # （重复报错会让错误链出现两条同样的条目，归因时会被重复计数）
-                    logger.warning(f"Planner&ReAct流结束但计划为空，跳过完成事件")
+                    logger.warning("Planner&ReAct流结束但计划为空，跳过完成事件")
                 else:
                     self.plan.status = ExecutionStatus.COMPLETED
                     yield PlanEvent(status=PlanEventStatus.COMPLETED, plan=self.plan)
+
+                    # [lab/D11] 一个成功的步骤都没有 → **不能算任务完成**。
+                    #   上面 `react.execute_step` 已经把 `success=false` 的步骤记成 FAILED，
+                    #   但 flow 到这里仍会发“完成”事件 —— 而 adapter 的 `ok` 只看有没有
+                    #   ErrorEvent。实测（2026-10-10，216 次运行）：16 次失败全部是
+                    #   “所有步骤都没做成 + 自述成功”，判定器只能靠“产物不存在”发现。
+                    #   这一条把它变成**显式的错误**（error_type=agent_error），
+                    #   于是“自述成功”不再可能出现在“什么都没做成”的运行上。
+                    if not any(step.success for step in self.plan.steps):
+                        logger.warning("Planner&ReAct流结束但没有任何步骤成功，上报错误")
+                        yield ErrorEvent(
+                            error="所有计划步骤都未成功（步骤结果均为 success=false），任务未完成"
+                        )
                 self.status = FlowStatus.IDLE
                 break
         # 28.任务已经结束则返回结束事件
         yield DoneEvent()
-        logger.info(f"Planner&ReAct流处理任务消息已完毕")
+        logger.info("Planner&ReAct流处理任务消息已完毕")
 
     @property
     def done(self) -> bool:
