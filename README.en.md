@@ -31,8 +31,13 @@ Three pieces of infrastructure exist because "our number went up" is worthless w
 
 - **Noise floor** — run the *same* configuration twice and measure the spread. Without it,
   a 20% improvement claim is indistinguishable from re-running the same code.
-  Measured floor: **±16.6% cost** on `deepseek-reasoner`, **±46.8%** after switching the SUT to
-  `deepseek-v4.1-flash` (cost deltas below that are invisible — and we say so).
+  Measured floor: **±15.2% cost** across **18 regression tasks × 6 runs** (`deepseek-v4.1-flash`, suite `01417afc`);
+  the same model on only 7 tasks gave ±46.8% — the floor is a function of task count, so it is never compared
+  across different task sets. Doubling the runs barely moved the cost floor (0.95pt), but the tighter success
+  floor exposed the real failure mode: **16/216 runs (7.4%) never called a single tool** — the planner returned
+  malformed JSON, so the executor never started and the plan text was submitted as the answer, **while the agent
+  self-reported success** (94% false-positive rate). Two identical arms differed by 6.48pt in success, but that is
+  **not** significant (Fisher p = 0.064) — not a device bias.
 - **Interleaved A/B** — both arms alternate inside one suite (A,B,B,A…), so time-correlated
   server drift cannot masquerade as a treatment effect.
 - **LLM record/replay** — a real run (24.5 s / $0.057) replays offline in **0.4 s / $0**,
@@ -46,7 +51,7 @@ Three pieces of infrastructure exist because "our number went up" is worthless w
 | Hardening 2×2 (`partial_write`, write path) | **negative result**, mechanism explained: the Agent re-reads its own output |
 | Read-path silent fault 2×2 (`truncated_result`) | **negative result**: every truncation triggered a re-read (see `docs/step9-readpath-2x2.md`) |
 | Cost attribution | reconciled to the database to 0.00% (per-tool / per-step) |
-| LLM-judge + Cohen's κ | **skeleton only** — 100-row labelling sheet generated; **not calibrated yet**, and we do not claim otherwise |
+| LLM-judge + Cohen's κ (rubric **v3**) | κ = **0.889** / **1.000** / **0.869** (TC / IF / OQ) on a **95-row** sheet, gate ✅ — but **auxiliary signal only**, not part of the deterministic baseline. Both label sets came from the **same annotator** (once with, once without seeing the agent's conclusion), so this is **intra-rater** agreement, **not** an independent human. See `docs/step16-blind-relabel.md`. |
 
 > Methodological honesty is part of the deliverable: every document carries a
 > "what you may say / what you may not say" table, and the README documents its own mistakes
