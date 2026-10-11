@@ -88,7 +88,7 @@ def test_duration_is_measured_and_monotonic():
     span = handle.span
     assert span.duration_ms is not None
     assert span.duration_ms >= 0
-    assert span.end_ms >= span.start_ms
+    assert span.end_ms is not None and span.end_ms >= span.start_ms
 
 
 def test_end_is_idempotent():
@@ -337,6 +337,94 @@ def test_task_success_audit_counts_only_clean_runs(tmp_path):
     assert row["last_clean_fail_run"] == 1
 
 
+def test_avg_cost_for_group_filters_by_model(tmp_path):
+    """预估必须按**当前模型**筛历史 —— 换模型后单次成本差 5 倍，混算会把预估拉偏。
+
+    实测背景（`docs/step17-resolution-budget.md` 的执行过程中抓到）：
+    semireal 组上 `deepseek-reasoner` 是 **$0.109/次**、`deepseek-v4.1-flash` 只有
+    **$0.021/次**。修之前预估把两者混在一起 → **预估 $9.58**，
+    而同一批 108 次真实只花了约 $2.3（高估 4.5 倍）。
+
+    高估和低估一样有害：它会让 `--yes` 确认变成例行动作，人就不看预估了。
+    """
+    from lab.bench.runner import RunOutcome, SuiteResult
+
+    store = SpanStore(tmp_path / "traces.db")
+
+    def _save(suite_id: str, model: str, cost: float) -> None:
+        store.save_suite_header(SuiteResult(suite_id=suite_id, label=suite_id, model_name=model))
+        for index in range(3):
+            store.save_outcome(
+                RunOutcome(
+                    run_id=f"{suite_id}-{index}",
+                    suite_id=suite_id,
+                    task_uid="u",
+                    task_key="sem_bug_fix",
+                    group="semireal",
+                    run_index=index,
+                    ok=True,
+                    cost_usd=cost,
+                )
+            )
+
+    _save("old-model", "deepseek-reasoner", 0.10)
+    _save("new-model", "deepseek-v4.1-flash", 0.02)
+
+    # 不筛模型：混算（旧行为，保留兼容）
+    assert store.avg_cost_for_group("semireal") == pytest.approx(0.06, rel=1e-6)
+    # 按模型筛：两个模型各算各的
+    assert store.avg_cost_for_group("semireal", model_name="deepseek-reasoner") == pytest.approx(0.10)
+    assert store.avg_cost_for_group("semireal", model_name="deepseek-v4.1-flash") == pytest.approx(0.02)
+    # 库里没有的模型 → None：调用方回退到保守默认值，而不是拿**别人**的历史当自己的
+    assert store.avg_cost_for_group("semireal", model_name="never-ran") is None
+
+
+def test_idle_failures_are_isolated_from_real_failures(tmp_path):
+    """空转失败（`tool_calls=0`）要能**单独**查出来 —— 它是 SUT 的健壮性缺陷，不是能力边界。
+
+    2026-10-10 实测：`deepseek-v4.1-flash` 上 **84% 的失败是空转**（planner 输出不合规
+    → 执行器不启动 → 把计划文本当答案，而且自述成功）。
+    见 `docs/step17-resolution-budget.md` §十四/§十五。
+    """
+    from lab.bench.runner import RunOutcome, SuiteResult
+
+    store = SpanStore(tmp_path / "traces.db")
+    store.save_suite_header(SuiteResult(suite_id="s", label="s", model_name="m"))
+
+    def _add(i: int, *, ok: bool, tool_calls: int, faults: int = 0, self_ok: bool = True) -> None:
+        store.save_outcome(
+            RunOutcome(
+                run_id=f"r{i}",
+                suite_id="s",
+                task_uid="u",
+                task_key="syn_sum_range",
+                group="synthetic",
+                run_index=i,
+                ok=ok,
+                tool_calls=tool_calls,
+                faults_injected=faults,
+                self_reported_ok=self_ok,
+                cost_usd=0.01,
+            )
+        )
+
+    _add(0, ok=True, tool_calls=10)
+    _add(1, ok=False, tool_calls=0, self_ok=True)  # 空转 + 自述成功
+    _add(2, ok=False, tool_calls=6)  # 做了但做错
+    _add(3, ok=False, tool_calls=0, faults=3)  # 故障注入造成的失败 → 不算 SUT 的毛病
+
+    rows = store.idle_failures()
+    assert {row["run_index"] for row in rows} == {1}
+
+    summary = store.idle_failure_summary()
+    assert len(summary) == 1
+    assert summary[0]["model_name"] == "m"
+    assert summary[0]["n"] == 3  # 无故障运行：run0/run1/run2（run3 有故障注入，被排除）
+    assert summary[0]["idle"] == 1
+    assert summary[0]["fails"] == 2  # 空转 1 + 真失败 1
+    assert summary[0]["idle_self_ok"] == 1
+
+
 def test_store_roundtrip_preserves_tree(tmp_path):
     """落盘再读回，父子关系与属性必须完全一致（trace 的价值全在因果结构上）。"""
     recorder = TraceRecorder("t-round", sut_name="fake-sut")
@@ -361,6 +449,7 @@ def test_store_roundtrip_preserves_tree(tmp_path):
     assert loaded_step.parent_id == recorder.task_span.span_id
 
     task = store.load_task("t-round")
+    assert task is not None
     assert task["goal"] == "测试目标"
     assert task["ok"] == 1
     assert json.loads(task["tool_sequence"]) == ["write_file"]

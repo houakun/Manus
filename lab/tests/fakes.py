@@ -73,9 +73,9 @@ class ScriptedLLM:
     async def invoke(
             self,
             messages: List[Dict[str, Any]],
-            tools: List[Dict[str, Any]] = None,
-            response_format: Dict[str, Any] = None,
-            tool_choice: str = None,
+            tools: Optional[List[Dict[str, Any]]] = None,
+            response_format: Optional[Dict[str, Any]] = None,
+            tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         self.calls.append({
             "messages": messages,

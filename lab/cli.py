@@ -389,6 +389,24 @@ def _cmd_bench_tasks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _current_model_name() -> Optional[str]:
+    """当前生效的模型名 —— 用于把"历史均值"限定到**同一个模型**上。
+
+    为什么需要它：`avg_cost_for_group` 原来不分模型，而换模型会让单次成本差 4~5 倍
+    （实测 semireal：`deepseek-reasoner` $0.109/次 vs `deepseek-v4.1-flash` $0.021/次）。
+    不筛模型 → 预估把旧模型的贵历史算进来 → 对当前模型**高估 4.5 倍**，
+    于是 `--yes` 确认变成例行动作（而例行确认等于没有确认）。
+
+    读配置失败（缺 key / 缺文件）时返回 None = "不筛模型"（回退到旧行为，宁可保守）。
+    """
+    try:
+        from lab.config import load_llm_config
+
+        return load_llm_config().model_name or None
+    except Exception:  # noqa: BLE001 —— 预估只是提示，配置读不出来不该阻断命令
+        return None
+
+
 def _confirm_cost(
     store: Any,
     tasks: List[Any],
@@ -408,15 +426,27 @@ def _confirm_cost(
     """
     runs = runs_per_task * len(tasks) * arm_count
     groups = {task.group for task in tasks}
+    # 限定到当前模型：换模型后单次成本能差 5 倍（见 _current_model_name 的 docstring）。
+    model_name = _current_model_name()
     historical = [
-        cost for cost in (store.avg_cost_for_group(name, faulted=faulted) for name in groups) if cost is not None
+        cost
+        for cost in (
+            store.avg_cost_for_group(name, faulted=faulted, model_name=model_name) for name in groups
+        )
+        if cost is not None
     ]
     if historical:
         per_run = max(historical)  # 多分组时取最贵的，偏保守
-        basis = f"库中同组历史均值（{'/'.join(sorted(groups))}，{'带故障注入' if faulted else '无故障'}）"
+        basis = (
+            f"库中同组历史均值（{'/'.join(sorted(groups))}，"
+            f"{'带故障注入' if faulted else '无故障'}，模型={model_name or '不限'}）"
+        )
     else:
         per_run = 0.15 if not faulted else 0.35
-        basis = f"保守默认值 ${per_run:.2f}/次（库里还没有此类历史；故障格实测约是基线的 2~3 倍）"
+        basis = (
+            f"保守默认值 ${per_run:.2f}/次（库里还没有 **{model_name or '此模型'}** 的此类历史；"
+            "故障格实测约是基线的 2~3 倍）"
+        )
 
     scale = f" × {arm_count} 臂" if arm_count > 1 else ""
     print(f"即将运行 {len(tasks)} 个任务 × {runs_per_task} 次{scale} = **{runs} 次{what}**")
@@ -854,6 +884,7 @@ def _run_digest_lines(
     failed_checks: Optional[List[str]] = None,
     process_flags: Optional[List[str]] = None,
     tool_sequence: Optional[str] = None,
+    tool_calls: Optional[int] = None,
     self_reported_ok: Optional[bool] = None,
     workspace: str = "",
     run_time: Optional[str] = None,
@@ -869,6 +900,16 @@ def _run_digest_lines(
             + ("（⚠️ 与判定器不一致：只看自述会被骗）" if bool(self_reported_ok) != ok else "")
         )
     lines.append(f"  {metrics}")
+    # 空转：判定失败且**一个工具都没调用**。
+    # 为什么要在摘要里显眼标出来（2026-10-10 实测）：这类失败在 `deepseek-v4.1-flash` 上
+    # 占**全部失败的 84%**，机制是 planner 输出格式不合规 → 执行器不启动 →
+    # 把计划文本当答案（且自述成功）。它与“做错了”是两件事，
+    # 而只看 `tool_sequence` 的空列表很容易被当成“工具调用没记录”。
+    if not ok and tool_calls == 0:
+        lines.append(
+            "  ⚠️ **空转**：一个工具都没调用 —— 产物必然不存在。"
+            "这不是「做错了」，是「没做」（实测成因：planner 输出不合规，见 docs/step17 §十四）"
+        )
     if error_type or error:
         lines.append(f"  错误：error_type={error_type or '—'}  {str(error or '')[:160]}")
     if failed_checks:
@@ -899,6 +940,26 @@ def _safe_json_list(raw: Any) -> List[str]:
     if isinstance(value, list):
         return [str(item) for item in value]
     return [str(value)[:200]]
+
+
+def _safe_int(raw: Any, default: int = 0) -> int:
+    """把库里的值安全转成 int（坏值不该让“读失败运行”这条命令整个挂掉）。
+
+    与 `_safe_json_list` 同一个理由：这些列是**历史数据**，
+    旧版本写过什么格式不由现在决定 —— 而“读失败运行”恰恰是最需要它可用的时候。
+    """
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(raw: Any, default: float = 0.0) -> float:
+    """把库里的值安全转成 float（与 `_safe_int` 同一理由）。"""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def _cmd_bench_show(args: argparse.Namespace) -> int:
@@ -956,6 +1017,7 @@ def _cmd_bench_show(args: argparse.Namespace) -> int:
             failed_checks=outcome.failed_checks,
             process_flags=outcome.process_flags,
             tool_sequence=(task or {}).get("tool_sequence"),
+            tool_calls=outcome.tool_calls,
             self_reported_ok=outcome.self_reported_ok,
             # ⚠️ workspace 要从 `tasks` 表取：`bench_runs` 里**没有**这一列，
             # 所以 `load_suite` 重建出来的 outcome.workspace 是空串 ——
@@ -1019,6 +1081,7 @@ def _cmd_bench_sample_failures(args: argparse.Namespace) -> int:
             failed_checks=failed,
             process_flags=flags,
             tool_sequence=row.get("tool_sequence"),
+            tool_calls=_safe_int(row.get("tool_calls")),
             self_reported_ok=bool(row.get("self_reported_ok")) if row.get("self_reported_ok") is not None else None,
             workspace=str(row.get("workspace") or ""),
             run_time=str(row.get("created_at") or ""),
@@ -1036,6 +1099,72 @@ def _cmd_bench_sample_failures(args: argparse.Namespace) -> int:
             + (f" --arm {row.get('arm')}" if row.get("arm") else "")
         )
         print()
+    return 0
+
+
+def _cmd_bench_idle_failures(args: argparse.Namespace) -> int:
+    """`lab bench idle-failures`：列出**空转失败**（判定失败 + 一个工具都没调用）。
+
+    为什么值得一条专门命令（2026-10-10 实测，见 `docs/step17-resolution-budget.md` §十四/§十五）：
+    这类失败在 `deepseek-v4.1-flash` 上占**全部失败的 84%**（全库 854 次里占 51%），
+    而它的成因**不是能力** —— 是 planner 输出的 JSON 不合规（返回 list 而非 object）
+    → 执行器根本没启动 → Agent 把**计划文本**当答案提交，而且**自述成功**（83%）。
+    把它单独列出来，才看得清“成功率”里有多少是“根本没做”。
+    """
+    from lab.api import default_trace_store
+
+    store = default_trace_store()
+    suite_id = None
+    if args.suite:
+        suite_id = _resolve_suite_id(store, args.suite)
+        if suite_id is None:
+            print(f"[lab] 无法唯一确定 suite：{args.suite}", file=sys.stderr)
+            return 2
+
+    summary = store.idle_failure_summary()
+    print("## 空转失败（判定失败 + 一个工具都没调用，只算无故障运行）")
+    print()
+    if not summary:
+        print("（库里还没有数据。）")
+        return 0
+
+    print("| 模型 | 无故障运行 | **空转** | 空转率 | 失败 | 空转占失败 | 其中自述成功 |")
+    print("|---|---|---|---|---|---|---|")
+    total = idle_total = 0
+    for row in summary:
+        n = _safe_int(row.get("n"))
+        idle = _safe_int(row.get("idle"))
+        fails = _safe_int(row.get("fails"))
+        total += n
+        idle_total += idle
+        rate = f"{100 * idle / n:.1f}%" if n else "—"
+        share = f"{100 * idle / fails:.0f}%" if fails else "—"
+        print(
+            f"| `{row.get('model_name')}` | {n} | **{idle}** | {rate} | {fails} | {share} "
+            f"| {_safe_int(row.get('idle_self_ok'))} |"
+        )
+    if total:
+        print(f"| **合计** | {total} | **{idle_total}** | {100 * idle_total / total:.1f}% | — | — | — |")
+    print()
+    print("> 机制：planner 输出的 JSON 不合规（返回 list 而非 object）→ 执行器不启动 →")
+    print("> Agent 把**计划文本**当最终答案，而且**自述成功**。")
+    print("> 它与「做了但做错」是两件事 —— 前者该修被测对象的健壮性，后者才是能力边界。")
+    print("> 详见 `docs/step17-resolution-budget.md` §十四/§十五。")
+    print()
+
+    rows = store.idle_failures(limit=args.limit, suite_id=suite_id)
+    if not rows:
+        print("（没有可列的空转失败。）")
+        return 0
+    print(f"最近 {len(rows)} 条（看完整轨迹：`python -m lab bench show <suite> <task> --run N`）：")
+    print()
+    for row in rows:
+        print(
+            f"  {str(row.get('task_key')):<24} {str(row.get('suite_id'))[:8]}  run{row.get('run_index')}"
+            f"  arm={row.get('arm') or '—'}  自述成功={bool(row.get('self_reported_ok'))}"
+            f"  llm_calls={_safe_int(row.get('llm_calls'))}  ${_safe_float(row.get('cost_usd')):.4f}"
+            f"  {row.get('created_at')}"
+        )
     return 0
 
 
@@ -1994,6 +2123,31 @@ def _cmd_bench_gate(args: argparse.Namespace) -> int:
 
     if floor is not None:
         print(render_noise_floor(floor))
+
+        # ---- 地板口径 vs 本次对比口径 ----
+        # 分辨率是**任务数**的函数（≈1/√n），而地板往往只在一部分任务上测过。
+        # 不加这句的话，读者会拿"7 个任务测出的 ±46.8%"去守"18 个任务的 suite"，
+        # 既浪费分辨率（偏保守得没必要），又让旁边那个“测量分辨率”变成错的参照。
+        # 这里只做**报告**，不做自动换算 —— 换算需要“任务间同分布”的假设，而那个假设没被验过。
+        paired_n = next((metric.n_pairs for metric in report.paired.values()), 0)
+        if paired_n:
+            same_scope = (not floor.task_count) or paired_n == floor.task_count
+            mark = "✅ 与地板口径一致" if same_scope else "⚠️ **与地板口径不一致**"
+            print(
+                f"> 本次门禁口径：**{paired_n}** 个任务（{report.scope}）；"
+                f"地板口径：**{floor.task_count}** 个任务 —— {mark}"
+            )
+            if not same_scope:
+                print(
+                    ">    分辨率随任务数下降（≈1/√n），所以上面的「测量分辨率」"
+                    "**不是**本次对比的参照。"
+                )
+                print(
+                    ">    要么把地板重测到同一批任务上，要么只按 √n 做量级换算"
+                    "（见 `docs/step17-resolution-budget.md`）。"
+                )
+            print()
+
         if thresholds_from:
             print("> ✅ `--auto-thresholds`：阈值已抬到不小于噪声地板。")
         else:
@@ -2273,6 +2427,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_audit_labels.add_argument("--limit", type=int, default=20, help="每组最多列几条")
     bench_audit_labels.set_defaults(func=_cmd_bench_audit_labels)
+
+    bench_idle = bench_sub.add_parser(
+        "idle-failures", help="列出**空转失败**（判定失败 + 一个工具都没调用）—— $0 审计"
+    )
+    bench_idle.add_argument("--limit", type=int, default=30, help="最多列几条明细（默认 30）")
+    bench_idle.add_argument("--suite", default=None, help="只列某个 suite（默认全库）")
+    bench_idle.set_defaults(func=_cmd_bench_idle_failures)
 
     bench_show = bench_sub.add_parser("show", help="读一次具体运行的轨迹（工具序列 + 失败检查 + 关键产物 + 轨迹树）")
     bench_show.add_argument("suite", help="suite（支持短 id 或 label 片段）")

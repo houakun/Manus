@@ -1021,6 +1021,65 @@ class SpanStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def idle_failures(self, *, limit: int = 50, suite_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """**空转失败**：判定失败且**一个工具都没调用**（`COALESCE(tool_calls,0)=0`）。
+
+        为什么单独一个入口（2026-10-10 实测，见 `docs/step17-resolution-budget.md` §十四/§十五）：
+        这类失败在 `deepseek-v4.1-flash` 的 430 次无故障运行里占**全部失败的 84%**
+        （全库 854 次里占 51%），机制是 planner 输出的 JSON 不合规（返回 list 而非 object）
+        → 执行器根本没启动 → Agent 把**计划文本**当最终答案提交，而且**自述成功**（83%）。
+
+        它与“做了但做错”是两件事：前者是 **SUT 的健壮性缺陷**（该修被测对象），
+        后者是**能力边界**（该改任务或提示词）。混在一起，所有成功率的解读都会偏 ——
+        所以要有入口能把它们单独列出来，也就能直接拿去当“修 planner”的**回归用例**。
+
+        只算**无故障**运行：故障注入会人为制造失败，那是装置在起作用，不是 SUT 的毛病。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                # 静态 SQL + 命名参数（与 list_failed_runs 同一套写法）
+                """
+                SELECT b.suite_id, b.task_key, b.task_uid, b.run_index, b.arm, b.task_id,
+                       b.error_type, b.error, b.cost_usd, b.elapsed_ms, b.llm_calls,
+                       b.created_at, b.self_reported_ok, b.tool_calls,
+                       t.workspace AS workspace, t.tool_sequence AS tool_sequence
+                FROM bench_runs b LEFT JOIN tasks t ON b.task_id = t.task_id
+                WHERE b.ok = 0
+                  AND COALESCE(b.tool_calls, 0) = 0
+                  AND COALESCE(b.faults_injected, 0) = 0
+                  AND (:pattern IS NULL OR b.suite_id LIKE :pattern)
+                ORDER BY b.created_at DESC
+                LIMIT :limit
+                """,
+                {"pattern": f"{suite_id}%" if suite_id else None, "limit": limit},
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def idle_failure_summary(self) -> List[Dict[str, Any]]:
+        """空转失败的**分母与分布**：按模型拆分（供 `bench idle-failures`）。
+
+        为什么要分母：单看“23 次空转”没有意义 —— 要说清它是 854 次里的 23 次（2.7%），
+        以及在**哪个模型**上（实测 `deepseek-v4.1-flash` **4.9%** vs `deepseek-reasoner` **0.5%**）。
+        只算无故障运行（与 `idle_failures` 同口径）。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(NULLIF(s.model_name, ''), '(未记录)') AS model_name,
+                       COUNT(*) AS n,
+                       SUM(CASE WHEN b.ok = 0 AND COALESCE(b.tool_calls, 0) = 0
+                                THEN 1 ELSE 0 END) AS idle,
+                       SUM(CASE WHEN b.ok = 0 THEN 1 ELSE 0 END) AS fails,
+                       SUM(CASE WHEN b.ok = 0 AND COALESCE(b.tool_calls, 0) = 0
+                                 AND b.self_reported_ok = 1 THEN 1 ELSE 0 END) AS idle_self_ok
+                FROM bench_runs b LEFT JOIN bench_suites s ON s.suite_id = b.suite_id
+                WHERE COALESCE(b.faults_injected, 0) = 0
+                GROUP BY COALESCE(NULLIF(s.model_name, ''), '(未记录)')
+                ORDER BY n DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def load_runs_grouped_by_task(self, limit_per_task: int = 500) -> Dict[str, List[Dict[str, Any]]]:
         """把历史运行按 task_key 分组（用于按分位数推导预算阈值）。
 
@@ -1041,7 +1100,9 @@ class SpanStore:
                 bucket.append(dict(row))
         return grouped
 
-    def avg_cost_for_group(self, group: str, *, faulted: Optional[bool] = None) -> Optional[float]:
+    def avg_cost_for_group(
+        self, group: str, *, faulted: Optional[bool] = None, model_name: Optional[str] = None
+    ) -> Optional[float]:
         """某个分组的历史平均单次成本（用于**预估预算**）。
 
         why 需要它：CLI 原来用一个写死的系数（$0.045/次）估成本，
@@ -1053,6 +1114,13 @@ class SpanStore:
             False = 只看无故障的。这一区分很关键：实测故障格的单次成本是基线的
             2~3 倍（Agent 会因为产物被截断而反复重试），
             用无故障均值去估故障实验会低估一半以上。
+        :param model_name: 只统计**这个模型**跑出来的历史。
+            不筛模型的代价实测过：semireal 组上 `deepseek-reasoner` 是 **$0.109/次**，
+            而 `deepseek-v4.1-flash` 只有 **$0.021/次**（相差 5 倍）。
+            混在一起算 → 换到便宜模型后预估会**高估 4.5 倍**
+            （实测：预估 $9.58，而同一批 108 次真实只花了约 $2.3），
+            于是把上面那个"估错 3 倍"翻到了另一个方向 —— 而高估同样有害：
+            它会让 `--yes` 确认变成例行动作，人就开始不看预估了。
         """
         with self._connect() as conn:
             row = conn.execute(
@@ -1064,8 +1132,14 @@ class SpanStore:
                   AND (:faulted IS NULL
                        OR (:faulted = 1 AND COALESCE(faults_injected, 0) > 0)
                        OR (:faulted = 0 AND COALESCE(faults_injected, 0) = 0))
+                  AND (:model IS NULL
+                       OR suite_id IN (SELECT suite_id FROM bench_suites WHERE model_name = :model))
                 """,
-                {"group": group, "faulted": None if faulted is None else (1 if faulted else 0)},
+                {
+                    "group": group,
+                    "faulted": None if faulted is None else (1 if faulted else 0),
+                    "model": model_name or None,
+                },
             ).fetchone()
         if not row or not row["n"]:
             return None

@@ -233,12 +233,21 @@ class _FakeStore:
     def finalize_suite(self, suite) -> None:
         self.suites[suite.suite_id] = suite
 
-    def avg_cost_for_group(self, group: str, *, faulted=None):
+    def avg_cost_for_group(self, group: str, *, faulted=None, model_name=None):
         """CLI 的预算预估会读它；没有历史时返回 None（走保守默认值）。
 
         注意签名要跟随真实实现 —— 少一个关键字参数就是 TypeError（踩过）。
+        `model_name` 就是那次踩坑后加上的：预估现在会按当前模型筛历史。
         """
         return
+
+    def idle_failures(self, *, limit: int = 50, suite_id=None):
+        """CLI 的空转审计会读它（签名跟随真实实现）。"""
+        return []
+
+    def idle_failure_summary(self):
+        """空转汇总：替身里给一条，用来验证表格渲染与“空转占失败”的算术。"""
+        return [{"model_name": "fake-model", "n": 100, "idle": 5, "fails": 8, "idle_self_ok": 4}]
 
     def load_runs_grouped_by_task(self, limit_per_task: int = 500):
         """CLI 的阈值推导会读它；替身里返回空 → 退回默认阈值。"""
@@ -392,6 +401,119 @@ def test_cli_bench_gate_refuses_tiny_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
 
     assert main(["bench", "gate", "--baseline", "base-ok", "--candidate", "tiny", "--min-runs", "10"]) == 2
+
+
+def test_cli_bench_gate_compares_floor_scope(tmp_path, monkeypatch, capsys):
+    """地板的**任务数**必须与本次门禁口径对照 —— 否则那个「测量分辨率」是错的参照。
+
+    实测背景：当前地板只用 **7** 个 semireal 任务测过，而 `bench gate` 会拿它
+    去守**任意** suite（可能 28 个任务）。分辨率随任务数下降（≈1/√n），
+    所以口径不一致时必须当场说，而不是让人拿错参照。
+    见 `docs/step17-resolution-budget.md`。
+    """
+    from lab import api as lab_api
+
+    # syn_sum_range 是 regression 任务 → 会进 gate 的 regression 口径
+    task = next(t for t in load_all_tasks() if t.key == "syn_sum_range")
+
+    def _suite(suite_id):
+        outcomes = [
+            RunOutcome(
+                run_id=f"{suite_id}-{i}",
+                suite_id=suite_id,
+                task_uid=task.uid,
+                task_key=task.key,
+                group=task.group,
+                run_index=i,
+                ok=True,
+                tokens=1000,
+                cost_usd=0.001,
+                elapsed_ms=5000,
+                tool_calls=3,
+                steps_done=1,
+            )
+            for i in range(10)
+        ]
+        return SuiteResult(
+            suite_id=suite_id,
+            label=suite_id,
+            outcomes=outcomes,
+            task_summaries=[summarize_task(task, outcomes)],
+        )
+
+    store = _FakeStore()
+    store.save_suite(_suite("base-ok"))
+    store.save_suite(_suite("cand-ok"))
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
+
+    def _floor(task_count):
+        path = tmp_path / f"floor_{task_count}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "suite_id": "62bde6db-0000-0000-0000-000000000000",
+                    "label": "测试地板",
+                    "arms": ["a", "b"],
+                    "runs_per_task": 3,
+                    "task_count": task_count,
+                    "model_name": "m",
+                    "temperature": 0.0,
+                    "guard_config": "all",
+                    "fault_spec": "",
+                    "interleaved": True,
+                    "created_at": "2026-01-01T00:00:00",
+                    "metrics": [
+                        {
+                            "name": "cost_pct",
+                            "label": "成本（相对）",
+                            "unit": "%",
+                            "delta": 1.0,
+                            "resolution": 46.8,
+                            "per_task": [1.0, 2.0],
+                        }
+                    ],
+                    "notes": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    # 1. 地板 7 个任务、本次配对 1 个任务 → 必须显式告警
+    code = main(
+        [
+            "bench",
+            "gate",
+            "--baseline",
+            "base-ok",
+            "--candidate",
+            "cand-ok",
+            "--noise-floor",
+            str(_floor(7)),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "与地板口径不一致" in out
+    assert "**不是**本次对比的参照" in out
+
+    # 2. 口径一致时 → 明确说一致，不制造噪声
+    code = main(
+        [
+            "bench",
+            "gate",
+            "--baseline",
+            "base-ok",
+            "--candidate",
+            "cand-ok",
+            "--noise-floor",
+            str(_floor(1)),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "与地板口径一致" in out
+    assert "与地板口径不一致" not in out
 
 
 def test_cli_bench_run_accepts_new_replay_and_ab_arguments():
@@ -796,3 +918,22 @@ def test_cli_bench_run_accepts_every_referenced_fault_argument():
         "task",
     ):
         assert hasattr(args, name), f"bench run 缺少参数 {name}，而代码里会引用它"
+
+
+def test_cli_bench_idle_failures_renders_summary(monkeypatch, capsys):
+    """`bench idle-failures` 要报出“空转占失败多少” —— 这是解读成功率的关键分母。
+
+    2026-10-10 实测：`deepseek-v4.1-flash` 上 **84% 的失败是空转**
+    （planner 输出不合规 → 执行器不启动 → 把计划文本当答案）。
+    """
+    from lab import api as lab_api
+
+    store = _FakeStore()
+    monkeypatch.setattr(lab_api, "default_trace_store", lambda: store)
+
+    assert main(["bench", "idle-failures"]) == 0
+    out = capsys.readouterr().out
+    assert "空转失败" in out
+    assert "fake-model" in out
+    assert "62%" in out  # 5/8 = 62%（空转占失败）
+    assert "planner 输出" in out  # 机制说明必须在输出里

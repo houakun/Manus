@@ -435,12 +435,23 @@ class SuiteResult(BaseModel):
         return task_level_rates(grouped)
 
     def error_attribution(self) -> Dict[str, int]:
-        """失败归因：按 error_type 统计（handoff 第 8 节的"定位/规划/验证/工具"雏形）。"""
+        """失败归因：按 error_type 统计 + **把“空转”单列**。
+
+        ⚠️ 为什么必须把空转拆出来（2026-10-10 实测，见 `docs/step17-resolution-budget.md` §十四/§十五）：
+        `deepseek-v4.1-flash` 的 430 次无故障运行里，**84% 的失败是“一个工具都没调用”**
+        —— planner 输出的 JSON 不合规（返回 list 而非 object）→ 执行器根本没启动 →
+        Agent 把**计划文本**当最终答案提交，而且**自述成功**（83% 假阳性）。
+        它与“做了但做错”是完全不同的两件事：前者是 SUT 的健壮性缺陷，后者是能力边界。
+        混在一个 `verification_failed` 里，会让所有成功率的解读都偏。
+        """
         counts: Dict[str, int] = {}
         for outcome in self.outcomes:
             if outcome.ok:
                 continue
             key = outcome.error_type or "verification_failed"
+            # 没有明确错误类型 + 一个工具都没调 → 空转（不是“做错”，是“没做”）
+            if outcome.error_type is None and not (outcome.tool_calls or 0):
+                key = "idle_no_tool_call"
             counts[key] = counts.get(key, 0) + 1
         # 工具级失败类型（来自加固层的 error_types）也一起统计，
         # 这样"Agent 说成功但工具层面出过错"的情况不会被漏掉

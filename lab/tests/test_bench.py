@@ -449,7 +449,8 @@ def _result_with_guard(guard: dict, **kwargs) -> TaskResult:
         guard=guard,
     )
     base.update(kwargs)
-    return TaskResult(**base)
+    # pyright 无法收窄 `dict[str, Any]` 到 TaskResult 的参数类型（**既有**，非本轮引入）
+    return TaskResult(**base)  # pyright: ignore[reportArgumentType]
 
 
 def test_process_rules_flag_efficiency_security_and_cheating():
@@ -651,7 +652,8 @@ def test_task_level_rates_rejects_bare_sequences():
     from lab.bench.stats import task_level_rates
 
     with pytest.raises(TypeError, match="Mapping"):
-        task_level_rates(["semireal/sem_bug_fix"])
+        # 这里**故意**传错类型（list 而非 Mapping）来断言抛 TypeError —— 静态检查器不理解这个意图
+        task_level_rates(["semireal/sem_bug_fix"])  # pyright: ignore[reportArgumentType]
 
 
 def test_task_level_rates_flags_non_uniform_k():
@@ -662,3 +664,53 @@ def test_task_level_rates_flags_non_uniform_k():
     assert metrics.uniform_k is False
     assert metrics.k == 3  # 取最小值
     assert any("不一致" in note for note in metrics.caveats)
+
+
+# ==================== 3.8 空转失败的归因（2026-10-10） ====================
+
+
+def test_error_attribution_splits_idle_failures():
+    """空转（判定失败 + **一个工具都没调用**）必须从 `verification_failed` 里单独列出。
+
+    为什么：2026-10-10 实测，`deepseek-v4.1-flash` 的 430 次无故障运行里
+    **84% 的失败是空转**（planner 输出不合规 → 执行器不启动 → 把计划文本当答案，
+    而且自述成功）。它与“做了但做错”是两件事 —— 混在一个 `verification_failed` 里，
+    所有成功率的解读都会偏。见 `docs/step17-resolution-budget.md` §十四/§十五。
+    """
+    from lab.bench.runner import RunOutcome, SuiteResult
+
+    def _outcome(i: int, *, ok: bool, tool_calls: int, error_type=None) -> RunOutcome:
+        return RunOutcome(
+            run_id=f"r{i}",
+            suite_id="s",
+            task_uid="synthetic/t",
+            task_key="t",
+            group="synthetic",
+            run_index=i,
+            ok=ok,
+            tool_calls=tool_calls,
+            error_type=error_type,
+            tokens=100,
+            cost_usd=0.01,
+            elapsed_ms=1000,
+            steps_done=1,
+        )
+
+    suite = SuiteResult(
+        suite_id="s",
+        label="s",
+        outcomes=[
+            _outcome(0, ok=True, tool_calls=10),  # 成功
+            _outcome(1, ok=False, tool_calls=0),  # 空转
+            _outcome(2, ok=False, tool_calls=0),  # 空转
+            _outcome(3, ok=False, tool_calls=7),  # 做了但做错
+            # 有明确 error_type → 不归空转（保留更具体的原因）
+            _outcome(4, ok=False, tool_calls=0, error_type="task_timeout"),
+        ],
+    )
+    attr = suite.error_attribution()
+    assert attr.get("idle_no_tool_call") == 2
+    assert attr.get("verification_failed") == 1
+    assert attr.get("task_timeout") == 1
+    # 成功的那次不进任何失败桶
+    assert sum(attr.values()) == 4
