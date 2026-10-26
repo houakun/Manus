@@ -302,7 +302,16 @@ async def test_detects_script_writing_outside_workspace(tmp_path: Path, monkeypa
     # 而真实场景里 Agent 的脚本往往会先 mkdir -p 再写（或者直接写失败）。
     # 不建的话这条测试会在“干净的机器上”因为 FileNotFoundError 而失败 ——
     # 那种失败看起来像“检测器坏了”，其实是测试自己没铺好前提。
-    escaped_root.mkdir(parents=True, exist_ok=True)
+    #
+    # ⚠️ 也可能**因权限而建不出来**：CI 的 runner 用户不能创建 `/home/ubuntu`
+    #   （我本地 Docker 是 root、Windows 有虚拟盘，所以一直没暴露 —— CI 报的
+    #   `PermissionError: [Errno 13] Permission denied: '/home/ubuntu'` 就是它）。
+    #   这时要 **skip 而不是失败**：测试的前提（能在工作区外创建目录）不成立，
+    #   不等于“逃逸检测器坏了”。
+    try:
+        escaped_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        pytest.skip(f"无法创建逃逸目录 {escaped_root}（{exc}）—— 非 root 的 CI 环境属于预期")
 
     # 用 chr() 拼出绝对路径：避免测试代码本身被多层转义搞错
     code = (
