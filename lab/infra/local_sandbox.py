@@ -881,7 +881,19 @@ class LocalSandbox:
         else:
             home_real = str(self._root / "home" / "ubuntu")
             tmp_real = str(self._root / "tmp")
-        return command.replace(self.SANDBOX_HOME, home_real).replace(self.SANDBOX_TMP, tmp_real)
+
+        # ⚠️ 必须**一次性**替换（`re.sub`），不能用链式 `.replace`：
+        #   在 Linux 上 workspace 通常在 `/tmp/...` 下，于是 `home_real` 本身
+        #   就以 `/tmp` 开头 —— 第二步 `.replace("/tmp", tmp_real)` 会把刚换好的
+        #   `home_real` 里的 `/tmp` **再替换一次**，得到
+        #   `<root>/tmp/<root>/home/ubuntu`（路径重复），命令必然 `cd` 失败。
+        #   实测：这就是 CI 长期红在 `bench validate` 的真因 —— `syn_rename_files`
+        #   的参考解 `cd /home/ubuntu/docs && mv ...` 报 `can't cd to ...`；
+        #   Windows 上不触发，因为那里走虚拟盘分支（`{drive}:\home\ubuntu`），
+        #   而 Linux 上 `tempfile` 的 workspace 永远在 `/tmp/...`。
+        mapping = {self.SANDBOX_HOME: home_real, self.SANDBOX_TMP: tmp_real}
+        pattern = re.compile("|".join(re.escape(key) for key in mapping))
+        return pattern.sub(lambda match: mapping[match.group(0)], command)
 
     def _build_child_env(self) -> Dict[str, str]:
         """构造子进程的环境变量（白名单 + 显式覆盖）。

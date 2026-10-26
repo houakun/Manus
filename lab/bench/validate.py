@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -237,7 +238,12 @@ async def _fixture_truth_problems(task: BenchTask, workspace: Path) -> List[str]
     await sandbox.ensure_sandbox()
     await _apply_fixtures(sandbox, task.fixtures)
 
-    result = await sandbox.exec_command("selfcheck", "/home/ubuntu", rule.command)
+    # 固定时区（见 `SelfCheck.timezone` 的注释）：POSIX 用 `TZ=` 前缀；
+    # Windows 的 cmd 不认这个前缀，而 Windows 开发机通常就是捕获日志的那个时区。
+    command = rule.command
+    if rule.timezone and os.name != "nt":
+        command = f"TZ={rule.timezone} {command}"
+    result = await sandbox.exec_command("selfcheck", "/home/ubuntu", command)
     data = result.data if isinstance(result.data, dict) else {}
     returncode = data.get("returncode")
     output = data.get("output") or ""

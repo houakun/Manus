@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# pyright: reportOptionalSubscript=false
+# 理由（2026-10-11，修 CI 时）：本文件大量使用 `result.data["..."]` 作为断言 ——
+#   而 `ToolResult.data` 的声明是 Optional（生产代码在 success=False 时确实可能为 None）。
+#   逐个加 `assert result.data is not None` 会让 36 处断言淹没在样板里；
+#   而这些用例的**语义**就是“成功路径下 data 里应该有什么”：真为 None 会以
+#   TypeError 直接炸，不会静默通过。生产侧（local_sandbox.py）的类型保持不变。
 """LocalSandbox 的回归测试。
 
 这些测试是 Step 1 的"验收证据"：它们把 LocalSandbox 的关键不变量固定下来，
@@ -373,6 +379,10 @@ def test_output_decodes_utf8_first():
     assert decode_command_output(raw) == "写入成功: /home/ubuntu/a.txt\n"
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="OEM 代码页回退（GetOEMCP）是 Windows cmd.exe 特有的；Linux 上 fallback 是 locale 编码",
+)
 def test_output_falls_back_to_oem_codepage_for_cmd_exe_errors():
     """cmd.exe 的错误信息是 OEM 代码页（中文机器上是 GBK）—— 不能变成乱码进上下文。
 
@@ -387,6 +397,10 @@ def test_output_falls_back_to_oem_codepage_for_cmd_exe_errors():
     assert "\r" not in decoded
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="混合编码里的 GBK 回退同样依赖 Windows 的 OEM 代码页",
+)
 def test_output_handles_mixed_encodings_in_one_stream():
     """一次命令里同时有 Python(UTF-8) 与 cmd.exe(GBK) 输出 —— 逐行判定要各自正确。
 
@@ -537,6 +551,10 @@ async def test_stale_drive_mapping_is_reclaimed(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="用例让脚本写 /home/ubuntu/... 绝对路径，靠虚拟盘符导回工作区；Linux 上会真写到宿主路径",
+)
 async def test_crlf_written_by_scripts_is_normalized(tmp_path: Path):
     """脚本写出的 CRLF 要归一为 LF —— 目标环境 Ubuntu 根本不产出 CRLF。
 
@@ -581,6 +599,10 @@ async def test_binary_files_are_never_touched(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="同上：需要虚拟盘符才能让脚本里的绝对路径落回工作区",
+)
 async def test_crlf_normalization_can_be_disabled(tmp_path: Path, monkeypatch):
     """归一必须能被关掉 —— 否则"这次变化是不是归一带来的"就无法回答。
 

@@ -17,6 +17,9 @@ selfcheck:
   command: python repo/tests/run_tests.py
   expect_exit: 1
   output_recorded_in: /home/ubuntu/ci_log.txt
+  # 这份日志是在 UTC+8 上捕获的：`test_naive_deadline_is_handled` 用本地时区算差值，
+  # 在 UTC 上会 PASSED（差值恰好正确）。固定 TZ，让 Linux CI 也能逐行复现这份日志。
+  timezone: Asia/Shanghai
 fixtures:
   - path: /home/ubuntu/ci_log.txt
     content: |

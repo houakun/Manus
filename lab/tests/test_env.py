@@ -27,6 +27,10 @@ from lab.infra.env import (
 )
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="用例用 Windows 路径字面量 + os.pathsep=';' 验证路径拼接语义，Linux 上 ':' 会把 C:\\x 拆碎",
+)
 def test_path_is_guaranteed_prefix_plus_parent_fallback():
     """PATH = 固定前缀 + 父 PATH 兜底。
 
@@ -76,6 +80,10 @@ def test_path_does_not_depend_on_launch_context(monkeypatch):
     assert tools["python"], "连 python 都解析不到，任务根本无法跑"
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="同上：依赖 Windows 路径字面量与 os.pathsep=';'",
+)
 def test_interpreter_fallback_is_last_and_never_shadows():
     """宿主解释器目录必须是**最后一项**。
 

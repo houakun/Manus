@@ -139,6 +139,15 @@ class SelfCheck(BaseModel):
     output_recorded_in: str
     expect_exit: int = 1
 
+    # 执行 selfcheck 时固定的时区（POSIX 的 `TZ`，Windows 上忽略）。
+    # 为什么需要：**日志内容本身可能依赖本地时区** —— 实测 `ci_naive_datetime`
+    # 用 `datetime.now()`（本地 naive）减 `datetime.now(timezone.utc)` 的 naive 版本，
+    # 于是同一份代码在 UTC 上 PASSED、在 UTC+8 上 FAILED，连带统计行都不同。
+    # fixture 是在某一个时区捕获的，固定它才能让“同一份日志”在 Windows 与 CI(Linux)
+    # 上都逐行复现 —— 否则只能从“日志真实性检查”里抹掉这些行，而那会削弱检查
+    # （曾试过：`test_selfcheck_catches_a_fabricated_ci_log` 立刻抓住了这个削弱）。
+    timezone: Optional[str] = None
+
 
 class BenchTask(BaseModel):
     """一个评测任务。"""
@@ -177,9 +186,17 @@ class BenchTask(BaseModel):
 
 
 def load_task(path: Path) -> BenchTask:
-    """从 YAML 载入一个任务。"""
-    with open(path, "r", encoding="utf-8") as fp:
-        data = yaml.safe_load(fp) or {}
+    """从 YAML 载入一个任务。
+
+    读失败（文件缺失/无权限/编码错误）包成带**路径**的错误：
+    否则调用方只拿到一个 `FileNotFoundError: 'x.yaml'`，在“载入 28 个任务”的
+    上下文里看不出是哪一个任务、哪个目录出的问题。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = yaml.safe_load(fp) or {}
+    except OSError as exc:
+        raise ValueError(f"无法读取任务定义 {path}: {exc}") from exc
     data.setdefault("key", path.stem)
     data.setdefault("group", path.parent.name)
     return BenchTask.model_validate(data)
