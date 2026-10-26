@@ -44,7 +44,24 @@ jobs:
       #              + 录制回放（含"不联网"与"成本口径"两个铁约束）
       #              + 交错 A/B 排程 / 噪声地板 / 实验条件落库
       - name: Unit tests
-        run: python -m pytest -q
+        run: |
+          set +e
+          python -m pytest -q --tb=short > pytest.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            # 把失败摘要写进 **step summary**：run 页面直接可见，
+            # 不需要登录下载日志（维护者与外部贡献者都能看到为什么红）。
+            # 背景：之前 CI 长期红，但失败信息只在需要认证的日志里，
+            # 导致“本地绿灯、CI 红灯”排查变成猜谜。
+            {
+              echo "## pytest 失败（摘要）"
+              echo '```text'
+              tail -60 pytest.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            cat pytest.log
+          fi
+          exit $code
 
       # 任务集三步自检 + 同义反复检测。
       # 这一步是"评测台自身可信度"的门禁：
